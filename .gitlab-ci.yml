@@ -55,8 +55,8 @@ variables:
     description: "GPU type for NVCF testing (e.g., L40S, H100)"
     value: "H100"
   NVCF_INSTANCE_TYPE:
-    description: "Instance type for NVCF testing (e.g., OCI.GPU.L40S_1x, OCI.GPU.H100_1x)"
-    value: "OCI.GPU.H100_1x"
+    description: "Instance type for NVCF testing (e.g., OCI.GPU.H100_1x, OCI.GPU.H100_4x)"
+    value: "OCI.GPU.H100_4x"
   NVCF_CUSTOM_BACKEND:
     description: "Custom NVCF backend for testing (overrides default GitLab CI/CD variable)"
     value: "$NVCF_BACKEND"  # instead of $PERF_NVCF_BACKEND
@@ -87,8 +87,10 @@ variables:
   HELM_THANOS_RECEIVER_URL: "$HELM_THANOS_RECEIVER_URL"
   HELM_BYO_METRICS_RECEIVER_CLIENT_CRT: $HELM_BYO_METRICS_RECEIVER_CLIENT_CRT
   HELM_BYO_METRICS_RECEIVER_CLIENT_KEY: $HELM_BYO_METRICS_RECEIVER_CLIENT_KEY
-  HELM_GPU_REQUESTS: 1
-  HELM_GPU_LIMITS: 1
+  # Request all GPUs on the 4x NVCF instance so the e2e pipeline can spread its
+  # stages across the node and reduce wall time (see NVCF_INSTANCE_TYPE).
+  HELM_GPU_REQUESTS: 4
+  HELM_GPU_LIMITS: 4
   HELM_SHMEM_LIMIT: 500Gi
   HELM_IMAGE_TAG:
   TEST_END_TO_END:
@@ -203,27 +205,94 @@ stages:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
     - when: never
 
-  # Rules for merge result pipelines and web triggers
-  merge_result_and_web_rules: &merge_result_and_web_rules
-    # MR pipelines (excluding merge trains)
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train" && $NVCF_HELM_STRICT == "true"'
-      when: on_success
-      allow_failure: false
-    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE != "merge_train"'
-      when: on_success
-      allow_failure: true
+  # Shared rule entries for the long-running SLURM + NVCF end-to-end jobs
+  # (slurm_end_to_end, nvcf-helm, nvcf-helm-validate). These dominate MR CI
+  # wall time, so they are opt-in on day-to-day MRs but always enforced before
+  # code reaches nvidia/main. The per-job rule lists below are composed from
+  # these entries; they differ only in how a label-less MR is handled.
+  e2e_merge_train_entry: &e2e_merge_train_entry
+    # Merge train: mandatory coverage before merging to nvidia/main
+    if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+    when: on_success
+    allow_failure: false
+  e2e_label_entry: &e2e_label_entry
+    # Regular MR (not merge train) with the opt-in label: run automatically
+    if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)run-e2e-tests($|,)/'
+    when: on_success
+    allow_failure: false
+  e2e_web_strict_entry: &e2e_web_strict_entry
+    if: '$CI_PIPELINE_SOURCE == "web" && $NVCF_HELM_STRICT == "true"'
+    when: on_success
+    allow_failure: false
+  e2e_web_entry: &e2e_web_entry
+    if: '$CI_PIPELINE_SOURCE == "web"'
+    when: on_success
+    allow_failure: true
 
+  # slurm_end_to_end + nvcf-helm: optional MANUAL jobs on label-less MRs, so a
+  # developer can start each from the pipeline view (the "play" button) without
+  # them running by default or blocking the MR. allow_failure is explicit
+  # because `when: manual` inside `rules` defaults it to false (blocking).
+  slurm_nvcf_e2e_rules: &slurm_nvcf_e2e_rules
     - *skip_single_purpose_web_rule
+    - *e2e_merge_train_entry
+    - *e2e_label_entry
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+    - *e2e_web_strict_entry
+    - *e2e_web_entry
+    - when: never
 
-    # Web-triggered pipelines
-    - if: '$CI_PIPELINE_SOURCE == "web" && $NVCF_HELM_STRICT == "true"'
-      when: on_success
-      allow_failure: false
-    - if: '$CI_PIPELINE_SOURCE == "web"'
+  # nvcf-helm-validate: like slurm_nvcf_e2e_rules, but on a label-less MR it
+  # stays on_success (not manual) so it chains automatically after nvcf-helm
+  # with no "play" button of its own. It `needs: nvcf-helm`, so GitLab keeps it
+  # skipped until nvcf-helm runs (via the label, merge train, or manual start).
+  nvcf_helm_validate_rules: &nvcf_helm_validate_rules
+    - *skip_single_purpose_web_rule
+    - *e2e_merge_train_entry
+    - *e2e_label_entry
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: on_success
       allow_failure: true
+    - *e2e_web_strict_entry
+    - *e2e_web_entry
+    - when: never
 
-    # Default: skip if none of the above match
+  # Shared rule entries for gpu_tests and its dependent combine_coverage.
+  gpu_post_merge_push_entry: &gpu_post_merge_push_entry
+    if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
+  gpu_e2e_trigger_entry: &gpu_e2e_trigger_entry
+    if: '$TEST_END_TO_END == "True"'
+  gpu_mr_default_entry: &gpu_mr_default_entry
+    if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+  # gpu_tests: automatic by default; with the 'optional-gpu-tests' label a
+  # regular MR turns it into an optional MANUAL job ("play" button), so it does
+  # not run by default or block the MR.
+  gpu_tests_rules: &gpu_tests_rules
+    - *skip_single_purpose_web_rule
+    - *gpu_post_merge_push_entry
+    - *gpu_e2e_trigger_entry
+    - *e2e_merge_train_entry
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)optional-gpu-tests($|,)/'
+      when: manual
+      allow_failure: true
+    - *gpu_mr_default_entry
+    - when: never
+
+  # combine_coverage: mirrors gpu_tests_rules, but on a labeled MR it stays
+  # on_success (not manual) and non-blocking. Because it `needs: gpu_tests`,
+  # GitLab keeps it skipped until gpu_tests runs, then runs it automatically.
+  combine_coverage_rules: &combine_coverage_rules
+    - *skip_single_purpose_web_rule
+    - *gpu_post_merge_push_entry
+    - *gpu_e2e_trigger_entry
+    - *e2e_merge_train_entry
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)optional-gpu-tests($|,)/'
+      when: on_success
+      allow_failure: true
+    - *gpu_mr_default_entry
     - when: never
 
   # Rules for jobs that should run both before and after merging
@@ -781,7 +850,7 @@ build_deploy_curator_distributable:
 # Run GPU tests on SLURM cluster
 gpu_tests:
   stage: end-to-end
-  rules: *pre_post_merge_rules
+  rules: *gpu_tests_rules
   # `build_xenna_wheels` is `optional: true` so the job runs unchanged when
   # the 'use-local-xenna-build' MR label is absent. When the artifact is
   # present, run_env_tests.sh inside the container overrides the
@@ -857,7 +926,7 @@ slurm_end_to_end:
     - job: resolve_version
       artifacts: true
     - job: build_deploy_curator_slim
-  rules: *merge_result_and_web_rules
+  rules: *slurm_nvcf_e2e_rules
   tags:
     - ${SLURM_RUNNER_TAG}
   variables:
@@ -895,7 +964,7 @@ combine_coverage:
     GIT_SUBMODULE_STRATEGY: none
   stage: end-to-end
   needs: ["unit_tests", "gpu_tests"]
-  rules: *pre_post_merge_rules
+  rules: *combine_coverage_rules
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner  # Override to Docker executor
@@ -942,7 +1011,7 @@ nvcf-helm:
     - job: resolve_version
       artifacts: true
     - job: build_deploy_curator
-  rules: *merge_result_and_web_rules
+  rules: *slurm_nvcf_e2e_rules
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner  # Override to Docker executor
@@ -982,7 +1051,7 @@ nvcf-helm:
 nvcf-helm-validate:
   stage: end-to-end
   needs: [ "nvcf-helm" ]
-  rules: *merge_result_and_web_rules
+  rules: *nvcf_helm_validate_rules
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner  # Override to Docker executor
@@ -1153,7 +1222,6 @@ k8s_gpu_tests:
       artifacts: true
   image: ${CURATOR_SLIM_FULL_IMAGE}
   timeout: 45 minutes
-  allow_failure: true
   variables:
     KUBERNETES_POLL_TIMEOUT: 1800
   id_tokens:
@@ -1197,7 +1265,6 @@ k8s_helm_test:
   needs: ["build_deploy_curator"]
   image: ${CI_BUILDER_IMAGE}
   timeout: 60 minutes
-  allow_failure: true
   variables:
     KUBERNETES_POLL_TIMEOUT: 1800
   id_tokens:
