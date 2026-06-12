@@ -213,13 +213,19 @@ class CpuVideoDecoder:
         self._accumulate_stat("t_seek", time.perf_counter() - t0)
 
     def _validate_monotonic_frame_pts(self, frame_pts: int, kf_pts_stream: int) -> None:
-        """Ensure decoded frame PTS values stay strictly increasing across seeks."""
+        """Ensure decoded frame PTS values stay strictly increasing within a single seek/GOP decode.
+
+        The baseline (``last_decoded_pts``) is reset per group in
+        :meth:`_decode_group`, so this only guards monotonicity *within* one
+        seek -- not across re-seeks, where the decoder legitimately re-emits
+        earlier frames (see the open-GOP note there).
+        """
         if self.last_decoded_pts is not None and frame_pts <= self.last_decoded_pts:
             msg = (
                 f"Non-monotonic frame pts={frame_pts} decoded after {self.last_decoded_pts} "
                 f"(GOP kf_pts_stream={kf_pts_stream}) — "
-                "seek landed before the keyframe or decoder output regressed in presentation order. "
-                "This indicates a bug in the decode plan or a malformed video stream."
+                "decoder output regressed in presentation order within a single seek. "
+                "This indicates a malformed video stream or a decoder bug."
             )
             raise RuntimeError(msg)
         self.last_decoded_pts = frame_pts
@@ -285,6 +291,13 @@ class CpuVideoDecoder:
     ) -> int:
         """Decode one GOP-worth of target frames after seeking to its keyframe."""
         self._seek_and_flush(kf_pts_stream)
+        # The seek may legitimately land on an earlier sync sample than the
+        # requested keyframe: MP4 marks only true sync samples (stss) as
+        # seekable, but open-GOP streams flag non-IDR I-frames as keyframes too.
+        # The decoder then re-emits frames from before the previous group, so
+        # PTS only needs to be monotonic within this single decode, not across
+        # groups. Reset the baseline per seek to avoid a false regression.
+        self.last_decoded_pts = None
 
         target_idx = 0
         for packet in self.container.demux(self.stream):
