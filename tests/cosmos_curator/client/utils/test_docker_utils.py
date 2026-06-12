@@ -199,6 +199,26 @@ def test_generated_dockerfile_has_no_empty_continuation_lines(
     assert pkg_config_arg < pkg_config_env
 
 
+def test_full_dockerfile_does_not_patch_nvidia_wheel_urls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NVIDIA CUDA wheels are resolved from PyPI directly, without lockfile rewrites."""
+    monkeypatch.chdir(REPO_ROOT)
+
+    contents = _render_dockerfile(
+        tmp_path,
+        slim=False,
+        redistributable=True,
+        conda_env_names=["default", "cuml", "seedvr"],
+    )
+
+    assert "pypi.nvidia.com" not in contents
+    assert "pixi-nvidia-wheels" not in contents
+    assert "/wheels-ready" not in contents
+    assert "file:///pixi-cache/nvidia-wheels" not in contents
+
+
 def test_full_dockerfile_rebuilds_opencv_against_local_ffmpeg(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

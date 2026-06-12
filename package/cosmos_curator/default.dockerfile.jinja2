@@ -12,7 +12,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # re-check ffmpeg-builder's NVCODEC_VERSION against the Video Codec SDK driver floor.
 
 # ---------------------------------------------------------------------------
-# Wheels builder stage: install pixi (and pre-download NVIDIA wheels in full mode)
+# Wheels builder stage: install pixi and optional build artifacts
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04 AS wheels-builder
 
@@ -25,34 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 # Install pixi with curl into /opt/pixi without modifying PATH
 RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION="${PIXI_VERSION}" PIXI_HOME=/opt/pixi PIXI_NO_PATH_UPDATE=1 sh
 
-{% if not slim %}
-# Downloads large NVIDIA CUDA wheels from pypi.nvidia.com into a BuildKit
-# cache so pixi install can read them locally (avoiding its hardcoded 30s
-# HTTP timeout).  /wheels-ready is a sentinel that the main stage bind-mounts
-# to force this stage to run first.
-COPY pixi.toml pixi.lock /tmp/pixi-setup/
-RUN --mount=type=cache,id=pixi-nvidia-wheels,target=/pixi-cache/nvidia-wheels \
-    mkdir -p /pixi-cache/nvidia-wheels && \
-    grep -oP 'https://pypi\.nvidia\.com/[^\s"]+\.whl' /tmp/pixi-setup/pixi.lock | sort -u | while read -r url; do \
-        if [[ ! "$url" =~ ^https://pypi\.nvidia\.com/[a-zA-Z0-9/_.-]+\.whl$ ]]; then \
-            echo "WARNING: Skipping invalid URL: $url"; \
-            continue; \
-        fi; \
-        filename=$(basename "$url") && \
-        echo "Pre-downloading: $filename" && \
-        curl -fsSL --retry 5 --retry-delay 3 --max-time 300 -C - -o "/pixi-cache/nvidia-wheels/$filename" "$url" || \
-            echo "WARNING: Failed to download $filename"; \
-    done && \
-    echo "=== Pre-downloaded $(ls -1 /pixi-cache/nvidia-wheels/*.whl 2>/dev/null | wc -l) NVIDIA wheels ===" && \
-    touch /wheels-ready
-{% if 'seedvr' in envs %}
+{% if not slim and 'seedvr' in envs %}
 # SeedVR tarball: fetch here so the main image does not need curl (libcurl pulls krb5).
 ARG SEEDVR_COMMIT=e4de8c2
 RUN mkdir -p /opt/seedvr-artifacts \
     && curl -fsSL --retry 5 --retry-delay 3 --max-time 300 "https://github.com/ByteDance-Seed/SeedVR/archive/${SEEDVR_COMMIT}.tar.gz" \
         | tar xz -C /tmp \
     && mv /tmp/SeedVR-${SEEDVR_COMMIT}* /opt/seedvr-artifacts/SeedVR
-{% endif %}
 {% endif %}
 
 # ---------------------------------------------------------------------------
@@ -254,18 +233,7 @@ RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
 
 COPY pixi.toml pixi.lock /pyav-build/
 
-# Same NVIDIA-wheel patching trick as the main stage so `pixi install -e default`
-# does not stall on pypi.nvidia.com timeouts.
-RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheels-ready \
-    --mount=type=cache,id=pixi-nvidia-wheels,target=/pixi-cache/nvidia-wheels,readonly \
-    cd /pyav-build && \
-    for whl in /pixi-cache/nvidia-wheels/*.whl; do \
-        [ -f "$whl" ] || continue; \
-        filename=$(basename "$whl") && \
-        if grep -q "$filename" pixi.lock; then \
-            sed -i "s|https://pypi\.nvidia\.com/[^\"]*/${filename}\\b|file:///pixi-cache/nvidia-wheels/${filename}|g" pixi.lock; \
-        fi; \
-    done && \
+RUN cd /pyav-build && \
     export CONDA_OVERRIDE_CUDA=13.0.2 && \
     export CUDA_PATH="/usr/local/cuda" && \
     success=false && \
@@ -332,18 +300,7 @@ RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
 
 COPY pixi.toml pixi.lock /opencv-build/
 
-# Same NVIDIA-wheel patching trick as the main stage so `pixi install -e default`
-# does not stall on pypi.nvidia.com timeouts.
-RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheels-ready \
-    --mount=type=cache,id=pixi-nvidia-wheels,target=/pixi-cache/nvidia-wheels,readonly \
-    cd /opencv-build && \
-    for whl in /pixi-cache/nvidia-wheels/*.whl; do \
-        [ -f "$whl" ] || continue; \
-        filename=$(basename "$whl") && \
-        if grep -q "$filename" pixi.lock; then \
-            sed -i "s|https://pypi\.nvidia\.com/[^\"]*/${filename}\\b|file:///pixi-cache/nvidia-wheels/${filename}|g" pixi.lock; \
-        fi; \
-    done && \
+RUN cd /opencv-build && \
     export CONDA_OVERRIDE_CUDA=13.0.2 && \
     export CUDA_PATH="/usr/local/cuda" && \
     success=false && \
@@ -527,51 +484,8 @@ COPY --from=pyav-builder /pyav-wheelhouse /opt/cosmos-curator-wheelhouse
 COPY --from=opencv-builder /opencv-wheelhouse /opt/cosmos-curator-wheelhouse
 COPY --chown=1000:1000 --from=opencv-builder /opencv-build/pixi.lock {{code_dir_str}}/pixi.lock
 
-# ============================================================================
-# NVIDIA CUDA Wheel Pre-download & pixi.lock Patching
-# ============================================================================
-#
-# Problem:
-#   pixi embeds uv as a compiled Rust library that hardcodes a 30-second HTTP
-#   timeout for package downloads. This timeout CANNOT be configured:
-#     - UV_HTTP_TIMEOUT env var is ignored (pixi overrides it internally)
-#     - find-links / extra-index-urls are ignored during --frozen install
-#       (pixi uses the exact download URLs baked into pixi.lock)
-#
-#   Large NVIDIA CUDA wheels (100-800 MB each) hosted on pypi.nvidia.com
-#   regularly exceed 30 seconds to download, causing pixi install to fail.
-#
-# Solution:
-#   1. Parse pixi.lock for all pypi.nvidia.com wheel URLs
-#   2. Pre-download them with curl in wheels-builder (5-minute timeout, 5 retries)
-#      into a named BuildKit cache (id=pixi-nvidia-wheels)
-#   3. Patch pixi.lock in-place: replace remote URLs with file:// paths
-#   4. pixi install --frozen reads the patched lockfile and loads wheels locally
-#
-# The pre-downloaded wheels live only in the BuildKit cache (id=pixi-nvidia-wheels)
-# which persists across builds and does NOT bloat the Docker image layers.
-# /wheels-ready is a sentinel bind-mounted from wheels-builder to force ordering.
-#
-#   +------------------+       +-------------------+       +---------------------+
-#   |   pixi.lock      | grep  | pypi.nvidia.com   | curl  | BuildKit cache:     |
-#   |   (lockfile)     +------>| wheel URLs        +------>| pixi-nvidia-wheels  |
-#   +------------------+       +-------------------+       +---------------------+
-#                                                                   |
-#   +------------------+   sed replaces remote URLs                 |
-#   |   pixi.lock      |   with file:///pixi-cache/nvidia-wheels/  |
-#   |   (patched)      +<------------------------------------------+
-#   +------------------+
-#          |
-#          |  pixi install --frozen
-#          v
-#   +------------------+
-#   |  local .whl read |  (no network, no timeout)
-#   +------------------+
 # If we install all the environments in a single layer, it's over 20GB and will cause slurm/NVCF to timeout pulling the
 # layer. Since the cuml environment is large and needs non-overlapping RAPIDS packages, we install it separately.
-#
-# Same sentinel bind + readonly cache mount as the patch step above, so pixi
-# install can resolve the patched file:// URLs locally.
 #
 # Retry logic: pixi install can fail due to transient network errors (connection resets, timeouts).
 # We retry up to 10 times with a 3-second backoff to handle these flakes.
@@ -583,19 +497,7 @@ COPY --chown=1000:1000 --from=opencv-builder /opencv-build/pixi.lock {{code_dir_
 # Redirecting the cache to a mount (different filesystem) breaks hardlinks -- rattler falls
 # back to full copies, duplicating multi-GB packages across every environment (~8GB -> ~21GB).
 # Instead, let rattler use its default on-disk cache and clean it within the same RUN layer.
-RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheels-ready \
-    --mount=type=cache,id=pixi-nvidia-wheels,target=/pixi-cache/nvidia-wheels,readonly \
-    cd {{code_dir_str}} && \
-    patched=0 && \
-    for whl in /pixi-cache/nvidia-wheels/*.whl; do \
-        [ -f "$whl" ] || continue; \
-        filename=$(basename "$whl") && \
-        if grep -q "$filename" pixi.lock; then \
-            sed -i "s|https://pypi\.nvidia\.com/[^\"]*/${filename}\\b|file:///pixi-cache/nvidia-wheels/${filename}|g" pixi.lock && \
-            patched=$((patched + 1)); \
-        fi; \
-    done && \
-    echo "=== Patched $patched NVIDIA wheel URLs in pixi.lock to use local files ===" && \
+RUN cd {{code_dir_str}} && \
 {%- if verbose %}
     echo "=== pixi version ===" && pixi --version && \
 {%- endif %}
@@ -655,19 +557,7 @@ RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheel
 
 # Install the cuml environment separately if requested.
 {% if 'cuml' in envs %}
-RUN --mount=type=bind,from=wheels-builder,source=/wheels-ready,target=/tmp/wheels-ready \
-    --mount=type=cache,id=pixi-nvidia-wheels,target=/pixi-cache/nvidia-wheels,readonly \
-    cd {{code_dir_str}} && \
-    patched=0 && \
-    for whl in /pixi-cache/nvidia-wheels/*.whl; do \
-        [ -f "$whl" ] || continue; \
-        filename=$(basename "$whl") && \
-        if grep -q "$filename" pixi.lock; then \
-            sed -i "s|https://pypi\.nvidia\.com/[^\"]*/${filename}\\b|file:///pixi-cache/nvidia-wheels/${filename}|g" pixi.lock && \
-            patched=$((patched + 1)); \
-        fi; \
-    done && \
-    echo "=== Patched $patched NVIDIA wheel URLs in pixi.lock to use local files ===" && \
+RUN cd {{code_dir_str}} && \
     export CONDA_OVERRIDE_CUDA=13.0.2 && \
 {%- if verbose %}
     export RUST_LOG=uv=debug && \
