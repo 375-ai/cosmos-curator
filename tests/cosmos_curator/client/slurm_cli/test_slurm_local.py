@@ -74,6 +74,13 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     monkeypatch.delenv("SLURM_JOBID", raising=False)
     monkeypatch.setenv("HOST_ONLY", "host-value")
+    monkeypatch.setenv("PIXI_PROJECT_MANIFEST", str(repo / "pixi.toml"))
+    monkeypatch.setenv("PIXI_PROJECT_ROOT", str(repo))
+    monkeypatch.setenv("PIXI_ENVIRONMENT_NAME", "cluster")
+    monkeypatch.setenv("PIXI_IN_SHELL", "1")
+    monkeypatch.setenv("CONDA_PREFIX", str(repo / ".pixi" / "envs" / "cluster"))
+    monkeypatch.setenv("CONDA_DEFAULT_ENV", "cosmos-curator:cluster")
+    monkeypatch.setenv("CONDA_ENV_SHLVL_2_PIXI_PROJECT_MANIFEST", str(repo / "pixi.toml"))
     image = tmp_path / "images" / "cosmos-curator+1.0.0-slim.sqsh"
 
     with (
@@ -160,6 +167,9 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     assert "CONDA_OVERRIDE_CUDA" in env_keys
     assert "SLURM_JOB_ID" in env_keys
     assert "SLURM_PROCID" not in env_keys
+    assert "PIXI_PROJECT_MANIFEST" not in env_keys
+    assert "PIXI_ENVIRONMENT_NAME" not in env_keys
+    assert "CONDA_PREFIX" not in env_keys
     assert "EXTRA" in env_keys
     assert "HOST_ONLY" in env_keys
     assert subprocess_env["COSMOS_CURATOR_RAY_SLURM_JOB"] == "True"
@@ -171,6 +181,13 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     assert subprocess_env["CONDA_OVERRIDE_CUDA"] == "13.0.2"
     assert subprocess_env["EXTRA"] == "value"
     assert subprocess_env["HOST_ONLY"] == "host-value"
+    assert "PIXI_PROJECT_MANIFEST" not in subprocess_env
+    assert "PIXI_PROJECT_ROOT" not in subprocess_env
+    assert "PIXI_ENVIRONMENT_NAME" not in subprocess_env
+    assert "PIXI_IN_SHELL" not in subprocess_env
+    assert "CONDA_PREFIX" not in subprocess_env
+    assert "CONDA_DEFAULT_ENV" not in subprocess_env
+    assert "CONDA_ENV_SHLVL_2_PIXI_PROJECT_MANIFEST" not in subprocess_env
 
     container_command = srun_cmd[srun_cmd.index("bash") + 2]
     assert "cd /opt/cosmos-curator" in container_command

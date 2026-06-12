@@ -45,6 +45,28 @@ _DEFAULT_CONTAINER_IMAGE = "~/container_images/cosmos-curator+1.0.0.sqsh"
 _DEFAULT_CONDA_OVERRIDE_CUDA = "13.0.2"
 _SOURCE_DIRNAMES = ("cosmos_curator", "tools")
 _SOURCE_FILENAMES = ("pixi.toml", "pixi.lock", "pyproject.toml", "pytest.ini", ".coveragerc")
+_PIXI_ACTIVATION_ENV_VARS = (
+    "PIXI_ENVIRONMENT_NAME",
+    "PIXI_ENVIRONMENT_PLATFORMS",
+    "PIXI_EXE",
+    "PIXI_IN_SHELL",
+    "PIXI_PROJECT_MANIFEST",
+    "PIXI_PROJECT_NAME",
+    "PIXI_PROJECT_ROOT",
+    "PIXI_PROJECT_VERSION",
+    "PIXI_PROMPT",
+)
+_CONDA_ACTIVATION_ENV_VARS = (
+    "CONDA_DEFAULT_ENV",
+    "CONDA_EXE",
+    "CONDA_PREFIX",
+    "CONDA_PROMPT_MODIFIER",
+    "CONDA_PYTHON_EXE",
+    "CONDA_SHLVL",
+    "_CE_CONDA",
+    "_CE_M",
+)
+_LAUNCHER_ENV_PREFIXES = ("CONDA_ENV_SHLVL_", "CONDA_PREFIX_")
 _SLURM_ENV_VARS_TO_FORWARD = (
     "SLURM_JOB_ID",
     "SLURM_JOBID",
@@ -200,6 +222,17 @@ def _get_cache_environment() -> dict[str, str]:
     }
 
 
+def _get_clean_subprocess_environment() -> dict[str, str]:
+    """Return host environment without Pixi/Conda activation state from the launcher shell."""
+    env = os.environ.copy()
+    for key in (*_PIXI_ACTIVATION_ENV_VARS, *_CONDA_ACTIVATION_ENV_VARS):
+        env.pop(key, None)
+    for key in list(env):
+        if key.startswith(_LAUNCHER_ENV_PREFIXES):
+            env.pop(key)
+    return env
+
+
 def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
@@ -247,7 +280,7 @@ def _get_source_link_command() -> str:
 def _get_srun_environment(
     opts: SlurmContainerRuntime, *, include_slurm_env: bool = True
 ) -> tuple[dict[str, str], list[str]]:
-    env = os.environ.copy()
+    env = _get_clean_subprocess_environment()
     container_env = {
         SLURM_RAY_ENV_VAR_NAME: "True",
         "COSMOS_S3_PROFILE_PATH": str(_CONTAINER_S3_CREDS_PATH),
