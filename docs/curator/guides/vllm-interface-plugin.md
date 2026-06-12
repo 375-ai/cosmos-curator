@@ -379,14 +379,19 @@ def make_llm_input(
     config: VllmConfig,
 ) -> dict[str, Any]:
     """Make LLM input for text-based models with PIL images."""
+    import numpy as np
     from PIL import Image
     
-    # Convert tensor frames to PIL Images
-    # frames shape: (num_frames, C, H, W) in range [0, 1]
+    # Convert tensor frames to PIL Images only if your model expects PIL inputs.
+    # Shape is (num_frames, C, H, W); value semantics depend on the caller's
+    # preprocessing mode and are not guaranteed to be [0, 1].
     images = []
     for frame in frames:
-        # Convert to (H, W, C) and scale to [0, 255]
-        frame_np = (frame.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        # Example for display-ready float tensors. Use a model-specific
+        # conversion for uint8 or normalized tensors.
+        frame_np = frame.permute(1, 2, 0).cpu().numpy()
+        frame_np = np.clip(frame_np, 0.0, 1.0)
+        frame_np = np.rint(frame_np * 255).astype(np.uint8)
         images.append(Image.fromarray(frame_np))
     
     # Build prompt with image placeholders
@@ -401,7 +406,7 @@ def make_llm_input(
 **Key points:**
 1. **Input format varies by model**: Check vLLM's model-specific docs
 2. **`multi_modal_data` key matters**: `"video"` vs `"image"` (singular vs plural)
-3. **Frames format**: Expect `torch.Tensor` of shape `(num_frames, C, H, W)` in range `[0, 1]`
+3. **Frames format**: Expect `torch.Tensor` of shape `(num_frames, C, H, W)`; dtype/range depends on the caller's preprocessing path
 4. **Metadata is part of the plugin API**: include it even if your model ignores it
 5. **`config.use_image_input` controls modality**: use it when one plugin supports both images and video
 6. **Chat templates**: Use `processor.apply_chat_template()` if model supports it
@@ -945,7 +950,8 @@ frames = frames.transpose(0, 1)  # Wrong!
 # Only transform if your model requires a different format
 ```
 
-**Why:** The interface contract is `(num_frames, C, H, W)` in range `[0, 1]`. Document if your model needs different format.
+**Why:** The interface contract is `(num_frames, C, H, W)`. Tensor dtype/range is determined by
+the caller's preprocessing path; document and test any model-specific conversion your plugin needs.
 
 ### Bug 6: Forgetting to Handle Edge Cases
 
@@ -998,8 +1004,9 @@ def make_llm_input(
     
     Args:
         prompt: Text prompt for video description.
-        frames: Video frames as torch.Tensor with shape (num_frames, C, H, W)
-                in range [0, 1]. Typically 8 frames for MyModel.
+        frames: Video frames as torch.Tensor with shape (num_frames, C, H, W).
+                Dtype/range depends on the caller's preprocessing path. Typically
+                8 frames for MyModel.
         metadata: Per-window metadata supplied by ``make_metadata``.
         processor: AutoProcessor for tokenization.
         config: vLLM configuration. Use ``config.use_image_input`` for image vs video plugins.

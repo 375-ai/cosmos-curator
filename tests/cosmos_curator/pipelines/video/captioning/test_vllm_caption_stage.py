@@ -28,6 +28,7 @@ import pytest
 from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.models.vllm_model_ids import _VLLM_MODELS
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning import vllm_caption_stage
 from cosmos_curator.pipelines.video.captioning.vllm_caption_stage import _scatter_captions
 from cosmos_curator.pipelines.video.utils.data_model import (
@@ -73,6 +74,48 @@ else:
 UUID_1 = UUID("00000000-0000-0000-0000-000000000001")
 UUID_2 = UUID("00000000-0000-0000-0000-000000000002")
 UUID_3 = UUID("00000000-0000-0000-0000-000000000003")
+
+
+@pytest.mark.env("default")
+@pytest.mark.parametrize(
+    ("preprocess_mode", "expected_render_mode"),
+    [
+        (PreprocessMode.CURATOR, "normalized_float"),
+        (PreprocessMode.MODEL, "display_uint8"),
+    ],
+)
+@patch("cosmos_curator.pipelines.video.captioning.vllm_caption_stage.windowing_utils.make_windows_for_video")
+def test_prep_windows_passes_debug_render_context(
+    mock_make_windows: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    preprocess_mode: PreprocessMode,
+    expected_render_mode: str,
+) -> None:
+    """VllmPrepStage should pass video render context when debug saving is enabled."""
+    config = VllmConfig(
+        model_variant="mock",
+        preprocess_mode=preprocess_mode,
+        debug_save_frames=True,
+        debug_frames_output_dir=Path("frames"),
+    )
+    stage = VllmPrepStage(config, WindowConfig(), keep_mp4=False)
+    stage._processor = MagicMock()  # type: ignore[attr-defined]
+
+    windows = [Window(start_frame=0, end_frame=1)]
+    frames = [torch.zeros((1, 3, 4, 4))]
+    mock_make_windows.return_value = (windows, frames)
+    captured: dict[str, object] = {}
+
+    def fake_make_model_inputs(*_args: object, **kwargs: object) -> list[dict[str, object]]:
+        captured.update(kwargs)
+        return [{"test": "data"}]
+
+    monkeypatch.setattr(vllm_caption_stage, "make_model_inputs", fake_make_model_inputs)
+
+    stage._prep_windows(Video(input_video=Path("test.mp4")), "prompt")
+
+    render_context: Any = captured["debug_render_context"]
+    assert render_context.mode == expected_render_mode
 
 
 @pytest.mark.env("default")

@@ -78,6 +78,7 @@ if pixi_utils.is_running_in_env("default"):
 
     from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
     from cosmos_curator.models.vllm_interface import (
+        FrameRenderContext,
         VllmWindowResult,
         auto_processor,
         make_metadata,
@@ -87,11 +88,22 @@ if pixi_utils.is_running_in_env("default"):
         vllm_model,
     )
     from cosmos_curator.pipelines.video.utils.decoder_utils import get_frame_count
-    from cosmos_curator.pipelines.video.utils.vision_process import fetch_video, read_video_cpu
+    from cosmos_curator.pipelines.video.utils.vision_process import (
+        OPENAI_CLIP_MEAN,
+        OPENAI_CLIP_STD,
+        fetch_video,
+        read_video_cpu,
+    )
     from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
     vllm_logger = logging.getLogger("vllm")
     vllm_logger.setLevel(logging.ERROR)  # Suppress warnings and info from vLLM
+
+    def _video_debug_render_context(preprocess_mode: PreprocessMode) -> FrameRenderContext:
+        """Build the debug render context for video tensors from the video preprocessing contract."""
+        if preprocess_mode == PreprocessMode.CURATOR:
+            return FrameRenderContext.normalized_float(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD)
+        return FrameRenderContext.display_uint8()
 
 
 T = TypeVar("T", bound=PipelineTask)
@@ -434,6 +446,11 @@ class VllmPrepStage(CuratorStage):
             self._processor,
             prompt,
             debug_window_ids=debug_window_ids,
+            debug_render_context=(
+                _video_debug_render_context(self._vllm_config.preprocess_mode)
+                if self._vllm_config.debug_save_frames
+                else None
+            ),
         )
 
         for window, llm_input in zip(windows, llm_inputs, strict=True):
@@ -1075,6 +1092,11 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
             config=caption_single_config,
             processor=self._processor,
             prompt=prompt,
+            debug_render_context=(
+                _video_debug_render_context(caption_single_config.preprocess_mode)
+                if caption_single_config.debug_save_frames
+                else None
+            ),
         )
         if not llm_inputs:
             msg = "make_model_inputs produced no inputs for caption_single."

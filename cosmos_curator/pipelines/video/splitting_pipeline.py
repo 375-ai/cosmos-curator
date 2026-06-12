@@ -2323,8 +2323,9 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         action="store_true",
         default=False,
         help=(
-            "Save video frames passed to vLLM as PNGs for debugging. "
-            "Frames will be saved to {output-clip-path}/frames/{clip_uuid}/"
+            "Save video frames passed to vLLM as debug artifacts: a PNG preview plus a "
+            "frame_stats.json describing the tensor as passed to the model. Written to "
+            "{output-clip-path}/frames/{clip_uuid}/"
         ),
     )
     parser.add_argument(

@@ -142,7 +142,7 @@ class VllmConfig:
     copy_weights_to: Path | None = None   # Optional model weight copy directory
     sampling_config: VllmSamplingConfig = attrs.Factory(VllmSamplingConfig)
     performance_mode: str | None = "throughput"
-    debug_save_frames: bool = False       # Save debug frame PNGs
+    debug_save_frames: bool = False       # Save debug frame artifacts
     debug_frames_output_dir: Path | None = None
 ```
 
@@ -231,7 +231,7 @@ Creates vLLM sampling parameters from configuration.
 
 ### Input Preparation Functions
 
-#### `make_model_inputs(videos, metadata, config, processor, prompt, *, debug_window_ids=None) -> list[dict[str, Any]]`
+#### `make_model_inputs(videos, metadata, config, processor, prompt, *, debug_window_ids=None, debug_render_context=None) -> list[dict[str, Any]]`
 
 Converts decoded video frames into model-ready inputs.
 
@@ -242,6 +242,7 @@ Converts decoded video frames into model-ready inputs.
 - `processor`: AutoProcessor for the model
 - `prompt`: Text prompt for captioning
 - `debug_window_ids`: Optional IDs used to organize saved debug frames
+- `debug_render_context`: Optional caller-owned context for rendering debug PNG previews
 
 **Returns**: List of model-specific input dictionaries
 

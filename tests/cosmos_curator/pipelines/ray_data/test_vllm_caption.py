@@ -21,6 +21,7 @@ import sys
 import types
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -433,6 +434,66 @@ def test_caption_window_rows_threads_window_pixel_cap(
     assert captured_kwargs["max_pixels_per_frame"] == pixel_cap
     assert rows[0]["caption_skip"] is True
     assert rows[0]["caption_error"] == "no_caption_windows"
+
+
+@pytest.mark.parametrize(
+    ("preprocess_mode", "expected_render_mode"),
+    [
+        (PreprocessMode.CURATOR, "normalized_float"),
+        (PreprocessMode.MODEL, "display_uint8"),
+    ],
+)
+def test_caption_window_rows_passes_video_debug_render_context(
+    monkeypatch: pytest.MonkeyPatch,
+    preprocess_mode: PreprocessMode,
+    expected_render_mode: str,
+) -> None:
+    """Ray Data video rows should pass the same debug render context as sync video."""
+    captured: dict[str, object] = {}
+
+    class FakeFrameRenderContext:
+        @classmethod
+        def normalized_float(cls, *_args: object, **_kwargs: object) -> types.SimpleNamespace:
+            return types.SimpleNamespace(mode="normalized_float")
+
+        @classmethod
+        def display_uint8(cls) -> types.SimpleNamespace:
+            return types.SimpleNamespace(mode="display_uint8")
+
+    fake_vllm_interface = types.ModuleType("cosmos_curator.models.vllm_interface")
+    fake_vllm_interface.FrameRenderContext = FakeFrameRenderContext
+    fake_vllm_interface.auto_processor = lambda *_args, **_kwargs: object()
+    fake_vllm_interface.make_metadata = lambda frames, *_args, **_kwargs: [{"fps": 1.0} for _ in frames]
+
+    def fake_make_model_inputs(*_args: object, **kwargs: object) -> list[dict[str, object]]:
+        captured.update(kwargs)
+        return [{"prompt": "rendered"}]
+
+    fake_vllm_interface.make_model_inputs = fake_make_model_inputs
+
+    fake_windowing_utils = types.ModuleType("cosmos_curator.pipelines.video.utils.windowing_utils")
+    fake_windowing_utils.split_video_into_windows = lambda *_args, **_kwargs: (
+        [],
+        [object()],
+        [types.SimpleNamespace(start=3, end=7)],
+    )
+    fake_vision_process = types.ModuleType("cosmos_curator.pipelines.video.utils.vision_process")
+    fake_vision_process.OPENAI_CLIP_MEAN = [0.1, 0.2, 0.3]
+    fake_vision_process.OPENAI_CLIP_STD = [0.4, 0.5, 0.6]
+
+    monkeypatch.setitem(sys.modules, "cosmos_curator.models.vllm_interface", fake_vllm_interface)
+    monkeypatch.setitem(sys.modules, "cosmos_curator.pipelines.video.utils.windowing_utils", fake_windowing_utils)
+    monkeypatch.setitem(sys.modules, "cosmos_curator.pipelines.video.utils.vision_process", fake_vision_process)
+
+    make_rows = _captioner.make_caption_window_rows_fn(
+        vllm_config=VllmConfig(model_variant="qwen", preprocess_mode=preprocess_mode, debug_save_frames=True),
+    )
+
+    rows = make_rows(_base_window_row(clip_bytes=b"not-real-video"))
+
+    render_context: Any = captured["debug_render_context"]
+    assert render_context.mode == expected_render_mode
+    assert rows[0]["prompt"] == "rendered"
 
 
 def test_caption_window_rows_runs_window_generation_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

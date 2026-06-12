@@ -26,7 +26,9 @@ paths run on every test invocation.
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -340,12 +342,17 @@ def test_vllm_caption_single_clears_video_max_pixels_without_mutating_stage_conf
     from cosmos_curator.pipelines.video.utils.data_model import VllmConfig  # noqa: PLC0415
 
     stage = vcs.VllmCaptionStage(
-        vllm_config=VllmConfig(model_variant="qwen3_vl_30b", video_max_pixels_per_frame=602112)
+        vllm_config=VllmConfig(
+            model_variant="qwen3_vl_30b",
+            video_max_pixels_per_frame=602112,
+            debug_save_frames=True,
+            debug_frames_output_dir=Path("frames"),
+        )
     )
     captured: dict[str, object] = {}
 
     def fake_make_model_inputs(**kwargs: object) -> list[dict[str, object]]:
-        captured["config"] = kwargs["config"]
+        captured.update(kwargs)
         return [{"prompt": "rendered", "multi_modal_data": {"video": [None]}}]
 
     monkeypatch.setattr(vcs, "make_model_inputs", fake_make_model_inputs)
@@ -369,6 +376,8 @@ def test_vllm_caption_single_clears_video_max_pixels_without_mutating_stage_conf
     config = captured["config"]
     assert isinstance(config, VllmConfig)
     assert config.video_max_pixels_per_frame is None
+    render_context: Any = captured["debug_render_context"]
+    assert render_context.mode == "display_uint8"
     assert stage._vllm_config.video_max_pixels_per_frame == 602112
 
 

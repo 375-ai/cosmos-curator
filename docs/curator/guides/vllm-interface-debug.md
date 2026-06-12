@@ -364,6 +364,56 @@ results = vllm_caption(..., stage2_prompts=["Refine..."])
 - Request ID mismatch → finished request not found in `in_flight_requests`
 - Stage 2 requests counted in total → they shouldn't be
 
+### Scenario 4: Debug frame preview doesn't match tensor state
+
+**Symptoms:**
+```bash
+--debug-save-vllm-frames
+```
+
+Debug artifacts are written under `{output-clip-path}/frames/{clip_uuid}/` for
+clip-organized video windows, or `window_{idx:04d}/` for fallback organization.
+Each frame-set directory contains PNG previews plus `frame_stats.json`.
+
+**How to read the artifacts:**
+- The PNG is a human preview. It may be denormalized, clamped, scaled, and rounded
+  to `uint8` before writing.
+- `frame_stats.json` describes the tensor as passed toward vLLM before preview
+  rendering. Use it to inspect `dtype`, `shape`, value range, mean/std, and
+  sampled unique values.
+
+**Debug steps:**
+1. Check `frame_stats.json` first:
+   ```json
+   {
+     "dtype": "torch.float16",
+     "shape": [8, 3, 224, 224],
+     "nonfinite_count": 0,
+     "value_min": -1.7,
+     "value_max": 2.5,
+     "render_context": {"mode": "normalized_float"}
+   }
+   ```
+
+2. Interpret the tensor state:
+   - `normalized_float` with values outside `[0, 1]` is expected for video
+     `PreprocessMode.CURATOR`.
+   - `display_uint8` should have display-domain values clamped to `[0, 255]`
+     for preview writing.
+   - `display_float01` should have display-ready float values in `[0, 1]`.
+
+3. Separate preview bugs from preprocessing bugs:
+   - If the PNG looks plausible and stats show the expected tensor state, the
+     debug artifact path is working.
+   - If stats show all zeros, a tiny sampled-unique count, unexpected shape, or
+     an unexpected dtype/range, investigate the preprocessing path that produced
+     the tensor.
+
+**Common causes:**
+- Missing or incorrect render context when a new debug caller is added
+- Normalized tensors inspected as if they were display-ready pixels
+- Blank or constant tensors produced before the vLLM input builder
+
 ## Debugging Techniques
 
 ### Where to Set Breakpoints

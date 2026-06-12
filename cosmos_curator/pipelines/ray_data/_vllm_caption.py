@@ -43,11 +43,14 @@ from cosmos_curator.core.utils.model.model_utils import get_local_dir_for_weight
 from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv, ray_data_gpu_runtime_env
 from cosmos_curator.core.utils.storage.storage_utils import StorageWriter
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.ray_data._summary_writer import write_summary_from_rows
 from cosmos_curator.pipelines.video.utils.data_model import VllmConfig, VllmSamplingConfig, WindowConfig
 
 if TYPE_CHECKING:
     from transformers import AutoProcessor
+
+    from cosmos_curator.models.vllm_interface import FrameRenderContext
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +94,19 @@ def qwen_model_id() -> str:
 def qwen_model_source() -> str:
     """Return the Xenna local-cache model path for Qwen."""
     return str(get_local_dir_for_weights_name(qwen_model_id()))
+
+
+def _video_debug_render_context(preprocess_mode: PreprocessMode) -> "FrameRenderContext":
+    """Build the debug render context for Ray Data video tensors."""
+    from cosmos_curator.models.vllm_interface import FrameRenderContext  # noqa: PLC0415
+    from cosmos_curator.pipelines.video.utils.vision_process import (  # noqa: PLC0415
+        OPENAI_CLIP_MEAN,
+        OPENAI_CLIP_STD,
+    )
+
+    if preprocess_mode == PreprocessMode.CURATOR:
+        return FrameRenderContext.normalized_float(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD)
+    return FrameRenderContext.display_uint8()
 
 
 def _max_caption_workers(total_visible_gpus: int, num_gpus_per_worker: int) -> int:
@@ -412,6 +428,11 @@ def make_caption_window_rows_fn(
                 resolved_vllm_config,
                 cast("AutoProcessor", _get_processor()),
                 _get_prompt(),
+                debug_render_context=(
+                    _video_debug_render_context(resolved_vllm_config.preprocess_mode)
+                    if resolved_vllm_config.debug_save_frames
+                    else None
+                ),
             )
             output_rows: list[dict[str, Any]] = []
             for (window_index, window_info, _), model_input in zip(decoded_windows, model_inputs, strict=True):

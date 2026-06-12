@@ -86,6 +86,7 @@ DEBUG TIP: Set breakpoint in vllm_caption() and step through for complete flow
 
 import asyncio
 import contextlib
+import json
 import secrets
 from collections import deque
 from collections.abc import Callable
@@ -95,6 +96,7 @@ from typing import (  # noqa: UP035, remove noqa when we drop support for python
     Any,
     Deque,
     Iterable,
+    Literal,
     TypeVar,
     cast,
 )
@@ -158,6 +160,13 @@ _VLLM_PLUGINS = {
 
 T = TypeVar("T")
 
+RGB_CHANNELS = 3
+GRAYSCALE_CHANNELS = 1
+PNG_MAX_VALUE = 255
+_STATS_SAMPLE_CAP = 4096
+_STATS_UNIQUE_VALUES_CAP = 32
+_RENDER_CONTEXT_MODES = frozenset({"display_uint8", "display_float01", "normalized_float"})
+
 
 @attrs.define
 class VllmWindowResult:
@@ -166,6 +175,62 @@ class VllmWindowResult:
     text: str
     finish_reason: str | None
     token_counts: TokenCounts
+
+
+@attrs.frozen
+class FrameRenderContext:
+    """Caller-owned instructions for turning a debug tensor into a PNG preview.
+
+    The shared saver follows caller-supplied context instead of guessing tensor
+    semantics from dtype or value range.
+    """
+
+    mode: Literal["display_uint8", "display_float01", "normalized_float"]
+    denorm_mean: tuple[float, ...] | None = None
+    denorm_std: tuple[float, ...] | None = None
+
+    @classmethod
+    def display_uint8(cls) -> "FrameRenderContext":
+        """Render display-domain uint8 tensors without value-range scaling."""
+        return cls(mode="display_uint8")
+
+    @classmethod
+    def display_float01(cls) -> "FrameRenderContext":
+        """Render display-ready float tensors in [0, 1].
+
+        This mode is separate from display_uint8 for callers that already have
+        display-ready float tensors and should scale them explicitly without
+        value-range inference.
+        """
+        return cls(mode="display_float01")
+
+    @classmethod
+    def normalized_float(
+        cls,
+        mean: Iterable[float],
+        std: Iterable[float],
+    ) -> "FrameRenderContext":
+        """Render normalized RGB float tensors by applying frame * std + mean."""
+        return cls(mode="normalized_float", denorm_mean=tuple(mean), denorm_std=tuple(std))
+
+    def __attrs_post_init__(self) -> None:
+        """Validate render context invariants at construction time."""
+        if self.mode not in _RENDER_CONTEXT_MODES:
+            msg = f"Unsupported frame render context mode: {self.mode}"
+            raise ValueError(msg)
+
+        if self.mode == "normalized_float":
+            if self.denorm_mean is None or self.denorm_std is None:
+                msg = "normalized_float render context requires denorm_mean and denorm_std"
+                raise ValueError(msg)
+            if len(self.denorm_mean) != RGB_CHANNELS or len(self.denorm_std) != RGB_CHANNELS:
+                msg = "normalized_float render context requires 3-channel mean/std"
+                raise ValueError(msg)
+            return
+
+        if self.denorm_mean is not None or self.denorm_std is not None:
+            msg = "display render contexts must not include denorm_mean or denorm_std"
+            raise ValueError(msg)
 
 
 def _make_window_result(request: VllmCaptionRequest, token_counts: TokenCounts) -> VllmWindowResult:
@@ -201,13 +266,15 @@ def _save_frames_as_pngs(
     frames: torch.Tensor,
     output_dir: Path,
     prefix: str,
+    render_context: FrameRenderContext,
 ) -> None:
-    """Save video frames as PNG files for debugging.
+    """Save video frames as PNG debug artifacts.
 
     Args:
         frames: Tensor of shape [num_frames, C, H, W] containing video frames.
         output_dir: Directory to save the PNG files.
         prefix: Prefix for the PNG filenames (e.g., "frame" or "window_0_frame").
+        render_context: Instructions for rendering the tensor as a preview PNG.
 
     """
     # Create output directory if it doesn't exist
@@ -217,27 +284,10 @@ def _save_frames_as_pngs(
     num_frames = frames.shape[0]
     logger.info(f"Saving {num_frames} frames to {output_dir} with prefix '{prefix}' {frames.shape=}")
 
-    RGB_CHANNELS = 3
-    GRAYSCALE_CHANNELS = 1
-    MAX_NORMALIZED_VALUE = 1.0
-    PNG_MAX_VALUE = 255
-
     for frame_idx in range(num_frames):
         frame = frames[frame_idx]  # shape: [C, H, W]
 
-        # Convert from torch tensor to numpy
-        # Assuming frame is in [C, H, W] format with values in [0, 255] or [0, 1]
-        frame_np = frame.cpu().numpy()
-
-        # Convert from [C, H, W] to [H, W, C]
-        frame_np = np.transpose(frame_np, (1, 2, 0))
-
-        # Ensure values are in [0, 255] range
-        frame_np = (
-            (frame_np * PNG_MAX_VALUE).astype(np.uint8)
-            if frame_np.max() <= MAX_NORMALIZED_VALUE
-            else frame_np.astype(np.uint8)
-        )
+        frame_np = _render_frame_for_png(frame, render_context)
 
         # Handle grayscale (single channel) or RGB
         if frame_np.shape[2] == GRAYSCALE_CHANNELS:
@@ -257,7 +307,107 @@ def _save_frames_as_pngs(
         output_path = output_dir / filename
         img.save(output_path, "PNG")
 
+    _write_frame_stats(output_dir, frames, render_context)
     logger.info(f"Saved {num_frames} frames to {output_dir}")
+
+
+def _render_frame_for_png(frame: torch.Tensor, render_context: FrameRenderContext) -> np.ndarray[Any, Any]:
+    """Render a single [C, H, W] frame tensor to a [H, W, C] uint8 PNG array."""
+    frame_np = frame.detach().cpu().numpy()
+    frame_np = np.transpose(frame_np, (1, 2, 0)).astype(np.float32, copy=False)
+
+    if render_context.mode == "display_uint8":
+        display_uint8_result: np.ndarray[Any, Any] = np.rint(np.clip(frame_np, 0, PNG_MAX_VALUE)).astype(np.uint8)
+        return display_uint8_result
+
+    if render_context.mode == "display_float01":
+        display_float_result: np.ndarray[Any, Any] = np.rint(np.clip(frame_np, 0.0, 1.0) * PNG_MAX_VALUE).astype(
+            np.uint8
+        )
+        return display_float_result
+
+    if frame_np.shape[2] != RGB_CHANNELS:
+        msg = f"normalized_float render context requires {RGB_CHANNELS} channels, got {frame_np.shape[2]}"
+        raise ValueError(msg)
+
+    if render_context.denorm_mean is None or render_context.denorm_std is None:
+        msg = "normalized_float render context requires denorm_mean and denorm_std"
+        raise ValueError(msg)
+
+    mean = np.asarray(render_context.denorm_mean, dtype=np.float32).reshape(1, 1, RGB_CHANNELS)
+    std = np.asarray(render_context.denorm_std, dtype=np.float32).reshape(1, 1, RGB_CHANNELS)
+    denorm_frame = (frame_np * std) + mean
+    normalized_result: np.ndarray[Any, Any] = np.rint(np.clip(denorm_frame, 0.0, 1.0) * PNG_MAX_VALUE).astype(np.uint8)
+    return normalized_result
+
+
+def _write_frame_stats(output_dir: Path, frames: torch.Tensor, render_context: FrameRenderContext) -> None:
+    """Write lightweight tensor stats next to debug PNG previews."""
+    stats_path = output_dir / "frame_stats.json"
+    stats = _collect_frame_stats(frames, render_context)
+    stats_path.write_text(json.dumps(stats, allow_nan=False, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _collect_frame_stats(frames: torch.Tensor, render_context: FrameRenderContext) -> dict[str, Any]:
+    """Collect lightweight stats from the tensor as passed toward vLLM."""
+    frames_cpu = frames.detach().cpu()
+    frame_values = frames_cpu.numpy().reshape(-1)
+    sampled_unique_sample_size = min(frame_values.size, _STATS_SAMPLE_CAP)
+    sample_step = max(1, frame_values.size // _STATS_SAMPLE_CAP)
+    sampled_values = frame_values[::sample_step][:sampled_unique_sample_size]
+    unique_values = np.unique(sampled_values)
+    sampled_unique_count = int(unique_values.size)
+    frame_values_f32 = frame_values.astype(np.float32, copy=False)
+
+    stats: dict[str, Any] = {
+        "dtype": str(frames.dtype),
+        "shape": list(frames.shape),
+        "nonfinite_count": int(np.count_nonzero(~np.isfinite(frame_values_f32))),
+        "sampled_unique_sample_size": int(sampled_unique_sample_size),
+        "sampled_unique_count": sampled_unique_count,
+        "sampled_unique_values": [_json_safe_float(value) for value in unique_values[:_STATS_UNIQUE_VALUES_CAP]],
+        "sampled_unique_values_truncated": sampled_unique_count > _STATS_UNIQUE_VALUES_CAP,
+        "render_context": _render_context_as_stats(render_context),
+    }
+
+    if frame_values.size == 0:
+        stats.update(
+            {
+                "value_min": None,
+                "value_max": None,
+                "value_mean": None,
+                "value_std": None,
+            },
+        )
+        return stats
+
+    stats.update(
+        {
+            "value_min": _json_safe_float(np.min(frame_values_f32)),
+            "value_max": _json_safe_float(np.max(frame_values_f32)),
+            "value_mean": _json_safe_float(np.mean(frame_values_f32)),
+            "value_std": _json_safe_float(np.std(frame_values_f32)),
+        },
+    )
+    return stats
+
+
+def _json_safe_float(value: float | np.floating[Any]) -> float | None:
+    """Return a strict-JSON-safe float, preserving non-finite values as null."""
+    value_float = float(value)
+    if not np.isfinite(value_float):
+        return None
+    return value_float
+
+
+def _render_context_as_stats(render_context: FrameRenderContext) -> dict[str, Any]:
+    """Serialize render context for frame_stats.json."""
+    context: dict[str, Any] = {"mode": render_context.mode}
+    if render_context.denorm_mean is not None:
+        context["denorm_mean"] = list(render_context.denorm_mean)
+    if render_context.denorm_std is not None:
+        context["denorm_std"] = list(render_context.denorm_std)
+    return context
 
 
 def vllm_model(config: VllmConfig) -> LLM:
@@ -362,6 +512,7 @@ def make_model_inputs(  # noqa: PLR0913
     prompt: str,
     *,
     debug_window_ids: list[str] | None = None,
+    debug_render_context: FrameRenderContext | None = None,
 ) -> list[dict[str, Any]]:
     """Make model inputs for a list of videos.
 
@@ -373,6 +524,7 @@ def make_model_inputs(  # noqa: PLR0913
         prompt: The prompt to use for the vLLM model.
         debug_window_ids: Optional list of clip UUIDs for organizing debug frames.
             Frames will be saved to {debug_frames_output_dir}/{clip_uuid}/frame_NNNN.png
+        debug_render_context: Optional render context for debug PNG previews.
 
     Returns:
         A list of LLM inputs for each video
@@ -384,6 +536,8 @@ def make_model_inputs(  # noqa: PLR0913
     if config.debug_save_frames:
         if config.debug_frames_output_dir is None:
             logger.warning("debug_save_frames is True but debug_frames_output_dir is None, skipping frame saving")
+        elif debug_render_context is None:
+            logger.warning("debug_save_frames is True but debug_render_context is None, skipping debug frame artifacts")
         else:
             for idx, frames in enumerate(videos):
                 # Use clip UUID as the subdirectory if provided
@@ -398,6 +552,7 @@ def make_model_inputs(  # noqa: PLR0913
                     frames,
                     output_dir,
                     prefix="frame",
+                    render_context=debug_render_context,
                 )
 
     return [

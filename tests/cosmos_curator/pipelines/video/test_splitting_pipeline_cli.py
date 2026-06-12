@@ -163,6 +163,15 @@ def test_deprecated_vllm_preprocess_args_are_documented() -> None:
     assert "Deprecated" in help_text
 
 
+def test_debug_save_vllm_frames_help_text_names_png_preview_and_stats() -> None:
+    """Debug frame help should describe both preview PNGs and tensor stats."""
+    help_text = _parser().format_help()
+
+    assert "--debug-save-vllm-frames" in help_text
+    assert "PNG preview" in help_text
+    assert "frame_stats.json" in help_text
+
+
 @pytest.mark.parametrize(
     "legacy_args",
     [

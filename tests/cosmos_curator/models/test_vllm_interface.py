@@ -14,6 +14,7 @@
 # limitations under the License.
 """Test vllm_interface.py."""
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -36,11 +37,13 @@ if pixi_utils.is_running_in_env("default"):
 
     from cosmos_curator.models.vllm_interface import (
         _VLLM_PLUGINS,
+        FrameRenderContext,
         VllmWindowResult,
         _caption_inflight_batching,
         _caption_no_inflight_batching,
         _get_vllm_plugin,
         _save_frames_as_pngs,
+        _write_frame_stats,
         auto_processor,
         make_metadata,
         make_model_inputs,
@@ -417,26 +420,25 @@ def test_vllm_caption_dispatch(mock_no_ifb: MagicMock, mock_ifb: MagicMock, *, i
 
 @pytest.mark.env("default")
 @pytest.mark.parametrize(
-    ("shape", "values_normalized", "prefix"),
+    ("shape", "render_mode", "prefix"),
     [
         # RGB frames with normalized values [0, 1]
-        ((3, 3, 64, 64), True, "frame"),
+        ((3, 3, 64, 64), "display_float01", "frame"),
         # RGB frames with uint8 values [0, 255]
-        ((5, 3, 128, 128), False, "window_0_frame"),
+        ((5, 3, 128, 128), "display_uint8", "window_0_frame"),
         # Grayscale frames with normalized values
-        ((2, 1, 32, 32), True, "test_prefix"),
+        ((2, 1, 32, 32), "display_float01", "test_prefix"),
         # Grayscale frames with uint8 values
-        ((4, 1, 96, 96), False, "frame"),
+        ((4, 1, 96, 96), "display_uint8", "frame"),
         # Single frame RGB
-        ((1, 3, 50, 50), True, "single"),
+        ((1, 3, 50, 50), "display_float01", "single"),
         # Prefix already ending with "_frame"
-        ((2, 3, 40, 40), True, "window_5_frame"),
+        ((2, 3, 40, 40), "display_float01", "window_5_frame"),
     ],
 )
 def test_save_frames_as_pngs(
     shape: tuple[int, int, int, int],
-    *,
-    values_normalized: bool,
+    render_mode: str,
     prefix: str,
     tmp_path: Path,
 ) -> None:
@@ -450,9 +452,12 @@ def test_save_frames_as_pngs(
     - PNG files can be loaded and have correct dimensions/channels
     """
     num_frames, channels, height, width = shape
+    render_context = (
+        FrameRenderContext.display_float01() if render_mode == "display_float01" else FrameRenderContext.display_uint8()
+    )
 
     # Create test frames with specified shape
-    if values_normalized:
+    if render_mode == "display_float01":
         frames = torch.rand((num_frames, channels, height, width))
     else:
         frames = torch.randint(0, 256, (num_frames, channels, height, width), dtype=torch.uint8).float()
@@ -460,7 +465,7 @@ def test_save_frames_as_pngs(
     output_dir = tmp_path / "frames_output"
 
     # Call the function
-    _save_frames_as_pngs(frames, output_dir, prefix)
+    _save_frames_as_pngs(frames, output_dir, prefix, render_context)
 
     # Verify output directory was created
     assert output_dir.exists()
@@ -469,6 +474,7 @@ def test_save_frames_as_pngs(
     # Verify correct number of files were created
     png_files = sorted(output_dir.glob("*.png"))
     assert len(png_files) == num_frames
+    assert (output_dir / "frame_stats.json").exists()
 
     # Verify each frame was saved correctly
     for frame_idx, png_file in enumerate(png_files):
@@ -500,6 +506,178 @@ def test_save_frames_as_pngs(
             assert img_array.shape == (height, width)
         elif channels == 3:
             assert img_array.shape == (height, width, channels)
+
+
+@pytest.mark.env("default")
+def test_save_frames_as_pngs_display_uint8_does_not_scale_near_black(tmp_path: Path) -> None:
+    """Display-domain uint8 previews should not infer [0, 1] from a near-black range."""
+    frames = torch.tensor(
+        [[[[0, 1], [1, 0]], [[1, 0], [0, 1]], [[0, 1], [0, 1]]]],
+        dtype=torch.uint8,
+    )
+    output_dir = tmp_path / "frames_output"
+
+    _save_frames_as_pngs(frames, output_dir, "frame", FrameRenderContext.display_uint8())
+
+    img_array = np.array(Image.open(output_dir / "frame_0000.png"))
+    assert img_array.max() == 1
+
+
+@pytest.mark.env("default")
+def test_save_frames_as_pngs_display_float01_scales_by_context(tmp_path: Path) -> None:
+    """Display-ready float previews scale [0, 1] values through the explicit context."""
+    frames = torch.tensor(
+        [[[[0.0, 0.5, 1.0]], [[0.0, 0.5, 1.0]], [[0.0, 0.5, 1.0]]]],
+        dtype=torch.float32,
+    )
+    output_dir = tmp_path / "frames_output"
+
+    _save_frames_as_pngs(frames, output_dir, "frame", FrameRenderContext.display_float01())
+
+    img_array = np.array(Image.open(output_dir / "frame_0000.png"))
+    assert img_array.tolist() == [[[0, 0, 0], [128, 128, 128], [255, 255, 255]]]
+
+
+@pytest.mark.env("default")
+def test_save_frames_as_pngs_normalized_float16_denormalizes_preview(tmp_path: Path) -> None:
+    """Normalized float16 previews should denormalize back to display-domain RGB."""
+    from cosmos_curator.pipelines.video.utils.vision_process import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD  # noqa: PLC0415
+
+    original_uint8 = torch.tensor(
+        [[[[0, 64], [128, 255]], [[255, 128], [64, 0]], [[32, 96], [160, 224]]]],
+        dtype=torch.uint8,
+    )
+    normalized = original_uint8.to(torch.float32) / 255.0
+    mean = torch.tensor(OPENAI_CLIP_MEAN, dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.tensor(OPENAI_CLIP_STD, dtype=torch.float32).view(1, 3, 1, 1)
+    normalized = ((normalized - mean) / std).to(torch.float16)
+    output_dir = tmp_path / "frames_output"
+
+    _save_frames_as_pngs(
+        normalized,
+        output_dir,
+        "frame",
+        FrameRenderContext.normalized_float(OPENAI_CLIP_MEAN, OPENAI_CLIP_STD),
+    )
+
+    img_array = np.array(Image.open(output_dir / "frame_0000.png"))
+    expected = np.transpose(original_uint8.numpy()[0], (1, 2, 0))
+    assert np.max(np.abs(img_array.astype(np.int16) - expected.astype(np.int16))) <= 1
+
+
+@pytest.mark.env("default")
+def test_save_frames_as_pngs_normalized_requires_rgb(tmp_path: Path) -> None:
+    """Normalized previews are RGB-only because mean/std are 3-channel values."""
+    frames = torch.zeros((1, 1, 2, 2), dtype=torch.float16)
+
+    with pytest.raises(ValueError, match="requires 3 channels"):
+        _save_frames_as_pngs(
+            frames,
+            tmp_path / "frames_output",
+            "frame",
+            FrameRenderContext.normalized_float(
+                [0.5, 0.5, 0.5],
+                [0.25, 0.25, 0.25],
+            ),
+        )
+
+
+@pytest.mark.env("default")
+def test_save_frames_as_pngs_writes_pre_render_stats(tmp_path: Path) -> None:
+    """Stats describe the tensor before PNG render transforms and sample uniques with a cap."""
+    frames = torch.arange(5000, dtype=torch.float32).reshape(1, 1, 1, 5000)
+    output_dir = tmp_path / "frames_output"
+
+    _save_frames_as_pngs(frames, output_dir, "frame", FrameRenderContext.display_uint8())
+
+    stats = json.loads((output_dir / "frame_stats.json").read_text())
+    assert stats["dtype"] == "torch.float32"
+    assert stats["shape"] == [1, 1, 1, 5000]
+    assert stats["value_min"] == 0.0
+    assert stats["value_max"] == 4999.0
+    assert stats["sampled_unique_sample_size"] == 4096
+    assert stats["sampled_unique_count"] <= 4096
+    assert len(stats["sampled_unique_values"]) <= 32
+    assert stats["render_context"] == {"mode": "display_uint8"}
+
+
+@pytest.mark.env("default")
+def test_write_frame_stats_serializes_nonfinite_values_as_strict_json(tmp_path: Path) -> None:
+    """Stats remain valid JSON and preserve a count when tensors contain NaN or Inf."""
+    frames = torch.tensor([[[[0.0, float("nan"), float("inf"), float("-inf")]]]], dtype=torch.float32)
+
+    _write_frame_stats(tmp_path, frames, FrameRenderContext.display_float01())
+
+    raw_stats = (tmp_path / "frame_stats.json").read_text()
+    stats = json.loads(
+        raw_stats,
+        parse_constant=lambda value: pytest.fail(f"Non-standard JSON constant serialized: {value}"),
+    )
+    assert stats["nonfinite_count"] == 3
+    assert stats["value_min"] is None
+    assert stats["value_max"] is None
+    assert stats["value_mean"] is None
+    assert stats["value_std"] is None
+    assert None in stats["sampled_unique_values"]
+    assert 0.0 in stats["sampled_unique_values"]
+
+
+@pytest.mark.env("default")
+def test_make_model_inputs_debug_save_missing_context_skips_artifacts(tmp_path: Path) -> None:
+    """Debug saving without render context should warn and leave no artifact directories."""
+    videos = [torch.zeros((1, 3, 2, 2))]
+    metadata = [{"fps": 1.0}]
+    config = VllmConfig(
+        model_variant="mock",
+        debug_save_frames=True,
+        debug_frames_output_dir=tmp_path / "frames",
+    )
+
+    with patch("cosmos_curator.models.vllm_interface.logger.warning") as mock_warning:
+        output = make_model_inputs(videos, metadata, config, MagicMock(), "p", debug_window_ids=["clip"])
+
+    assert len(output) == 1
+    mock_warning.assert_called_once()
+    assert not config.debug_frames_output_dir.exists()
+
+
+@pytest.mark.env("default")
+@pytest.mark.parametrize(
+    ("debug_window_ids", "expected_dir"),
+    [
+        (["clip-a"], "clip-a"),
+        (None, "window_0000"),
+    ],
+)
+def test_make_model_inputs_debug_save_writes_artifacts_with_layout(
+    debug_window_ids: list[str] | None,
+    expected_dir: str,
+    tmp_path: Path,
+) -> None:
+    """Debug saving with context should preserve clip-id and fallback layouts."""
+    videos = [torch.zeros((1, 3, 2, 2), dtype=torch.uint8)]
+    metadata = [{"fps": 1.0}]
+    config = VllmConfig(
+        model_variant="mock",
+        debug_save_frames=True,
+        debug_frames_output_dir=tmp_path / "frames",
+    )
+
+    output = make_model_inputs(
+        videos,
+        metadata,
+        config,
+        MagicMock(),
+        "p",
+        debug_window_ids=debug_window_ids,
+        debug_render_context=FrameRenderContext.display_uint8(),
+    )
+
+    assert len(output) == 1
+    artifact_dir = config.debug_frames_output_dir / expected_dir
+    assert (artifact_dir / "frame_0000.png").exists()
+    stats = json.loads((artifact_dir / "frame_stats.json").read_text())
+    assert stats["render_context"] == {"mode": "display_uint8"}
 
 
 @pytest.mark.env("default")
