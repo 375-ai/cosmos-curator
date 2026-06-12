@@ -215,6 +215,12 @@ stages:
     if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
     when: on_success
     allow_failure: false
+  e2e_merge_train_optional_entry: &e2e_merge_train_optional_entry
+    # Merge train, but non-blocking: NVCF is too flaky to gate the train, so
+    # these jobs still run for signal yet never fail the merge.
+    if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"'
+    when: on_success
+    allow_failure: true
   e2e_label_entry: &e2e_label_entry
     # Regular MR (not merge train) with the opt-in label: run automatically
     if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)run-e2e-tests($|,)/'
@@ -250,7 +256,7 @@ stages:
   # skipped until nvcf-helm runs (via the label, merge train, or manual start).
   nvcf_helm_validate_rules: &nvcf_helm_validate_rules
     - *skip_single_purpose_web_rule
-    - *e2e_merge_train_entry
+    - *e2e_merge_train_optional_entry
     - *e2e_label_entry
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       when: on_success
@@ -1011,7 +1017,16 @@ nvcf-helm:
     - job: resolve_version
       artifacts: true
     - job: build_deploy_curator
-  rules: *slurm_nvcf_e2e_rules
+  rules:
+    - *skip_single_purpose_web_rule
+    - *e2e_merge_train_optional_entry
+    - *e2e_label_entry
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+    - *e2e_web_strict_entry
+    - *e2e_web_entry
+    - when: never
   image: ${CI_BUILDER_IMAGE}
   tags:
     - build-runner  # Override to Docker executor
