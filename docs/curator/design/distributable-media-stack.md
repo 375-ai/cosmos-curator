@@ -58,9 +58,11 @@ but applies the redistributable media policy:
 - remove conda-forge FFmpeg/OpenH264-dependent media packages;
 - use PyPI PyAV/OpenCV package entries as placeholders for Docker-built wheels;
 - include only image-runtime environments, excluding developer and cluster tooling;
-- relock with `pixi lock --manifest-path distributable/pixi.toml`.
+- relock `distributable/pixi.lock`.
 
-The generated manifest and lockfile are checked in. CI fails if they are stale after a main `pixi.toml` change.
+The generated manifest and lockfile are checked in. Regenerate both with
+`pixi run -e tools python tools/update_distributable_pixi.py`. CI fails if they are stale after a main `pixi.toml`
+change.
 
 The redistributable Docker build installs from `distributable/pixi.toml` and `distributable/pixi.lock`, but copies them
 into the image as the usual `pixi.toml` and `pixi.lock` so runtime commands do not need special paths.

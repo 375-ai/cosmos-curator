@@ -382,11 +382,25 @@ def test_pre_commit_ruff_hooks_use_pixi_tools_environment() -> None:
     assert hooks_by_id["ruff-format"]["entry"] == (
         "pixi run --frozen -e tools ruff format --force-exclude --config=pyproject.toml"
     )
+    assert (
+        hooks_by_id["distributable-pixi-check"]["entry"]
+        == "pixi run --frozen -e tools python tools/update_distributable_pixi.py --check"
+    )
 
     devset_script = _read_repo_file("devset.sh")
     assert "pixi run -e tools pre-commit install" in devset_script
     assert "pixi run -e tools python -m build" in devset_script
     assert "dev-hooks" not in devset_script
+
+
+def test_distributable_pixi_ci_check_uses_generator() -> None:
+    """Verify CI uses the generator as the manifest and lockfile check owner."""
+    distributable_pixi_job = _read_ci_job("distributable_pixi_check")
+    script = _script_lines(distributable_pixi_job["script"])
+    script_text = "\n".join(script)
+
+    assert "python tools/update_distributable_pixi.py --check" in script_text
+    assert "pixi lock --manifest-path distributable/pixi.toml --check" not in script_text
 
 
 def test_slurm_end_to_end_uses_pixi_cluster_for_submit_cli() -> None:

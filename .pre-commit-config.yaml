@@ -31,9 +31,7 @@ repos:
         types_or: [python, pyi, jupyter]
       - id: distributable-pixi-check
         name: distributable pixi check
-        entry: >-
-          bash -c 'pixi run --frozen -e tools python tools/update_distributable_pixi.py --check &&
-          pixi lock --manifest-path distributable/pixi.toml --check'
+        entry: pixi run --frozen -e tools python tools/update_distributable_pixi.py --check
         language: system
         pass_filenames: false
         files: ^(pixi\.toml|distributable/pixi\.(toml|lock)|tools/update_distributable_pixi\.py)$

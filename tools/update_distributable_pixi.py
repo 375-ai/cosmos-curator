@@ -20,6 +20,8 @@ import argparse
 import copy
 import difflib
 import json
+import shutil
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -28,6 +30,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_MANIFEST_PATH = REPO_ROOT / "pixi.toml"
 TARGET_MANIFEST_PATH = REPO_ROOT / "distributable" / "pixi.toml"
+TARGET_LOCK_PATH = REPO_ROOT / "distributable" / "pixi.lock"
+UPDATE_COMMAND = "pixi run -e tools python tools/update_distributable_pixi.py"
 
 IMAGE_ENVIRONMENTS = (
     "cuml",
@@ -62,7 +66,7 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="Fail if distributable/pixi.toml is not up to date.",
+        help="Fail if distributable/pixi.toml or distributable/pixi.lock is not up to date.",
     )
     args = parser.parse_args()
 
@@ -70,19 +74,14 @@ def main() -> int:
     if args.check:
         current = TARGET_MANIFEST_PATH.read_text(encoding="utf-8") if TARGET_MANIFEST_PATH.exists() else ""
         if current != generated:
-            diff = difflib.unified_diff(
-                current.splitlines(keepends=True),
-                generated.splitlines(keepends=True),
-                fromfile=str(TARGET_MANIFEST_PATH),
-                tofile=f"{TARGET_MANIFEST_PATH} (generated)",
-            )
-            sys.stderr.writelines(diff)
+            _print_manifest_diff(current, generated)
+            _print_update_hint(f"{_repo_relative(TARGET_MANIFEST_PATH)} is generated and out of date.")
             return 1
-        return 0
+        return _run_pixi_lock(check=True)
 
     TARGET_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     TARGET_MANIFEST_PATH.write_text(generated, encoding="utf-8")
-    return 0
+    return _run_pixi_lock(check=False)
 
 
 def generate_manifest() -> str:
@@ -90,6 +89,47 @@ def generate_manifest() -> str:
     source = _load_toml(SOURCE_MANIFEST_PATH)
     distributable = _build_distributable_config(source)
     return _render_manifest(distributable)
+
+
+def _print_manifest_diff(current: str, generated: str) -> None:
+    diff = difflib.unified_diff(
+        current.splitlines(keepends=True),
+        generated.splitlines(keepends=True),
+        fromfile=str(TARGET_MANIFEST_PATH),
+        tofile=f"{TARGET_MANIFEST_PATH} (generated)",
+    )
+    sys.stderr.writelines(diff)
+
+
+def _run_pixi_lock(*, check: bool) -> int:
+    pixi = shutil.which("pixi")
+    if pixi is None:
+        sys.stderr.write("ERROR: pixi executable not found on PATH; cannot validate the distributable lockfile.\n")
+        action = "checked" if check else "regenerated"
+        _print_update_hint(f"{_repo_relative(TARGET_LOCK_PATH)} could not be {action}.")
+        return 1
+
+    command = [pixi, "lock", "--manifest-path", str(_repo_relative(TARGET_MANIFEST_PATH))]
+    if check:
+        command.append("--check")
+
+    result = subprocess.run(command, cwd=REPO_ROOT, check=False)  # noqa: S603
+    if result.returncode != 0:
+        _print_update_hint(f"{_repo_relative(TARGET_LOCK_PATH)} is out of date or failed Pixi validation.")
+    return result.returncode
+
+
+def _print_update_hint(reason: str) -> None:
+    sys.stderr.write(
+        f"\n{reason}\n\n"
+        "Regenerate the redistributable Pixi files with:\n"
+        f"  {UPDATE_COMMAND}\n\n"
+        f"That command updates {_repo_relative(TARGET_MANIFEST_PATH)} and {_repo_relative(TARGET_LOCK_PATH)}.\n",
+    )
+
+
+def _repo_relative(path: Path) -> Path:
+    return path.relative_to(REPO_ROOT)
 
 
 def _load_toml(path: Path) -> dict[str, Any]:

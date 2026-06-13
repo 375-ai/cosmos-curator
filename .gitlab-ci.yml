@@ -499,7 +499,6 @@ distributable_pixi_check:
   script:
     - *setup_ci_builder_env
     - python tools/update_distributable_pixi.py --check
-    - pixi lock --manifest-path distributable/pixi.toml --check
 
 resolve_version:
   stage: .pre
