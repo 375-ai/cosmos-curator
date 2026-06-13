@@ -25,6 +25,9 @@ substitutes for running the commands themselves. They verify that:
   lint tooling is not installed in production containers.
 """
 
+import json
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -61,10 +64,18 @@ def test_workspace_default_feature_is_cross_platform_minimal() -> None:
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
 
     assert pixi_config["workspace"]["channels"] == ["rapidsai", "conda-forge"]
+    assert pixi_config["workspace"]["conda-pypi-map"] == {"conda-forge": "conda-pypi-map.json"}
     assert pixi_config["workspace"]["platforms"] == ["linux-64", "linux-aarch64", "osx-arm64"]
     assert pixi_config["dependencies"] == {"python": ">=3.12.13,<3.13", "pip": "*"}
     assert "pypi-dependencies" not in pixi_config
     assert "nvidia" not in pixi_config["workspace"]["channels"]
+
+    conda_pypi_map = json.loads(_read_repo_file("conda-pypi-map.json"))
+    assert conda_pypi_map == {
+        "libopencv": "opencv-python-headless",
+        "opencv": "opencv-contrib-python",
+        "py-opencv": "opencv-python",
+    }
 
 
 def test_tools_environment_declares_cross_platform_repo_tooling() -> None:
@@ -139,6 +150,7 @@ def test_dev_environment_declares_linux_cpu_test_tooling() -> None:
         "tools",
         "cluster",
         "core",
+        "media",
         "transformers",
         "tracing",
         "profiling",
@@ -157,6 +169,8 @@ def test_runtime_features_are_separated_from_core() -> None:
     core_pypi_dependencies = core_feature["pypi-dependencies"]
     runtime_feature = features["runtime"]
     runtime_pypi_dependencies = runtime_feature["pypi-dependencies"]
+    media_feature = features["media"]
+    media_dependencies = media_feature["dependencies"]
 
     assert "channels" not in core_feature
     assert core_pypi_dependencies["cosmos-xenna"] == "==0.4.3"
@@ -173,9 +187,25 @@ def test_runtime_features_are_separated_from_core() -> None:
     assert runtime_feature["system-requirements"]["cuda"] == "13.0.2"
     for dependency_name in ("torch", "torchvision", "vllm", "cvcuda-cu13", "PyNvVideoCodec"):
         assert dependency_name in runtime_pypi_dependencies
+    for dependency_name in ("av", "opencv-python-headless", "opencv-python", "opencv-contrib-python"):
+        assert dependency_name not in runtime_pypi_dependencies
+
+    assert media_feature["channels"] == ["conda-forge"]
+    assert media_feature["platforms"] == ["linux-64", "linux-aarch64"]
+    assert media_dependencies["av"] == "==17.0.0"
+    assert media_dependencies["ffmpeg"] == {"version": ">=8.1.1,<9", "build": "lgpl_*"}
+    for dependency_name in ("libopencv", "opencv", "py-opencv"):
+        assert media_dependencies[dependency_name]["build"] == "headless_*"
 
     assert "unified" not in features
-    assert pixi_config["environments"]["default"] == ["core", "runtime", "transformers", "tracing", "profiling"]
+    assert pixi_config["environments"]["default"] == [
+        "core",
+        "runtime",
+        "media",
+        "transformers",
+        "tracing",
+        "profiling",
+    ]
 
 
 def test_legacy_transformers_environment_is_model_specific_runtime() -> None:
@@ -186,17 +216,73 @@ def test_legacy_transformers_environment_is_model_specific_runtime() -> None:
     legacy_pypi_dependencies = legacy_feature["pypi-dependencies"]
 
     assert legacy_feature["dependencies"]["transformers"] == "==4.55.4"
-    for dependency_name in ("av", "opencv-python-headless", "timm", "torch", "torchvision"):
+    for dependency_name in ("timm", "torch", "torchvision"):
         assert dependency_name in legacy_pypi_dependencies
+    for dependency_name in ("av", "opencv-python-headless"):
+        assert dependency_name not in legacy_pypi_dependencies
     assert "transformers-cosmos3" not in legacy_pypi_dependencies
     assert "vllm" not in legacy_pypi_dependencies
     assert pixi_config["environments"]["legacy-transformers"] == [
         "core",
+        "media",
         "legacy-transformers",
         "tracing",
         "profiling",
     ]
     assert "runtime" not in pixi_config["environments"]["legacy-transformers"]
+
+
+def test_distributable_pixi_manifest_is_generated_runtime_subset() -> None:
+    """Verify the redistributable Pixi manifest keeps custom-media placeholders isolated."""
+    result = subprocess.run(
+        [sys.executable, "tools/update_distributable_pixi.py", "--check"],
+        cwd=_REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout
+
+    pixi_config = tomllib.loads(_read_repo_file("distributable/pixi.toml"))
+    media_feature = pixi_config["feature"]["media"]
+
+    assert pixi_config["workspace"]["name"] == "cosmos-curator-distributable"
+    assert "conda-pypi-map" not in pixi_config["workspace"]
+    assert set(pixi_config["environments"]) == {
+        "cuml",
+        "default",
+        "legacy-transformers",
+        "model-download",
+        "paddle-ocr",
+        "seedvr",
+        "sam3",
+    }
+    for feature_names in pixi_config["environments"].values():
+        assert not {"tools", "cluster", "dev"} & set(feature_names)
+
+    assert "dependencies" not in media_feature
+    assert media_feature["pypi-dependencies"] == {
+        "av": "==17.0.0",
+        "opencv-python-headless": "*",
+    }
+
+
+def test_media_policy_matches_root_and_distributable_locks() -> None:
+    """Verify normal and redistributable locks keep distinct media policies."""
+    root_lock = _read_repo_file("pixi.lock")
+    distributable_lock = _read_repo_file("distributable/pixi.lock")
+
+    assert "ffmpeg-8.1.1-lgpl_" in root_lock
+    assert "ffmpeg-8.1.1-gpl_" not in root_lock
+    assert "opencv_python-" not in root_lock
+    assert "av-17.0.0-cp" not in root_lock
+
+    assert "conda-forge/linux-64/ffmpeg-" not in distributable_lock
+    assert "conda-forge/linux-aarch64/ffmpeg-" not in distributable_lock
+    assert "openh264" not in distributable_lock
+    assert "opencv_python_headless-" in distributable_lock
+    assert "av-17.0.0-cp" in distributable_lock
 
 
 def test_cuml_owns_rapids_channel() -> None:

@@ -205,20 +205,12 @@ def test_sample_closest(  # noqa: PLR0913
 def synthetic_video() -> io.BytesIO:
     """Create a synthetic test video in memory."""
     buffer = io.BytesIO()
-    container = av.open(buffer, mode="w", format="mp4")
+    container = av.open(buffer, mode="w", format="avi")
     fps = 30
-    # Set up video stream
-    stream = container.add_stream(
-        "h264",
-        rate=fps,
-        options={
-            "crf": "0",  # Lossless quality
-            "preset": "veryslow",  # Best compression
-        },
-    )
+    stream = container.add_stream("rawvideo", rate=fps)
     stream.width = 4
     stream.height = 4
-    stream.pix_fmt = "yuv420p"
+    stream.pix_fmt = "rgb24"
     stream.time_base = Fraction(1, fps)
 
     # Create 10 frames
@@ -369,7 +361,7 @@ def test_get_avg_frame_rate(synthetic_video: io.BytesIO) -> None:
 
 @pytest.mark.parametrize(
     ("stream_idx", "video_format"),
-    [(0, None), (0, "mp4")],
+    [(0, None), (0, "avi")],
 )
 def test_get_frame_count(synthetic_video: io.BytesIO, stream_idx: int, video_format: str | None) -> None:
     """Test that get_frame_count correctly returns the number of frames in a video.

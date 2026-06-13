@@ -1,5 +1,6 @@
 [workspace]
 channels = ["rapidsai", "conda-forge"]
+conda-pypi-map = { conda-forge = "conda-pypi-map.json" }
 name = "cosmos-curator"
 platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
 version = "1.0.0"
@@ -26,7 +27,7 @@ huggingface_hub = "*"
 jinja2 = "*"
 loguru = "*"
 mcap = ">=1.3.1,<2.0.0"
-numpy = ">2,<2.3" # opencv-python-headless requires >=2; numba 0.61.x requires <2.3
+numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
 nvidia-ml-py = "*"
 nvtx = "*"
 openssl = ">=3.6.2,<4.0a0" # default env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
@@ -116,10 +117,8 @@ pytest-mock = "*"
 safetensors = "*"
 
 [feature.dev.pypi-dependencies]
-av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
 mypy = "==2.1.0"
 openai = "*"
-opencv-python-headless = "*" # not available on conda-forge
 pandas-stubs = "*"
 torch = "==2.11.0"
 torchvision = "==0.26.0"
@@ -149,14 +148,12 @@ platforms = ["linux-64", "linux-aarch64"]
 [feature.runtime.dependencies]
 cuda-libraries-dev = "*"
 gpustat = "*"
-libgl = "*" # paddleocr -> opencv-python needs libGL.so.1; previously satisfied transitively via FFmpeg's conda deps
+libgl = "*" # PaddleOCR/OpenCV image paths need libGL.so.1
 pycountry = "*"
 
 [feature.runtime.pypi-dependencies]
-av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
 cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (default env; fixes vs vulnerable 5.8.x)
 cvcuda-cu13 = "*" # not available on conda-forge
-opencv-python-headless = "*" # not available on conda-forge
 PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmpeg vulns
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
@@ -225,7 +222,7 @@ azure-identity = "*"
 azure-storage-blob = "*"
 cuml = "==26.02"
 loguru = "*"
-numpy = ">2,<2.3" # opencv-python-headless requires >=2; numba 0.61.x requires <2.3
+numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
 openssl = ">=3.6.2,<4.0a0" # cuml env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
 pillow = ">=12.2.0" # CVE-2026-40192: same floor as core; cuml omits core so pin conda pillow (RAPIDS pulls it), not only core's pypi-dep
 pyjwt = ">=2.12.0" # CVE remediation: PyJWT 2.12+ (cuml env; same floor as core)
@@ -256,23 +253,32 @@ omegaconf = "*"
 
 [feature.seedvr.pypi-dependencies]
 diffusers = "*"
-mediapy = "*" # SeedVR uses mediapy.write_image / write_video for super-resolution output (cosmos_curator/pipelines/video/super_resolution/inference_seedvr2_window.py). PyPI variant: the conda package transitively pulls conda-forge ffmpeg + openh264, which we no longer ship; PyPI mediapy shells out to /opt/ffmpeg via PATH instead.
+mediapy = "*" # SeedVR uses mediapy.write_image / write_video for super-resolution output and shells out to ffmpeg on PATH.
 rotary-embedding-torch = "*"
+
+[feature.media]
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64"]
+
+[feature.media.dependencies]
+av = "==17.0.0" # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix).
+ffmpeg = { version = ">=8.1.1,<9", build = "lgpl_*" }
+libopencv = { version = "*", build = "headless_*" }
+opencv = { version = "*", build = "headless_*" }
+py-opencv = { version = "*", build = "headless_*" }
 
 [feature.legacy-transformers.dependencies]
 einops = "*"
 transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require older transformers
 
 [feature.legacy-transformers.pypi-dependencies]
-av = "==17.0.0"  # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix). Sourced from PyPI so image builds can replace it with a source build linked to /opt/ffmpeg; local/dev envs use the wheel as-is.
-opencv-python-headless = "*" # not available on conda-forge
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
 torchvision = "==0.26.0"
 
 # PaddleOCR for artificial text (overlay/post-production) detection. Isolated from default's vllm dependencies.
 [feature.paddle-ocr.target.linux-64.dependencies]
-libgl = "*" # paddleocr -> opencv-python needs libGL.so.1; previously satisfied transitively via FFmpeg's conda deps
+libgl = "*" # paddleocr -> opencv-python needs libGL.so.1
 
 [feature.paddle-ocr.target.linux-64.pypi-dependencies]
 paddleocr = "*"
@@ -316,10 +322,10 @@ transformers = ">=5.0.0"
 tools = ["tools"]
 cluster = ["tools", "cluster"]
 cuml = ["core", "cuml", "tracing"]
-default = ["core", "runtime", "transformers", "tracing", "profiling"]
-dev = ["tools", "cluster", "core", "transformers", "tracing", "profiling", "dev"]
-legacy-transformers = ["core", "legacy-transformers", "tracing", "profiling"]
+default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
+dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev"]
+legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
 model-download = ["core", "tracing"]
-paddle-ocr = ["core", "paddle-ocr", "tracing", "profiling"]
-seedvr = ["core", "runtime", "transformers", "seedvr", "tracing", "profiling"]
-sam3 = ["core", "runtime", "sam3", "tracing", "profiling"]
+paddle-ocr = ["core", "media", "paddle-ocr", "tracing", "profiling"]
+seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]
+sam3 = ["core", "runtime", "media", "sam3", "tracing", "profiling"]

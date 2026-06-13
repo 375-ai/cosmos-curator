@@ -153,3 +153,107 @@ validate_s3_json() {
 get_reduced_cpu_pipeline_args() {
     echo "--transnetv2-frame-decode-cpus-per-worker 1 --transcode-cpus-per-worker 1 --clip-extraction-cpus-per-worker 1"
 }
+
+_SLURM_LOG_TAIL_PID=""
+
+stop_slurm_log_tail() {
+    if [[ -n "${_SLURM_LOG_TAIL_PID}" ]]; then
+        kill "${_SLURM_LOG_TAIL_PID}" >/dev/null 2>&1 || true
+        wait "${_SLURM_LOG_TAIL_PID}" 2>/dev/null || true
+        _SLURM_LOG_TAIL_PID=""
+    fi
+}
+
+start_slurm_log_tail() {
+    local log_file=$1
+    (
+        while [[ ! -f "${log_file}" ]]; do
+            sleep 5
+        done
+        echo "---- Streaming SLURM job log (${log_file}) ----"
+        exec tail --pid="$$" -n +1 -F "${log_file}"
+    ) &
+    _SLURM_LOG_TAIL_PID=$!
+}
+
+wait_for_slurm_log_drain() {
+    local log_file=$1
+    local previous_size=""
+    local current_size
+    local stable_attempts=0
+
+    for _ in {1..10}; do
+        if [[ ! -f "${log_file}" ]]; then
+            sleep 1
+            continue
+        fi
+
+        current_size=$(stat -c %s "${log_file}" 2>/dev/null || true)
+        if [[ -n "${current_size}" && "${current_size}" == "${previous_size}" ]]; then
+            stable_attempts=$((stable_attempts + 1))
+            if (( stable_attempts >= 2 )); then
+                return 0
+            fi
+        else
+            previous_size="${current_size}"
+            stable_attempts=0
+        fi
+
+        sleep 1
+    done
+}
+
+wait_for_slurm_job() {
+    local job_id=$1
+    local max_attempts=$2
+    local sleep_seconds=$3
+    local attempt=0
+
+    while (( attempt < max_attempts )); do
+        if [[ -n "$(squeue -h -j "${job_id}" 2>/dev/null)" ]]; then
+            echo "[$(date -Ins)] Job ${job_id} still running..."
+        else
+            local state
+            state=$(sacct -j "${job_id}" -o State -n | head -n 1 | tr -d ' ')
+            echo "[$(date -Ins)] Job ${job_id} completed with state ${state}"
+            if [[ "${state}" == COMPLETED* ]]; then
+                return 0
+            fi
+            return 1
+        fi
+        sleep "${sleep_seconds}"
+        attempt=$((attempt + 1))
+    done
+
+    echo "Timeout waiting for job ${job_id}" >&2
+    return 1
+}
+
+monitor_slurm_job() {
+    # Args: job_id, log_file, max_attempts, sleep_seconds
+    local job_id=$1
+    local log_file=$2
+    local max_attempts=$3
+    local sleep_seconds=$4
+
+    start_slurm_log_tail "${log_file}"
+
+    if ! wait_for_slurm_job "${job_id}" "${max_attempts}" "${sleep_seconds}"; then
+        stop_slurm_log_tail
+        if [[ -f "${log_file}" ]]; then
+            echo "---- SLURM job log (${log_file}) ----"
+            tail -n 200 "${log_file}"
+        else
+            echo "SLURM log file ${log_file} was not found" >&2
+        fi
+        return 1
+    fi
+
+    wait_for_slurm_log_drain "${log_file}"
+    stop_slurm_log_tail
+    if [[ -f "${log_file}" ]]; then
+        echo "Collected SLURM log at ${log_file}"
+    fi
+}
+
+trap stop_slurm_log_tail EXIT

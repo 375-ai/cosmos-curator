@@ -329,17 +329,50 @@ stages:
   #   slim, distributable) at the same moment from the same apt/Pixi state.
   # - On MR pipelines: only when the image/runtime surface changes, or when
   #   the explicit `build-all-images` MR label is set as an escape hatch.
+  distributable_changes: &distributable_changes
+    - conda-pypi-map.json
+    - pixi.toml
+    - pixi.lock
+    - distributable/pixi.toml
+    - distributable/pixi.lock
+    - tools/update_distributable_pixi.py
+    - package/cosmos_curator/default.dockerfile.jinja2
+    - cosmos_curator/client/image_cli/image_app.py
+    - cosmos_curator/client/utils/docker_utils.py
+    - cosmos_curator/core/utils/ffmpeg_utils.py
   distributable_rules: &distributable_rules
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_REF_PROTECTED == "true"'
     - *skip_single_purpose_web_rule
     - if: '$CI_PIPELINE_SOURCE == "web"'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)build-all-images($|,)/'
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
-      changes:
-        - package/cosmos_curator/default.dockerfile.jinja2
-        - cosmos_curator/client/image_cli/image_app.py
-        - cosmos_curator/client/utils/docker_utils.py
-        - cosmos_curator/core/utils/ffmpeg_utils.py
+      changes: *distributable_changes
+    - when: never
+
+  # Redistributable Slurm smoke tests are expensive cluster jobs. They are a
+  # subset of distributable_rules so their build_deploy_curator_distributable
+  # need is always present, but they are not merge-train gates yet: automatic
+  # with run-e2e-tests, manual on ordinary MRs, and non-blocking for web
+  # pipelines.
+  distributable_smoke_rules: &distributable_smoke_rules
+    - *skip_single_purpose_web_rule
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)run-e2e-tests($|,)/ && $CI_MERGE_REQUEST_LABELS =~ /(^|,)build-all-images($|,)/'
+      when: on_success
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)run-e2e-tests($|,)/'
+      changes: *distributable_changes
+      when: on_success
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_LABELS =~ /(^|,)build-all-images($|,)/'
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes: *distributable_changes
+      when: manual
+      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+      allow_failure: true
     - when: never
 
   # Rules for ci-builder image refresh jobs
@@ -453,6 +486,20 @@ ruff:
     - *setup_ci_builder_env
     - ruff format --check
     - ruff check
+
+distributable_pixi_check:
+  stage: lint
+  image: ${CI_BUILDER_IMAGE}
+  tags:
+    - build-runner
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  rules: *pre_merge_rules
+  needs: []
+  script:
+    - *setup_ci_builder_env
+    - python tools/update_distributable_pixi.py --check
+    - pixi lock --manifest-path distributable/pixi.toml --check
 
 resolve_version:
   stage: .pre
@@ -958,6 +1005,42 @@ slurm_end_to_end:
       - slurm_logs/
       - slurm_remote_files/
       - slurm_submit.log
+
+slurm_distributable_media_smoke:
+  stage: end-to-end
+  id_tokens:
+    VAULT_JWT_TOKEN:
+      aud: ${VAULT_ADDR}
+  needs:
+    - job: resolve_version
+      artifacts: true
+    - job: build_deploy_curator_distributable
+  rules: *distributable_smoke_rules
+  parallel:
+    matrix:
+      - DISTRIBUTABLE_SMOKE_MODE: "bare"
+      - DISTRIBUTABLE_SMOKE_MODE: "mounted-ffmpeg"
+  tags:
+    - ${SLURM_RUNNER_TAG}
+  variables:
+    CI_BUILDS_DIR: ${NEMO_CI_PATH}/.config/${CI_JOB_ID}
+    ENROOT_CONFIG_PATH: "${CI_BUILDS_DIR}/.enroot"
+    DISTRIBUTABLE_FFMPEG_PREFIX: "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/ffmpeg/.pixi/envs/default"
+  before_script:
+    - source .gitlab/vault/vault-auth.sh
+    - *install_pixi_if_missing
+    - *setup_pixi_cluster
+  script:
+    - .gitlab/scripts/slurm_distributable_media_smoke.sh
+  retry:
+    max: 2
+    when: always
+  artifacts:
+    when: always
+    paths:
+      - slurm_distributable_smoke_logs/
+      - slurm_distributable_smoke_remote_files/
+      - slurm_distributable_smoke_*.submit.log
 
 # Combine coverage from unit tests and GPU tests
 # This job runs after both unit_tests and gpu_tests complete, combining coverage data from:

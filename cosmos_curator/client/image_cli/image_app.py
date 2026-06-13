@@ -19,9 +19,9 @@ import sys
 from pathlib import Path
 from typing import Annotated
 
-import rich
 import typer
 from loguru import logger
+from rich.console import Console
 from typer import Option
 
 from cosmos_curator.client.environment import CONTAINER_PATHS_CODE_DIR
@@ -211,20 +211,27 @@ def build(  # noqa: PLR0913
     _curator_path = Path(curator_path)
     _dockerfile_output_path = Path(dockerfile_output_path) if dockerfile_output_path else None
     package_path = _curator_path / Path("package") / Path("cosmos_curator")
+    manifest_path = _curator_path / ("distributable/pixi.toml" if redistributable else "pixi.toml")
+
+    if redistributable and slim:
+        logger.error(
+            "The redistributable image is a full image build; --redistributable and --slim cannot be combined.",
+        )
+        sys.exit(1)
 
     env_names = _parse_envs(envs)
     # Validate that requested environments exist in Pixi
-    pixi_envs = get_pixi_envs()
+    pixi_envs = get_pixi_envs(manifest_path)
     invalid_envs = set(env_names) - set(pixi_envs)
     if invalid_envs:
-        logger.error(f"Environments not available in Pixi: {sorted(invalid_envs)}")
+        logger.error(f"Environments not available in {manifest_path}: {sorted(invalid_envs)}")
         sys.exit(1)
 
     code_paths = []
     if extra_code_paths:
         code_paths.extend([path.rstrip("/") for path in extra_code_paths.split(",")])
 
-    console = rich.console.Console()
+    console = Console()
 
     if slim:
         console.log("Generating slim docker image (no pixi install)")

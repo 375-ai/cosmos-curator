@@ -1,0 +1,5 @@
+{
+  "libopencv": "opencv-python-headless",
+  "opencv": "opencv-contrib-python",
+  "py-opencv": "opencv-python"
+}

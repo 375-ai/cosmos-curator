@@ -29,6 +29,14 @@ repos:
         entry: pixi run --frozen -e tools ruff format --force-exclude --config=pyproject.toml
         language: system
         types_or: [python, pyi, jupyter]
+      - id: distributable-pixi-check
+        name: distributable pixi check
+        entry: >-
+          bash -c 'pixi run --frozen -e tools python tools/update_distributable_pixi.py --check &&
+          pixi lock --manifest-path distributable/pixi.toml --check'
+        language: system
+        pass_filenames: false
+        files: ^(pixi\.toml|distributable/pixi\.(toml|lock)|tools/update_distributable_pixi\.py)$
       - id: submodule-check
         name: "WARNING: You are about to update the version of submodule cosmos-xenna, Are you sure? - y/N: "
         entry: .githooks/submodule-check.sh

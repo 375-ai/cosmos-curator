@@ -36,11 +36,11 @@ class CommonTemplateParams:
         return CommonTemplateParams()
 
 
-def get_pixi_envs() -> list[str]:
+def get_pixi_envs(manifest_path: Path | None = None) -> list[str]:
     """Get list of environments from pixi.toml environments section."""
-    toml_path = Path.cwd() / "pixi.toml"
+    toml_path = manifest_path or Path.cwd() / "pixi.toml"
     if not toml_path.is_file():
-        logger.error(f"pixi.toml not found at {toml_path}")
+        logger.error(f"Pixi manifest not found at {toml_path}")
         sys.exit(1)
 
     with toml_path.open("rb") as f:

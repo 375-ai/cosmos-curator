@@ -1,18 +1,14 @@
 # syntax=docker/dockerfile:1
-# Dockerfile template for cosmos-curator
+# Dockerfile template for cosmos-curator images.
 #
-# The dockerfile is templated so that we can provide different Pixi environment information.
-# Docs on docker best practices:
-# - https://linuxhandbook.com/dockerize-python-apps/
-# - https://cloud.google.com/architecture/best-practices-for-building-containers
+# Normal full and slim images use the root Pixi lock and conda-forge LGPL media
+# stack. Redistributable builds use distributable/pixi.toml plus a custom
+# FFmpeg/PyAV/OpenCV wheelhouse built in this template.
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Keep all CUDA base image tags in this template aligned. When bumping them,
-# re-check ffmpeg-builder's NVCODEC_VERSION against the Video Codec SDK driver floor.
-
 # ---------------------------------------------------------------------------
-# Wheels builder stage: install pixi and optional build artifacts
+# Tools/artifacts stage
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04 AS wheels-builder
 
@@ -22,7 +18,7 @@ SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Install pixi with curl into /opt/pixi without modifying PATH
+# Install pixi with curl into /opt/pixi without modifying PATH.
 RUN curl -fsSL https://pixi.sh/install.sh | PIXI_VERSION="${PIXI_VERSION}" PIXI_HOME=/opt/pixi PIXI_NO_PATH_UPDATE=1 sh
 
 {% if not slim and 'seedvr' in envs %}
@@ -34,12 +30,10 @@ RUN mkdir -p /opt/seedvr-artifacts \
     && mv /tmp/SeedVR-${SEEDVR_COMMIT}* /opt/seedvr-artifacts/SeedVR
 {% endif %}
 
+{% if redistributable %}
 # ---------------------------------------------------------------------------
-# FFmpeg builder stage: compile FFmpeg from source
+# FFmpeg builder stage
 # ---------------------------------------------------------------------------
-# FFmpeg is built here and copied into the runtime image. Non-redistributable
-# images include the full codec/runtime surface. Redistributable images keep a
-# narrower FFmpeg surface and exclude components we cannot redistribute.
 FROM nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04 AS ffmpeg-builder
 
 SHELL ["/bin/bash", "-c"]
@@ -111,15 +105,7 @@ SHELL ["/bin/bash", "-c"]
 ] %}
 
 ENV FFMPEG_VERSION=8.1.1
-{% if not redistributable %}
-# nv-codec-headers tracks NVIDIA Video Codec SDK headers. Keep it compatible
-# with the CUDA base image tags used by this template.
-ENV NVCODEC_VERSION=13.0.19.0
-{% endif %}
 
-# Non-redistributable images use FFmpeg's default built-in codecs, demuxers,
-# muxers, parsers, filters, and bitstream filters. The narrow allowlist is only
-# used for redistributable variants.
 RUN mkdir -p /tmp && chmod 1777 /tmp && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -132,8 +118,7 @@ RUN mkdir -p /tmp && chmod 1777 /tmp && \
     cmake \
     libaom-dev \
     libdav1d-dev \
-{% if not redistributable %}    libopenh264-dev \
-{% endif %}    libtool \
+    libtool \
     libvpx-dev \
     libwebp-dev \
     nasm \
@@ -142,16 +127,13 @@ RUN mkdir -p /tmp && chmod 1777 /tmp && \
     xz-utils \
     yasm \
     zlib1g-dev && \
-{% if not redistributable %}    curl -fsSL -o /tmp/nv-codec-headers.tar.gz https://github.com/FFmpeg/nv-codec-headers/releases/download/n${NVCODEC_VERSION}/nv-codec-headers-${NVCODEC_VERSION}.tar.gz && \
-    tar xzf /tmp/nv-codec-headers.tar.gz -C /tmp/ && \
-    make -C /tmp/nv-codec-headers-${NVCODEC_VERSION} install && \
-{% endif %}    curl -fsSL -o /tmp/ffmpeg.tar.xz https://www.ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz && \
+    curl -fsSL -o /tmp/ffmpeg.tar.xz https://www.ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz && \
     tar xJf /tmp/ffmpeg.tar.xz -C /tmp/ && \
     cd /tmp/ffmpeg-${FFMPEG_VERSION} && \
     ./configure \
     --prefix=/opt/ffmpeg \
-{% if redistributable %}    --disable-everything \
-{% endif %}    --disable-autodetect \
+    --disable-everything \
+    --disable-autodetect \
     --disable-gpl \
     --disable-programs \
     --enable-ffmpeg \
@@ -166,13 +148,7 @@ RUN mkdir -p /tmp && chmod 1777 /tmp && \
     --enable-libdav1d \
     --enable-libvpx \
     --enable-libwebp \
-{% if not redistributable %}    --enable-ffnvcodec \
-    --enable-cuda \
-    --enable-cuvid \
-    --enable-nvdec \
-    --enable-nvenc \
-    --enable-libopenh264 \
-{% endif %}{% if redistributable %}    --enable-protocol={{ ffmpeg_protocols | join(',') }} \
+    --enable-protocol={{ ffmpeg_protocols | join(',') }} \
     --enable-demuxer={{ ffmpeg_demuxers | join(',') }} \
     --enable-muxer={{ ffmpeg_muxers | join(',') }} \
     --enable-decoder={{ ffmpeg_decoders | join(',') }} \
@@ -180,11 +156,9 @@ RUN mkdir -p /tmp && chmod 1777 /tmp && \
     --enable-parser={{ ffmpeg_parsers | join(',') }} \
     --enable-bsf={{ ffmpeg_bsfs | join(',') }} \
     --enable-filter={{ ffmpeg_filters | join(',') }} \
-{% endif %}    --extra-libs=-lpthread \
+    --extra-libs=-lpthread \
     --extra-libs=-lm \
-{% if not redistributable %}    --extra-cflags=-I/usr/local/cuda/include \
-    --extra-ldflags="-L/usr/local/cuda/lib64 -L/usr/local/cuda/lib64/stubs" \
-{% endif %}    --disable-static \
+    --disable-static \
     --enable-shared \
     --disable-doc \
     --disable-debug && \
@@ -195,26 +169,17 @@ RUN mkdir -p /tmp && chmod 1777 /tmp && \
     /opt/ffmpeg/bin/ffmpeg -version && \
     /opt/ffmpeg/bin/ffprobe -version && \
     found=$(find /opt/ffmpeg /usr/lib /usr/local/lib -name 'libopenh264*' 2>/dev/null) && \
-{% if not redistributable %}    if [ -z "$found" ]; then \
-        echo "ERROR: non-redistributable build expected libopenh264 but it is not installed."; \
-        exit 1; \
-    fi
-{% else %}    if [ -n "$found" ]; then \
+    if [ -n "$found" ]; then \
         echo "ERROR: redistributable build contains libopenh264:"; \
         echo "$found"; \
         exit 1; \
     fi
-{% endif %}
 
-{% if not slim %}
 # ---------------------------------------------------------------------------
-# PyAV builder stage: source-build PyAV against /opt/ffmpeg
+# PyAV builder stage
 # ---------------------------------------------------------------------------
-# PyPI's PyAV wheels bundle their own FFmpeg shared libs.
-# Rebuilding from source linked against /opt/ffmpeg keeps Python and the ffmpeg
-# CLI on the same codec policy. The wheel is built in pixi's `default` env so
-# the Python ABI tracks pixi.toml automatically (one Python pin spans all envs);
-# the main stage then just `pip install`s it, with no C toolchain.
+# PyPI's PyAV wheels bundle their own FFmpeg shared libs. Build from source
+# against /opt/ffmpeg so Python and the ffmpeg CLI share one codec policy.
 FROM nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04 AS pyav-builder
 
 SHELL ["/bin/bash", "-c"]
@@ -231,7 +196,7 @@ RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pixi.toml pixi.lock /pyav-build/
+COPY distributable/pixi.toml distributable/pixi.lock /pyav-build/
 
 RUN cd /pyav-build && \
     export CONDA_OVERRIDE_CUDA=13.0.2 && \
@@ -253,12 +218,11 @@ RUN cd /pyav-build && \
     rm -rf /pyav-build/.pixi /root/.cache/pip /tmp/pip-*
 
 # ---------------------------------------------------------------------------
-# OpenCV builder stage: source-build OpenCV against /opt/ffmpeg
+# OpenCV builder stage
 # ---------------------------------------------------------------------------
 # PyPI's opencv-python-headless wheels bundle their own FFmpeg shared libs.
-# Rebuilding from source linked against /opt/ffmpeg keeps cv2.VideoCapture /
-# cv2.VideoWriter on the same codec policy as PyAV and the ffmpeg/ffprobe CLI.
-# TIFF support is disabled below because libtiff6 pulls libjbig0, which is
+# Build from source against /opt/ffmpeg so cv2 uses the redistributable policy.
+# TIFF support is disabled because libtiff6 pulls libjbig0, which is
 # GPL-family and cannot ship without legal review.
 FROM nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04 AS opencv-builder
 
@@ -289,8 +253,7 @@ RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
         libpcre2-16-0 \
         libpng16-16t64 \
         $(if [ "$(dpkg --print-architecture)" = "amd64" ]; then echo libquadmath0; fi) \
-{% if not redistributable %}        libopenh264-7 \
-{% endif %}        libvpx9 \
+        libvpx9 \
         libwebp7 \
         libwebpdemux2 \
         libwebpmux3 \
@@ -298,7 +261,7 @@ RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
         pkg-config && \
     rm -rf /var/lib/apt/lists/*
 
-COPY pixi.toml pixi.lock /opencv-build/
+COPY distributable/pixi.toml distributable/pixi.lock /opencv-build/
 
 RUN cd /opencv-build && \
     export CONDA_OVERRIDE_CUDA=13.0.2 && \
@@ -363,7 +326,7 @@ RUN cd /opencv-build && \
     patch_lock_wheel opencv-python "opencv_python-${OPENCV_PYTHON_VERSION}" && \
     patch_lock_wheel opencv-contrib-python "opencv_contrib_python-${OPENCV_PYTHON_VERSION}"{% endif %} && \
     rm -rf /opencv-build/.pixi /opencv-python-src /root/.cache/pip /tmp/pip-*
-{% endif %}
+{% endif %}{# redistributable #}
 
 # ---------------------------------------------------------------------------
 # Main stage
@@ -373,18 +336,15 @@ FROM nvcr.io/nvidia/cuda:13.0.2-devel-ubuntu24.04 AS main
 SHELL ["/bin/bash", "-c"]
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 ENV TZ=America/Los_Angeles
-# Get system level packages
+
 RUN apt-get update \
     && apt-get install --no-install-recommends --option=Dpkg::Options::=--force-confdef -y \
-    # Needed because the certs age out sometimes?
     ca-certificates \
 {%- if nsight %}
-    # Needed for cuda profiling
     nsight-systems-2025.3.2 \
 {%- endif %}
-    # Needed to copy model weights using rclone
     rclone \
-    # Runtime libraries for source-built FFmpeg
+{%- if redistributable %}
     libaom3 \
     libdav1d7 \
     libavif16 \
@@ -396,32 +356,26 @@ RUN apt-get update \
     libpcre2-16-0 \
     libpng16-16t64 \
     $(if [ "$(dpkg --print-architecture)" = "amd64" ]; then echo libquadmath0; fi) \
-{% if not redistributable %}    libopenh264-7 \
-{% endif %}    libvpx9 \
+    libvpx9 \
     libwebp7 \
     libwebpdemux2 \
     libwebpmux3 \
-    # Refresh GPG-related base packages without reintroducing full build tooling
+{%- endif %}
     keyboxd gpgv gpgsm gpgconf gpg-agent \
     binutils openssl libsqlite3-0 \
     && update-ca-certificates \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy FFmpeg from the builder stage (installed to /opt/ffmpeg to avoid collisions).
+{% if redistributable %}
 COPY --from=ffmpeg-builder /opt/ffmpeg /opt/ffmpeg
 RUN echo "/opt/ffmpeg/lib" > /etc/ld.so.conf.d/ffmpeg.conf && \
     ldconfig && \
     /opt/ffmpeg/bin/ffmpeg -version > /dev/null && \
     /opt/ffmpeg/bin/ffprobe -version > /dev/null
 
-# Confirm the runtime image's codec surface matches the requested policy.
 RUN found=$(find /opt/ffmpeg /usr/lib /usr/local/lib -name 'libopenh264*' 2>/dev/null) && \
-{% if not redistributable %}    if [ -z "$found" ]; then \
-        echo "ERROR: non-redistributable runtime image expected libopenh264 but it is not installed."; \
-        exit 1; \
-    fi
-{% else %}    if [ -n "$found" ]; then \
+    if [ -n "$found" ]; then \
         echo "ERROR: redistributable runtime image contains libopenh264:"; \
         echo "$found"; \
         exit 1; \
@@ -433,11 +387,9 @@ RUN found=$(find /opt/ffmpeg /usr/lib /usr/local/lib -name 'libopenh264*' 2>/dev
 # Blackwell, so a symlink is sufficient.
 RUN ln -sf /usr/local/cuda/bin/ptxas /usr/local/cuda/bin/ptxas-blackwell
 
-# Copy pixi binary from the wheels-builder stage
 COPY --from=wheels-builder /opt/pixi/bin/pixi /usr/local/bin/pixi
 
-# Common ENV variables needed by some ML libs
-# Declares an optional inherited value for Docker's UndefinedVar check.
+{% if redistributable %}
 ARG PKG_CONFIG_PATH
 ENV AM_I_DOCKER=True \
     BUILD_WITH_CUDA=True \
@@ -451,8 +403,20 @@ ENV AM_I_DOCKER=True \
     LD_LIBRARY_PATH="/opt/ffmpeg/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
     XFORMERS_IGNORE_FLASH_VERSION_CHECK="1" \
     VLLM_WORKER_MULTIPROC_METHOD="spawn"
+{% else %}
+ENV AM_I_DOCKER=True \
+    BUILD_WITH_CUDA=True \
+    TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0+PTX" \
+    CUDA_HOME="/usr/local/cuda" \
+    CUDA_PATH="/usr/local/cuda" \
+    PATH="/usr/local/cuda/bin:${PATH}" \
+    CPATH="/usr/local/cuda/include" \
+    LIBRARY_PATH="/usr/local/cuda/lib64:${LIBRARY_PATH:-}" \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
+    XFORMERS_IGNORE_FLASH_VERSION_CHECK="1" \
+    VLLM_WORKER_MULTIPROC_METHOD="spawn"
+{% endif %}
 
-# Disable Ray log dedup
 ENV RAY_DEDUP_LOGS=0 \
     RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 \
     RAY_MAX_LIMIT_FROM_API_SERVER=40000 \
@@ -464,31 +428,29 @@ ENV RAY_DEDUP_LOGS=0 \
     RAY_WARN_BLOCKING_GET_INSIDE_ASYNC=0 \
     XENNA_RAY_METRICS_PORT=9002
 
-# boto3 & pbss
 ENV AWS_REQUEST_CHECKSUM_CALCULATION='when_required'
 
-# Set a bunch of env vars so that we cache weights in a workspace
 ENV DEFAULT_WORKSPACE_LOC="/config/default_workspace"
 ENV HF_HOME="${DEFAULT_WORKSPACE_LOC}/weights/hf_home/" \
     LAION_CACHE_HOME="${DEFAULT_WORKSPACE_LOC}/weights/laion_cache/"
 
-# Set up pixi environments
-{% if slim %}
-COPY --chown=1000:1000 pixi.toml pixi.lock {{code_dir_str}}/
+{% if redistributable %}
+COPY --chown=1000:1000 distributable/pixi.toml {{code_dir_str}}/pixi.toml
 {% else %}
-COPY --chown=1000:1000 pixi.toml {{code_dir_str}}/
+COPY --chown=1000:1000 pixi.toml pixi.lock conda-pypi-map.json {{code_dir_str}}/
 {% endif %}
 
 {% if not slim %}
+{% if redistributable %}
 COPY --from=pyav-builder /pyav-wheelhouse /opt/cosmos-curator-wheelhouse
 COPY --from=opencv-builder /opencv-wheelhouse /opt/cosmos-curator-wheelhouse
 COPY --chown=1000:1000 --from=opencv-builder /opencv-build/pixi.lock {{code_dir_str}}/pixi.lock
+{% endif %}
 
 # If we install all the environments in a single layer, it's over 20GB and will cause slurm/NVCF to timeout pulling the
 # layer. Since the cuml environment is large and needs non-overlapping RAPIDS packages, we install it separately.
 #
 # Retry logic: pixi install can fail due to transient network errors (connection resets, timeouts).
-# We retry up to 10 times with a 3-second backoff to handle these flakes.
 #
 # IMPORTANT: Do NOT set RATTLER_CACHE_DIR or UV_CACHE_DIR to a BuildKit cache mount.
 # Rattler uses hardlinks from its package cache into each environment directory. When
@@ -518,7 +480,7 @@ RUN cd {{code_dir_str}} && \
     done && \
     $success && \
     for env in {{ envs | reject('equalto', 'cuml') | join(' ') }}; do \
-        if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') else 1)"; then \
+{% if redistributable %}        if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') else 1)"; then \
             pixi run --as-is -e "$env" pip uninstall -y av && \
             pixi run --as-is -e "$env" pip install --no-cache-dir /opt/cosmos-curator-wheelhouse/av-17.0.0-*.whl && \
             pixi run --as-is -e "$env" python -c "import av; print(av.__version__, av.library_versions)"; \
@@ -532,18 +494,21 @@ RUN cd {{code_dir_str}} && \
             fi; \
             pixi run --as-is -e "$env" python -c 'import cv2; info = cv2.getBuildInformation(); print(cv2.__version__); print(next((line for line in info.splitlines() if "FFMPEG:" in line), "FFMPEG: <missing>")); raise SystemExit(0 if "FFMPEG:                      YES" in info else 1)'; \
         fi; \
-    done && \
-    found=$(find /opt/ffmpeg /usr/lib /usr/local/lib {{code_dir_str}}/.pixi -name 'libopenh264*' 2>/dev/null) && \
-{% if not redistributable %}    if [ -z "$found" ]; then \
-        echo "ERROR: non-redistributable PyAV/OpenCV rebuild expected libopenh264 but it is not installed."; \
-        exit 1; \
-    fi && \
-{% else %}    if [ -n "$found" ]; then \
+{% else %}        pixi run --as-is -e "$env" python -c "print('pixi as-is smoke ok')"; \
+        if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') else 1)"; then \
+            pixi run --as-is -e "$env" python -c "import av; print(av.__version__, av.library_versions)"; \
+        fi; \
+        if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('cv2') else 1)"; then \
+            pixi run --as-is -e "$env" python -c 'import cv2; info = cv2.getBuildInformation(); print(cv2.__version__); print(next((line for line in info.splitlines() if "FFMPEG:" in line), "FFMPEG: <missing>")); raise SystemExit(0 if "FFMPEG:                      YES" in info else 1)'; \
+        fi; \
+{% endif %}    done && \
+{% if redistributable %}    found=$(find /opt/ffmpeg /usr/lib /usr/local/lib {{code_dir_str}}/.pixi -name 'libopenh264*' 2>/dev/null) && \
+    if [ -n "$found" ]; then \
         echo "ERROR: redistributable PyAV/OpenCV rebuild produced or retained libopenh264:"; \
         echo "$found"; \
         exit 1; \
     fi && \
-{% endif %}    if grep -q 'files.pythonhosted.org/.*/av-17.0.0' pixi.lock || \
+    if grep -q 'files.pythonhosted.org/.*/av-17.0.0' pixi.lock || \
        grep -q 'files.pythonhosted.org/.*/opencv_python_headless-' pixi.lock{% if 'paddle-ocr' in envs or 'default' in envs %} || \
        grep -q 'files.pythonhosted.org/.*/opencv_python-' pixi.lock || \
        grep -q 'files.pythonhosted.org/.*/opencv_contrib_python-' pixi.lock{% endif %}; then \
@@ -553,9 +518,8 @@ RUN cd {{code_dir_str}} && \
     for env in {{ envs | reject('equalto', 'cuml') | join(' ') }}; do \
         pixi run --as-is -e "$env" python -c "print('pixi as-is smoke ok')"; \
     done && \
-    pixi clean cache -y
+{% endif %}    pixi clean cache -y
 
-# Install the cuml environment separately if requested.
 {% if 'cuml' in envs %}
 RUN cd {{code_dir_str}} && \
     export CONDA_OVERRIDE_CUDA=13.0.2 && \
@@ -577,7 +541,6 @@ RUN cd {{code_dir_str}} && \
     pixi clean cache -y
 {% endif %}{# cuml #}
 
-# Run any hacky post-install script for each environment
 COPY package/cosmos_curator/envs/ /tmp/cosmos_curator_build_envs
 {% for env in post_install_envs %}
 RUN cd {{code_dir_str}} && \
@@ -598,29 +561,6 @@ ENV SEEDVR_ROOT={{code_dir_str}}/SeedVR
 #       (canonical / CI)
 #   <repo-root>/cosmos-xenna/target/wheels/cosmos_xenna-*manylinux*_<arch>.whl
 #       (maturin default when building inside the cosmos-xenna submodule)
-# where <arch> is the value of `uname -m` evaluated inside the build (i.e.
-# `x86_64` for amd64 images, `aarch64` for arm64 images such as GH200/GB200).
-#
-# Both wheel directories are copied into the image; install/check then narrows
-# to the manylinux wheel matching the runtime architecture only. This is
-# important when the host's target/wheels/ contains additional artifacts for
-# other targets (e.g. a `macosx_*_arm64` wheel left behind by a local
-# `maturin build` on macOS, or both x86_64 and aarch64 manylinux wheels built
-# side-by-side) -- non-matching wheels are silently ignored, never installed.
-#
-# cosmos-xenna is a maturin/pyo3 (Rust) package; this image does NOT ship a
-# Rust toolchain, so a source install would fail. Build the wheel on the host
-# first for the correct target, e.g.:
-#
-#   cd <cosmos-xenna source> && uv sync --group dev && \
-#       uv run maturin build --release --strip \
-#           --compatibility manylinux_2_35 \
-#           --target x86_64-unknown-linux-gnu --zig    # for amd64 images
-#       # or:
-#       uv run maturin build --release --strip \
-#           --compatibility manylinux_2_35 \
-#           --target aarch64-unknown-linux-gnu --zig   # for arm64 images
-#
 {% if use_local_xenna_build %}
 COPY ["targe[t]/whee[l]s/", "cosmos-xenn[a]/targe[t]/whee[l]s/", "/tmp/cosmos-xenna-wheels/"]
 RUN ARCH="$(uname -m)" && \
@@ -647,21 +587,15 @@ ENV COSMOS_CURATOR_SLIM_ENVS="{{ envs | join(',') }}"
 LABEL cosmos-curator.slim="true"
 {% endif %}
 
-# Copy the video pipeline code
 COPY --chown=1000:1000 cosmos_curator {{code_dir_str}}/cosmos_curator
 COPY --chown=1000:1000 tests {{code_dir_str}}/tests
 COPY --chown=1000:1000 pytest.ini .coveragerc {{code_dir_str}}/
 COPY --chown=1000:1000 README.md ATTRIBUTIONS.md {{code_dir_str}}/
 
-# Copy additional code paths into the container
 {% for code_path in code_paths %}
 COPY --chown=1000:1000 {{code_path}} {{code_dir_str}}/{{code_path}}
 {% endfor %}
 
-# Debug env vars
-# ENV PYTHON_LOG=debug RUST_LOG=debug VLLM_LOG_LEVEL=DEBUG
-
-# Expose port for FastAPI & Ray
 EXPOSE 8000 6379
 
 WORKDIR {{code_dir_str}}

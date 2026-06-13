@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from cosmos_curator.client.image_cli import image_app
 from cosmos_curator.client.utils import docker_utils
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -143,8 +144,7 @@ def _run_blocks(contents: str) -> list[str]:
     return blocks
 
 
-@pytest.mark.parametrize("slim", [False, True])
-@pytest.mark.parametrize("redistributable", [False, True])
+@pytest.mark.parametrize(("slim", "redistributable"), [(False, False), (True, False), (False, True)])
 def test_generated_dockerfile_parses_with_buildx_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -177,8 +177,7 @@ def test_generated_dockerfile_parses_with_buildx_check(
     assert result.returncode == 0 or "Check complete" in result.stdout, result.stdout
 
 
-@pytest.mark.parametrize("slim", [False, True])
-@pytest.mark.parametrize("redistributable", [False, True])
+@pytest.mark.parametrize(("slim", "redistributable"), [(False, False), (True, False), (False, True)])
 def test_generated_dockerfile_has_no_empty_continuation_lines(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -190,127 +189,102 @@ def test_generated_dockerfile_has_no_empty_continuation_lines(
     monkeypatch.chdir(REPO_ROOT)
 
     contents = _render_dockerfile(tmp_path, slim=slim, redistributable=redistributable)
-    pkg_config_arg = contents.find("ARG PKG_CONFIG_PATH")
-    pkg_config_env = contents.find('PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}"')
 
     assert _empty_continuation_lines(contents) == []
-    assert pkg_config_arg != -1
-    assert pkg_config_env != -1
-    assert pkg_config_arg < pkg_config_env
+    if redistributable:
+        pkg_config_arg = contents.find("ARG PKG_CONFIG_PATH")
+        pkg_config_env = contents.find('PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}"')
+        assert pkg_config_arg != -1
+        assert pkg_config_env != -1
+        assert pkg_config_arg < pkg_config_env
+    else:
+        assert "ARG PKG_CONFIG_PATH" not in contents
+        assert "/opt/ffmpeg" not in contents
 
 
-def test_full_dockerfile_does_not_patch_nvidia_wheel_urls(
+def test_normal_full_dockerfile_uses_root_pixi_media_stack(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """NVIDIA CUDA wheels are resolved from PyPI directly, without lockfile rewrites."""
+    """Normal full images install directly from the root Pixi lock."""
     monkeypatch.chdir(REPO_ROOT)
 
     contents = _render_dockerfile(
         tmp_path,
         slim=False,
-        redistributable=True,
+        redistributable=False,
         conda_env_names=["default", "cuml", "seedvr"],
     )
 
+    assert "AS ffmpeg-builder" not in contents
+    assert "AS pyav-builder" not in contents
+    assert "AS opencv-builder" not in contents
+    assert "/opt/cosmos-curator-wheelhouse" not in contents
+    assert "file:///opt/cosmos-curator-wheelhouse/" not in contents
+    assert "pip uninstall -y av" not in contents
+    assert "pip uninstall -y opencv-python-headless opencv-python opencv-contrib-python" not in contents
+    assert "COPY --chown=1000:1000 pixi.toml pixi.lock conda-pypi-map.json" in contents
+    assert "pixi install  -e default -e seedvr --frozen" in contents
+    assert "=== pixi install cuml attempt $attempt/10 ===" in contents
+    assert "import av; print(av.__version__, av.library_versions)" in contents
+    assert "import cv2; info = cv2.getBuildInformation()" in contents
+
+
+def test_normal_slim_dockerfile_copies_root_lock_without_installing_envs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Normal slim images defer Pixi installation to runtime."""
+    monkeypatch.chdir(REPO_ROOT)
+
+    contents = _render_dockerfile(
+        tmp_path,
+        slim=True,
+        redistributable=False,
+        conda_env_names=["default", "model-download"],
+    )
+
+    assert "COPY --chown=1000:1000 pixi.toml pixi.lock conda-pypi-map.json" in contents
+    assert 'ENV COSMOS_CURATOR_SLIM_ENVS="default,model-download"' in contents
+    assert "pixi install attempt" not in contents
+    assert "AS ffmpeg-builder" not in contents
+    assert "/opt/ffmpeg" not in contents
+
+
+def test_redistributable_dockerfile_builds_custom_media_stack_from_distributable_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Redistributable images build PyAV/OpenCV wheels against the custom FFmpeg."""
+    monkeypatch.chdir(REPO_ROOT)
+
+    contents = _render_dockerfile(tmp_path, slim=False, redistributable=True)
+
+    assert "AS ffmpeg-builder" in contents
+    assert "AS pyav-builder" in contents
+    assert "AS opencv-builder" in contents
+    assert "COPY distributable/pixi.toml distributable/pixi.lock /pyav-build/" in contents
+    assert "COPY distributable/pixi.toml distributable/pixi.lock /opencv-build/" in contents
+    assert "COPY --chown=1000:1000 distributable/pixi.toml /opt/cosmos-curator/pixi.toml" in contents
+    assert "COPY --chown=1000:1000 --from=opencv-builder /opencv-build/pixi.lock" in contents
+    assert "COPY --from=pyav-builder /pyav-wheelhouse /opt/cosmos-curator-wheelhouse" in contents
+    assert "COPY --from=opencv-builder /opencv-wheelhouse /opt/cosmos-curator-wheelhouse" in contents
+    assert "file:///opt/cosmos-curator-wheelhouse/" in contents
+    assert "ERROR: full image runtime pixi.lock still references bundled PyPI wheels (av/opencv)" in contents
+    assert "ERROR: redistributable runtime image contains libopenh264" in contents
+    assert "libopenh264-dev" not in contents
+    assert "libopenh264-7" not in contents
     assert "pypi.nvidia.com" not in contents
     assert "pixi-nvidia-wheels" not in contents
     assert "/wheels-ready" not in contents
     assert "file:///pixi-cache/nvidia-wheels" not in contents
 
 
-def test_full_dockerfile_rebuilds_opencv_against_local_ffmpeg(
+def test_redistributable_dockerfile_replaces_bundled_video_wheels_in_pixi_install_layer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Full images should replace PyPI OpenCV wheels with a local FFmpeg-linked build."""
-    monkeypatch.chdir(REPO_ROOT)
-
-    contents = _render_dockerfile(tmp_path, slim=False, redistributable=True)
-
-    assert "AS opencv-builder" in contents
-    assert "COPY --from=ffmpeg-builder /opt/ffmpeg /opt/ffmpeg" in contents
-    assert "libvpx9" in contents
-    assert "libavif16" in contents
-    assert "libdrm2" in contents
-    assert "libgfortran5" in contents
-    assert "libwebp7" in contents
-    assert "libwebpdemux2" in contents
-    assert "libjpeg-turbo8" in contents
-    assert "libopenblas0-pthread" in contents
-    assert "libpcre2-16-0" in contents
-    assert "libpng16-16t64" in contents
-    assert '$(if [ "$(dpkg --print-architecture)" = "amd64" ]; then echo libquadmath0; fi)' in contents
-    assert "--wheel-dir /opencv-wheelhouse /opencv-python-src" in contents
-    assert 'PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig"' in contents
-    assert 'LD_LIBRARY_PATH="/opt/ffmpeg/lib:/usr/local/nvidia/lib' in contents
-    assert 'LIBRARY_PATH="/opt/ffmpeg/lib:/usr/local/cuda/lib64' in contents
-    assert "WITH_FFMPEG=ON" in contents
-    assert "WITH_GTK=OFF" in contents
-    assert "WITH_QT=OFF" in contents
-    assert "WITH_TIFF=OFF" in contents
-    assert "CMAKE_PREFIX_PATH=/opt/ffmpeg" in contents
-    assert "CMAKE_BUILD_RPATH=/opt/ffmpeg/lib" in contents
-    assert "pip install --no-cache-dir --no-deps /opencv-wheelhouse/opencv_python_headless-*.whl" in contents
-    assert 'raise SystemExit(0 if "FFMPEG:                      YES" in info else 1)' in contents
-    assert "rm -rf /pyav-build/.pixi /root/.cache/pip /tmp/pip-*" in contents
-    assert "rm -rf /opencv-build/.pixi /opencv-python-src /root/.cache/pip /tmp/pip-*" in contents
-    assert "COPY --from=opencv-builder /opencv-wheelhouse /opt/cosmos-curator-wheelhouse" in contents
-    assert "pip uninstall -y opencv-python-headless opencv-python opencv-contrib-python" in contents
-    assert (
-        "pip install --no-cache-dir --no-deps /opt/cosmos-curator-wheelhouse/opencv_python_headless-*.whl" in contents
-    )
-
-
-def test_full_dockerfile_with_paddle_ocr_rebuilds_all_opencv_variants(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PaddleOCR images need the non-headless OpenCV wheels rebuilt too."""
-    monkeypatch.chdir(REPO_ROOT)
-
-    contents = _render_dockerfile(
-        tmp_path,
-        slim=False,
-        redistributable=True,
-        conda_env_names=["default", "paddle-ocr"],
-    )
-
-    assert "/opt/cosmos-curator-wheelhouse/opencv_python-*.whl" in contents
-    assert "opencv_python-" in contents
-    assert "opencv_contrib_python-" in contents
-    assert "WITH_GTK=OFF" in contents
-    assert "WITH_QT=OFF" in contents
-    assert "WITH_TIFF=OFF" in contents
-
-
-def test_full_dockerfile_default_rebuilds_all_opencv_variants(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Default now includes PaddleOCR and needs the non-headless OpenCV wheels too."""
-    monkeypatch.chdir(REPO_ROOT)
-
-    contents = _render_dockerfile(
-        tmp_path,
-        slim=False,
-        redistributable=True,
-        conda_env_names=["default"],
-    )
-
-    assert "/opt/cosmos-curator-wheelhouse/opencv_python-*.whl" in contents
-    assert "opencv_python-" in contents
-    assert "opencv_contrib_python-" in contents
-    assert "WITH_GTK=OFF" in contents
-    assert "WITH_QT=OFF" in contents
-    assert "WITH_TIFF=OFF" in contents
-
-
-def test_full_dockerfile_replaces_bundled_video_wheels_in_pixi_install_layer(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Bundled PyPI video wheels must not survive in lower final-image layers."""
+    """Bundled PyPI video wheels must not survive in redistributable image layers."""
     monkeypatch.chdir(REPO_ROOT)
 
     contents = _render_dockerfile(tmp_path, slim=False, redistributable=True)
@@ -329,21 +303,42 @@ def test_full_dockerfile_replaces_bundled_video_wheels_in_pixi_install_layer(
     )
 
 
-def test_full_dockerfile_rewrites_pixi_lock_to_local_video_wheels(
+def test_image_build_dry_run_renders_redistributable_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Full images should keep a lockfile that points at source-built video wheels."""
+    """The image CLI should use the redistributable manifest and template branch."""
+    monkeypatch.chdir(REPO_ROOT)
+    dockerfile_path = tmp_path / "Dockerfile"
+
+    image_app.build(
+        curator_path=str(REPO_ROOT),
+        dockerfile_output_path=str(dockerfile_path),
+        envs="",
+        redistributable=True,
+        dry_run=True,
+    )
+
+    contents = dockerfile_path.read_text()
+    assert "Dockerfile template for cosmos-curator images" in contents
+    assert "COPY distributable/pixi.toml distributable/pixi.lock /pyav-build/" in contents
+
+
+def test_image_build_rejects_redistributable_slim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Redistributable builds are full images because the custom wheels are baked into the image."""
     monkeypatch.chdir(REPO_ROOT)
 
-    full_contents = _render_dockerfile(tmp_path, slim=False, redistributable=True)
-    slim_contents = _render_dockerfile(tmp_path, slim=True, redistributable=True)
+    with pytest.raises(SystemExit) as exc_info:
+        image_app.build(
+            curator_path=str(REPO_ROOT),
+            dockerfile_output_path=str(tmp_path / "Dockerfile"),
+            envs="",
+            redistributable=True,
+            slim=True,
+            dry_run=True,
+        )
 
-    assert "COPY --chown=1000:1000 pixi.toml pixi.lock" not in full_contents
-    assert "COPY --chown=1000:1000 --from=opencv-builder /opencv-build/pixi.lock" in full_contents
-    assert "file:///opt/cosmos-curator-wheelhouse/" in full_contents
-    assert "ERROR: full image runtime pixi.lock still references bundled PyPI wheels (av/opencv)" in full_contents
-    assert "COPY --chown=1000:1000 pixi.toml pixi.lock" in slim_contents
+    assert exc_info.value.code == 1
 
 
 def _capture_build_command(monkeypatch: pytest.MonkeyPatch, **build_kwargs: object) -> list[str]:
@@ -399,11 +394,11 @@ def test_build_compression_does_not_affect_local_load(monkeypatch: pytest.Monkey
     assert "--output" not in cmd
 
 
-def test_full_dockerfile_with_cuml_keeps_local_video_wheel_lockfile(
+def test_redistributable_dockerfile_with_cuml_keeps_local_video_wheel_lockfile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The cuml install layer should not revert or delete the full-image lockfile."""
+    """The cuml install layer should not revert or delete the redistributable lockfile."""
     monkeypatch.chdir(REPO_ROOT)
 
     contents = _render_dockerfile(
