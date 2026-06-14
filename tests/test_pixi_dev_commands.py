@@ -435,9 +435,13 @@ def test_slurm_end_to_end_uses_pixi_cluster_for_submit_cli() -> None:
 def test_nvcf_split_benchmark_runs_as_package_module() -> None:
     """Verify the NVCF split benchmark preserves repo-root imports."""
     script = _read_repo_file(".gitlab/scripts/nvcf_split_benchmark.sh")
+    ci_config = yaml.safe_load(_read_repo_file(".gitlab-ci.yml"))
 
     assert "python -m benchmarks.split_pipeline.nvcf_split_benchmark" in script
     assert "python benchmarks/split_pipeline/nvcf_split_benchmark.py" not in script
+    assert 'MAX_ATTEMPTS="${NVCF_SPLIT_BENCHMARK_MAX_ATTEMPTS:-4}"' in script
+    assert '--max-attempts "${MAX_ATTEMPTS}"' in script
+    assert ci_config["variables"]["NVCF_SPLIT_BENCHMARK_MAX_ATTEMPTS"]["value"] == "4"
 
 
 def test_image_cli_default_envs_do_not_include_dev() -> None:

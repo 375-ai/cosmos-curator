@@ -15,6 +15,8 @@
 
 """Model GPT2."""
 
+from typing import Any, cast
+
 from loguru import logger
 
 from cosmos_curator.core.interfaces.model_interface import ModelInterface
@@ -75,7 +77,7 @@ class GPT2(ModelInterface):
         model_dir = model_utils.get_local_dir_for_weights_name(self.model_id_names[0])
         self.tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
         self.model = GPT2LMHeadModel.from_pretrained(model_dir)
-        self.model.to("cuda")
+        cast("Any", self.model).to("cuda")
 
     # actual data processing function to be called by the stage using this model
     def generate(self, prompt: str) -> str:
@@ -89,7 +91,7 @@ class GPT2(ModelInterface):
 
         """
         inputs = self.tokenizer(prompt, return_tensors="pt").to("cuda")
-        output_ids = self.model.generate(
+        output_ids = cast("Any", self.model).generate(
             inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             pad_token_id=self.tokenizer.eos_token_id,

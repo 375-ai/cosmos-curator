@@ -15,13 +15,11 @@
 
 """SAM3 (Segment Anything 3) video segmentation model.
 
-SAM3 requires transformers>=5.0.0, which conflicts with the main transformers
-feature's <5 runtime contract for chat-template behavior. This model therefore
-runs in the dedicated `sam3` pixi environment so it can coexist on the same node
-via separate Ray workers.
+SAM3 carries its own kernels dependency, so it runs in the dedicated `sam3`
+pixi environment even though the main transformers feature now uses v5.
 """
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from loguru import logger
@@ -96,7 +94,8 @@ class SAM3Model(ModelInterface):
                 setattr(config, key, value)
             logger.info(f"SAM3 config overrides: {config_overrides}")
 
-        self.model: Sam3VideoModel = Sam3VideoModel.from_pretrained(
+        sam3_model_cls = cast("Any", Sam3VideoModel)
+        self.model: Sam3VideoModel = sam3_model_cls.from_pretrained(
             model_dir,
             config=config,
             torch_dtype=torch.bfloat16,

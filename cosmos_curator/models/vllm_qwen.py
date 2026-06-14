@@ -66,6 +66,20 @@ def qwen3_video_size_kwargs(num_frames: int, cap: int) -> dict[str, dict[str, in
     }
 
 
+def _qwen2_5_video_metadata(frames: torch.Tensor, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Build Transformers 5 video metadata for Qwen2.5-VL."""
+    num_frames = int(frames.shape[0])
+    return {
+        "total_num_frames": num_frames,
+        "fps": float(metadata["fps"]),
+        "width": int(frames.shape[3]),
+        "height": int(frames.shape[2]),
+        "duration": float(num_frames) / float(metadata["fps"]),
+        "video_backend": metadata["video_backend"],
+        "frames_indices": list(range(num_frames)),
+    }
+
+
 MAX_MODEL_LEN = 32768
 GPU_MEMORY_UTILIZATION = 0.85
 MAX_NUM_BATCHED_TOKENS = 32768
@@ -276,7 +290,12 @@ class VllmQwen(VllmPlugin):
         """
         message = make_message(prompt, use_image=config.use_image_input)
         data = frames if config.use_image_input else [(frames, metadata)]
-        return make_prompt(message, data, processor, use_image=config.use_image_input)
+        inputs = make_prompt(message, data, processor, use_image=config.use_image_input)
+        if not config.use_image_input:
+            inputs["mm_processor_kwargs"] = {
+                "video_metadata": [_qwen2_5_video_metadata(frames, metadata)],
+            }
+        return inputs
 
     @staticmethod
     def make_refined_llm_request(

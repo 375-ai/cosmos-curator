@@ -18,7 +18,7 @@
 import enum
 import pathlib
 from collections.abc import Iterable
-from typing import Any, Final
+from typing import Any, Final, cast
 
 import attrs
 import numpy as np
@@ -33,7 +33,7 @@ from cosmos_curator.core.utils.model import model_utils, pixi_utils
 # pyright: reportMissingImports=false
 # pyright: reportUnboundVariable=false
 if pixi_utils.is_running_in_env("default"):
-    from transformers import T5Config, T5EncoderModel, T5TokenizerFast
+    from transformers import T5Config, T5EncoderModel, T5TokenizerFast  # type: ignore[attr-defined]
     from transformers import logging as transformers_logging
 
     # Suppresses a lot of unhelpful warnings from transformers.
@@ -138,13 +138,13 @@ class T5Encoder(ModelInterface):
             low_cpu_mem_usage=True,
         )
         if self._variant == ModelVariant.T5_XXL_16_BIT:
-            self._model = self._model.half()  # cast T5 encoder's weights to fp16
+            self._model = cast("Any", self._model).half()  # cast T5 encoder's weights to fp16
 
     def setup(self) -> None:
         """Set up the T5 encoder model."""
         self._load_for_t5()
-        self._model.to(self._device)
-        self._model.eval()
+        cast("Any", self._model).to(self._device)
+        cast("Any", self._model).eval()
         self._model.requires_grad_(requires_grad=False)
 
     @torch.inference_mode()
@@ -154,7 +154,7 @@ class T5Encoder(ModelInterface):
         *,
         truncate: bool = True,
     ) -> list[EncodedSample]:
-        batch_encoding = self._tokenizer.batch_encode_plus(
+        batch_encoding = self._tokenizer(
             prompts,
             return_tensors="pt",
             truncation=True,

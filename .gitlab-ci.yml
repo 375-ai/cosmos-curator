@@ -135,6 +135,9 @@ variables:
   NVCF_SPLIT_BENCHMARK_LIMIT:
     description: "Input video limit for nvcf_split_benchmark"
     value: "5000"
+  NVCF_SPLIT_BENCHMARK_MAX_ATTEMPTS:
+    description: "Maximum attempts per nvcf_split_benchmark scenario"
+    value: "4"
   HELM_DEBUG_KEEP_FAILED_DEPLOYMENTS:
     description: "On failure, do not delete the deployment"
     value: "False"

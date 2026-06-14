@@ -32,7 +32,7 @@ if pixi_utils.is_running_in_env("default"):
 @pytest.mark.env("default")
 def test_make_llm_input_nemotron() -> None:
     """Test make_llm_input_nemotron function."""
-    # Mock the tokenizer to return a tensor that can be indexed and converted to list
+    # Mock the Transformers v5 tensor return shape.
     mock_tensor = torch.tensor([[1, 2, 3, 4, 5]])  # Shape: (1, 5)
 
     mock_processor = MagicMock()
@@ -79,7 +79,7 @@ def test_make_message() -> None:
 @pytest.mark.env("default")
 def test_make_prompt() -> None:
     """Test make_prompt function."""
-    # Mock the tokenizer to return a tensor that can be indexed and converted to list
+    # Mock the Transformers v5 tensor return shape.
     mock_tensor = torch.tensor([[10, 20, 30, 40]])  # Shape: (1, 4)
 
     mock_processor = MagicMock()

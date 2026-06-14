@@ -57,6 +57,7 @@ echo "Published ${PERF_IMAGE}"
 
 date_str=$(date +%Y%m%d%H%M%S)
 LIMIT_INPUT_VIDEOS="${NVCF_SPLIT_BENCHMARK_LIMIT:-5000}"
+MAX_ATTEMPTS="${NVCF_SPLIT_BENCHMARK_MAX_ATTEMPTS:-4}"
 export RUST_BACKTRACE=1
 
 # Run benchmark
@@ -109,6 +110,7 @@ for captioning_algorithm in "${_captioning_algorithm_list[@]}"; do
           --kratos-metrics-endpoint "${PERF_KRATOS_METRICS_ENDPOINT}" \
           --kratos-bearer-url "${PERF_KRATOS_BEARER_URL}" \
           --limit "${LIMIT_INPUT_VIDEOS}" \
+          --max-attempts "${MAX_ATTEMPTS}" \
           --report-metrics-to-kratos
       done
     done

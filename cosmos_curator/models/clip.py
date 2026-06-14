@@ -15,7 +15,7 @@
 
 """Model Clips."""
 
-from typing import Final
+from typing import Any, Final, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -38,7 +38,7 @@ class _CLIPImageEmbeddings(torch.nn.Module):
         super().__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         weight_file = model_utils.get_local_dir_for_weights_name(weights_name)
-        self.clip = CLIPModel.from_pretrained(weight_file).to(self.device).eval()
+        self.clip = cast("Any", CLIPModel.from_pretrained(weight_file)).to(self.device).eval()
         self.dtype = torch.float32
 
         # torchvision transforms that match CLIP preprocessor_config.json:
@@ -68,7 +68,7 @@ class _CLIPImageEmbeddings(torch.nn.Module):
             images = torch.from_numpy(images).permute(0, 3, 1, 2).to(self.device)
 
         inputs = self.transforms(images)
-        embed = self.clip.get_image_features(pixel_values=inputs)
+        embed = self.clip.get_image_features(pixel_values=inputs).pooler_output
 
         # Normalize embeddings
         return embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)  # type: ignore[no-any-return]

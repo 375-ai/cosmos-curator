@@ -334,6 +334,9 @@ Convert prompt and video frames to your model's expected input format:
 
 #### Pattern 1: Token IDs + Video Tensor (e.g., Qwen)
 
+With Transformers v5, tokenized chat templates return a tensor.
+Extract the first row for vLLM prompt-token input.
+
 ```python
 @staticmethod
 def make_llm_input(

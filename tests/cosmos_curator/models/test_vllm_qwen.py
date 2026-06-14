@@ -40,7 +40,7 @@ if pixi_utils.is_running_in_env("default"):
 @pytest.mark.env("default")
 def test_make_llm_input_qwen() -> None:
     """Test make_llm_input (video path)."""
-    # Mock the tokenizer to return a tensor that can be indexed and converted to list
+    # Mock the Transformers v5 tensor return shape.
     mock_tensor = torch.tensor([[1, 2, 3, 4, 5]])  # Shape: (1, 5)
 
     mock_processor = MagicMock()
@@ -49,7 +49,7 @@ def test_make_llm_input_qwen() -> None:
     # Create test frames tensor
     frames = torch.rand(2, 3, 32, 32)  # 2 frames, 3 channels, 32x32
     prompt = "Describe the video"
-    metadata = {"fps": 2.0, "duration": 1.0}
+    metadata = {"fps": 2.0, "duration": 1.0, "video_backend": "opencv", "do_sample_frames": False}
 
     config = VllmConfig(model_variant="qwen")
     result = VllmQwen.make_llm_input(prompt, frames, metadata, mock_processor, config)
@@ -62,7 +62,19 @@ def test_make_llm_input_qwen() -> None:
     video_frames, video_metadata = result["multi_modal_data"]["video"][0]
     assert video_frames.shape == (2, 3, 32, 32)
     assert video_metadata == metadata
-    assert "mm_processor_kwargs" not in result
+    assert result["mm_processor_kwargs"] == {
+        "video_metadata": [
+            {
+                "total_num_frames": 2,
+                "fps": 2.0,
+                "width": 32,
+                "height": 32,
+                "duration": 1.0,
+                "video_backend": "opencv",
+                "frames_indices": [0, 1],
+            }
+        ]
+    }
 
 
 @pytest.mark.env("default")
@@ -136,7 +148,7 @@ def test_make_message_image() -> None:
 @pytest.mark.env("default")
 def test_make_prompt() -> None:
     """Test make_prompt function (video path)."""
-    # Mock the tokenizer to return a tensor that can be indexed and converted to list
+    # Mock the Transformers v5 tensor return shape.
     mock_tensor = torch.tensor([[10, 20, 30, 40]])  # Shape: (1, 4)
 
     mock_processor = MagicMock()
@@ -223,18 +235,31 @@ def test_make_llm_input_qwen3vl_video_emits_top_level_size() -> None:
 
 @pytest.mark.env("default")
 def test_make_llm_input_qwen_does_not_emit_size_when_cap_is_set() -> None:
-    """Qwen2.5 support is enforced by fetch_video(), not request-level size."""
+    """Qwen2.5 timing metadata is emitted without Qwen3 request-level size."""
     mock_tensor = torch.tensor([[1, 2, 3, 4, 5]])
     mock_processor = MagicMock()
     mock_processor.apply_chat_template.return_value = mock_tensor
 
     frames = torch.rand(2, 3, 32, 32)
-    metadata = {"fps": 2.0, "duration": 1.0}
+    metadata = {"fps": 2.0, "duration": 1.0, "video_backend": "opencv"}
     config = VllmConfig(model_variant="qwen", video_max_pixels_per_frame=602112)
 
     result = VllmQwen.make_llm_input("Describe the video", frames, metadata, mock_processor, config)
 
-    assert "mm_processor_kwargs" not in result
+    assert result["mm_processor_kwargs"] == {
+        "video_metadata": [
+            {
+                "total_num_frames": 2,
+                "fps": 2.0,
+                "width": 32,
+                "height": 32,
+                "duration": 1.0,
+                "video_backend": "opencv",
+                "frames_indices": [0, 1],
+            }
+        ]
+    }
+    assert "size" not in result["mm_processor_kwargs"]
 
 
 @pytest.mark.env("default")
