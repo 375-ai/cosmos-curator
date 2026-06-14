@@ -219,11 +219,22 @@ Ray Data rows.
 See [Ray Data Captioning Design](ray-data-captioning.md) for the detailed architecture, tradeoffs, and known technical
 debt.
 
+### Video workflow migration scope
+
+The broad architecture in this document supports long-term coexistence between Ray Data and Xenna, but the current video
+split workflow has a narrower migration decision: Ray Data is the priority implementation path for retained split,
+caption, filtering, embedding, semantic dedup, and shard-dataset workloads. Xenna remains the production fallback until
+each retained workflow clears the cutover criteria in the migration plan.
+
+See [Ray Data Migration Plan](ray-data-migration.md) for the retained workflow contract, checklist, validation plan,
+cutover gates, and rollback policy. That plan owns workflow priority; this document owns the general Ray Data execution
+architecture.
+
 ### Long-term outlook
 
 If Ray Data proves to be the better engine for all pipelines, the Xenna dependency could eventually be removed. But
-both engines may coexist long-term — the separate implementation approach supports either outcome without upfront
-commitment.
+both engines may coexist long-term outside the retained video migration scope; the separate implementation approach
+supports either outcome for workflows that do not have their own cutover plan.
 
 ---
 
@@ -257,7 +268,10 @@ as a `map_batches` kwarg. This is the same `PixiRuntimeEnv` already used by the 
 - [x] `summary.json` output for the splitting pipeline (driver-side aggregation via `take_all()`;
   avoids the `groupby` shuffle's per-node CPU reservation in the streaming DAG)
 - [x] Ray Data captioning via Ray Data LLM + vLLM
-- [ ] Ray Data versions of remaining production pipelines (embedding, filtering)
+- [ ] Retained split-workflow filtering, especially LLM/VLM semantic filtering and video-type classification
+- [ ] Ray Data embedding output for retained split runs
+- [ ] Ray Data semantic dedup over Lance embeddings
+- [ ] Ray Data shard dataset workflow consuming Lance metadata/captions, clip-media locations, and dedup decisions
 - [ ] Per-clip transcode failure reporting: surface failed clips with error info in per-video metadata and
   `summary.json` instead of silently dropping them
 - [ ] Retry policy for transient I/O failures: bounded retries on `read_video` and clip-write stages (S3 throttles,
@@ -270,4 +284,5 @@ as a `map_batches` kwarg. This is the same `PixiRuntimeEnv` already used by the 
   and per-clip error fields mirroring Xenna's `video.errors` / `clip.errors`
 - [ ] Refactor existing pipeline utilities/helpers to work for both engines where applicable
 - [ ] Multi-node model download for Ray Data pipelines
-- [ ] Performance comparison between Xenna and Ray Data for the same workloads
+- [ ] Performance comparison between Xenna and Ray Data for the same retained workloads, using the baselines defined in
+  the migration plan
