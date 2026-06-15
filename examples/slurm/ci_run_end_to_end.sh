@@ -19,6 +19,9 @@ for var in "${required_vars[@]}"; do
 done
 
 SLURM_E2E_S3_PROFILE_NAME=${SLURM_E2E_S3_PROFILE_NAME:-default}
+SLURM_E2E_RUN_LANCE=${SLURM_E2E_RUN_LANCE:-0}
+SLURM_E2E_OUTPUT_CLIP_LANCE_PATH=${SLURM_E2E_OUTPUT_CLIP_LANCE_PATH:-${SLURM_E2E_OUTPUT_CLIP_PATH}_lance}
+SLURM_E2E_OUTPUT_DATASET_LANCE_PATH=${SLURM_E2E_OUTPUT_DATASET_LANCE_PATH:-${SLURM_E2E_OUTPUT_DATASET_PATH}_lance}
 
 export AWS_SHARED_CREDENTIALS_FILE="${AWS_SHARED_CREDENTIALS_FILE:-/creds/s3_creds}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-west-2}"
@@ -62,8 +65,38 @@ run_shard() {
   log "Shard pipeline completed"
 }
 
+run_split_lance() {
+  log "Running Lance split pipeline -> ${SLURM_E2E_OUTPUT_CLIP_LANCE_PATH}"
+  python -m cosmos_curator.pipelines.video.run_pipeline split \
+    --input-video-path "${S3_INPUT_VIDEO_PATH}" \
+    --output-clip-path "${SLURM_E2E_OUTPUT_CLIP_LANCE_PATH}" \
+    --input-s3-profile-name "${SLURM_E2E_S3_PROFILE_NAME}" \
+    --output-s3-profile-name "${SLURM_E2E_S3_PROFILE_NAME}" \
+    --limit 1 \
+    --execution-mode STREAMING \
+    --upload-clip-info-in-lance
+  log "Lance split pipeline completed"
+}
+
+run_shard_lance() {
+  log "Running Lance shard pipeline -> ${SLURM_E2E_OUTPUT_DATASET_LANCE_PATH}"
+  python -m cosmos_curator.pipelines.video.run_pipeline shard \
+    --input-clip-path "${SLURM_E2E_OUTPUT_CLIP_LANCE_PATH}" \
+    --output-dataset-path "${SLURM_E2E_OUTPUT_DATASET_LANCE_PATH}" \
+    --input-s3-profile-name "${SLURM_E2E_S3_PROFILE_NAME}" \
+    --output-s3-profile-name "${SLURM_E2E_S3_PROFILE_NAME}" \
+    --annotation-version v0 \
+    --metadata-input-format lance
+  log "Lance shard pipeline completed"
+}
+
 run_split
 run_dedup
 run_shard
+
+if [[ "${SLURM_E2E_RUN_LANCE}" == "1" ]]; then
+  run_split_lance
+  run_shard_lance
+fi
 
 log "SLURM end-to-end pipeline finished successfully"

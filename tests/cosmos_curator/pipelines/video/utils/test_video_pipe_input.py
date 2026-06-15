@@ -13,17 +13,25 @@
 """Tests for video pipe input (session-based multi-cam extraction)."""
 
 import contextlib
+import json
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import lance
 import pytest
 
+from cosmos_curator.pipelines.video.read_write.clip_metadata_lance_schema import (
+    CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
+    CLIP_METADATA_LANCE_SCHEMA,
+    build_clip_metadata_lance_table,
+)
 from cosmos_curator.pipelines.video.utils.video_pipe_input import (
     _multi_cam_session_to_split_task,
     _order_video_paths,
     extract_multi_cam_split_tasks,
+    extract_shard_tasks,
 )
 
 
@@ -277,6 +285,112 @@ def test_extract_multi_cam_split_tasks_one_session_primary_first(tmp_path: Path)
     # Primary (path containing "front") must be first
     assert "front" in str(task.videos[0].input_video).lower()
     assert task.video is task.videos[0]
+
+
+def _legacy_clip_metadata(clip_path: Path, clip_uuid: str = "clip-1") -> dict[str, Any]:
+    return {
+        "span_uuid": clip_uuid,
+        "source_video": "input/video.mp4",
+        "duration_span": [0.0, 1.0],
+        "width_source": 640,
+        "height_source": 360,
+        "framerate_source": 24.0,
+        "clip_location": str(clip_path),
+        "width": 640,
+        "height": 360,
+        "framerate": 24.0,
+        "num_frames": 24,
+        "video_codec": "h264",
+        "num_bytes": 128,
+        "valid": True,
+        "has_caption": True,
+        "caption_quality_flags_enabled": True,
+        "total_prompt_tokens": 7,
+        "total_output_tokens": 5,
+        "num_caption_windows": 1,
+        "windows": [
+            {
+                "start_frame": 0,
+                "end_frame": 24,
+                "caption_status": "success",
+                "caption_failure_reason": None,
+                "flag_length_outlier": False,
+                "flag_repetition": False,
+                "flag_near_duplicate": False,
+                "qwen_caption": "caption text",
+                "qwen_prompt_tokens": 7,
+                "qwen_output_tokens": 5,
+            }
+        ],
+        "filtered_windows": [],
+    }
+
+
+def test_extract_shard_tasks_reads_lance_metadata(tmp_path: Path) -> None:
+    """Shard task extraction can consume Lance metadata without per-clip JSON."""
+    input_root = tmp_path / "split"
+    output_root = tmp_path / "dataset" / "v0"
+    input_root.mkdir()
+    clip_path = input_root / "clips" / "clip-1.mp4"
+    clip_path.parent.mkdir()
+    clip_path.write_bytes(b"clip")
+
+    table = build_clip_metadata_lance_table(
+        [_legacy_clip_metadata(clip_path)],
+        video_uuid="video-1",
+        clip_chunk_index=0,
+    )
+    lance.write_dataset(
+        table,
+        input_root / "lance" / "v0",
+        schema=CLIP_METADATA_LANCE_SCHEMA,
+        mode="overwrite",
+        data_storage_version=CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
+    )
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format="lance",
+    )
+
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample.uuid == "clip-1"
+    assert sample.clip_location == clip_path
+    assert sample.clip_metadata["span_uuid"] == "clip-1"
+    assert sample.clip_metadata["windows"][0]["qwen_caption"] == "caption text"
+    assert sample.clip_metadata["windows"][0]["qwen_prompt_tokens"] == 7
+
+
+def test_extract_shard_tasks_auto_falls_back_to_json_metadata(tmp_path: Path) -> None:
+    """Auto mode keeps legacy split outputs readable when Lance is absent."""
+    input_root = tmp_path / "split"
+    output_root = tmp_path / "dataset" / "v0"
+    metas_root = input_root / "metas" / "v0"
+    metas_root.mkdir(parents=True)
+    clip_path = input_root / "clips" / "clip-1.mp4"
+    clip_path.parent.mkdir()
+    clip_path.write_bytes(b"clip")
+    metadata = _legacy_clip_metadata(clip_path)
+    (input_root / "summary.json").write_text(json.dumps({"video": {"clips": ["clip-1"]}}))
+    (metas_root / "clip-1.json").write_text(json.dumps(metadata))
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format="auto",
+    )
+
+    assert len(samples) == 1
+    assert samples[0].uuid == "clip-1"
+    assert samples[0].clip_metadata == metadata
 
 
 def test_extract_multi_cam_split_tasks_only_uuid_dirs_are_sessions(tmp_path: Path) -> None:

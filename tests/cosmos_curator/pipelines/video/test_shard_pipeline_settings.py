@@ -85,6 +85,7 @@ def test_shard_parser_add_argument_type_matches_field_scalar_type() -> None:
         ("output_dataset_path", str),
         ("captioning_algorithm", str),
         ("annotation_version", str),
+        ("metadata_input_format", str),
         ("input_semantic_dedup_s3_profile_name", str),
         ("semantic_dedup_epsilon", float),
         ("max_tars_per_part", int),
@@ -169,6 +170,7 @@ def test_shard_settings_from_minimal_valid_parse() -> None:
     assert settings.common.verbose is False
     assert settings.common.execution_mode == "AUTO"
     assert settings.captioning_algorithm == "qwen"
+    assert settings.metadata_input_format == "json"
     assert settings.max_tars_per_part >= 1
 
 
@@ -250,6 +252,22 @@ def test_shard_settings_validation_rejects_invalid_values(
         _shard_settings_from_args(args)
 
 
+def test_shard_parser_rejects_invalid_metadata_input_format() -> None:
+    """``metadata_input_format`` is limited to supported metadata readers."""
+    parser = _shard_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "--input-clip-path",
+                "/in",
+                "--output-dataset-path",
+                "/out",
+                "--metadata-input-format",
+                "parquet",
+            ],
+        )
+
+
 def test_common_settings_rejects_invalid_execution_mode() -> None:
     """``execution_mode`` must be AUTO, BATCH, or STREAMING."""
     ns = argparse.Namespace(
@@ -297,6 +315,7 @@ def test_shard_settings_rejects_empty_input_clip_path() -> None:
         output_dataset_path="/out",
         captioning_algorithm="qwen",
         annotation_version="v0",
+        metadata_input_format="json",
         input_semantic_dedup_s3_profile_name="default",
         semantic_dedup_epsilon=0.01,
         max_tars_per_part=10,

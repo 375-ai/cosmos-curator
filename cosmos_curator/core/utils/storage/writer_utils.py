@@ -173,11 +173,12 @@ def write_parquet(  # noqa: PLR0913
     )
 
 
-def write_lance_fragments(
+def write_lance_fragments(  # noqa: PLR0913
     table: pa.Table,
     dest: storage_client.StoragePrefix | pathlib.Path | str,
     *,
     schema: pa.Schema | None = None,
+    data_storage_version: str | None = None,
     storage_options: dict[str, str] | None = None,
     verbose: bool = False,
 ) -> tuple[list[dict[str, Any]], str]:
@@ -194,7 +195,13 @@ def write_lance_fragments(
     if verbose:
         logger.debug(f"Writing Lance fragments to {dest_uri}")
 
-    fragments = write_fragments(table, dest_uri, schema=schema or table.schema, storage_options=storage_options)
+    fragments = write_fragments(
+        table,
+        dest_uri,
+        schema=schema or table.schema,
+        data_storage_version=data_storage_version,
+        storage_options=storage_options,
+    )
     fragments_json = [fragment.to_json() for fragment in fragments]
     schema_buf = (schema or table.schema).serialize().to_pybytes()
     schema_b64 = base64.b64encode(schema_buf).decode("ascii")

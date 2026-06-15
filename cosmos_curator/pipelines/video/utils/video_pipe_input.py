@@ -19,7 +19,9 @@ import json
 import pathlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Literal
 
+import lance
 import pandas as pd
 from loguru import logger
 from six import BytesIO
@@ -30,6 +32,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     get_directories_relative,
     get_files_relative,
     get_full_path,
+    get_lance_storage_options,
     get_storage_client,
     is_parquet_file,
     path_exists,
@@ -37,6 +40,10 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     read_json_file,
 )
 from cosmos_curator.pipelines.video.utils.data_model import ClipSample, SplitPipeTask, Video
+
+MetadataInputFormat = Literal["auto", "json", "lance"]
+_LANCE_NOT_FOUND_MARKERS = ("was not found", "Dataset does not exist")
+_MAP_PAIR_LENGTH = 2
 
 
 def _check_output_path(output_path: str, client: StorageClient | None) -> None:
@@ -441,6 +448,150 @@ def _worker_read_clip_metadata(
         return None
 
 
+def _get_lance_metadata_uri(input_path: str, annotate_version: str) -> str:
+    return input_path.rstrip("/") + f"/lance/{annotate_version}"
+
+
+def _extract_shard_tasks_from_lance(
+    input_path: str,
+    input_s3_profile_name: str,
+    version: str,
+    *,
+    verbose: bool = False,
+) -> list[ClipSample]:
+    lance_uri = _get_lance_metadata_uri(input_path, version)
+    logger.info(f"Reading Lance clip metadata from {lance_uri} ...")
+    dataset = lance.dataset(
+        lance_uri,
+        storage_options=get_lance_storage_options(lance_uri, profile_name=input_s3_profile_name),
+    )
+    rows = dataset.to_table().to_pylist()
+    clip_samples = []
+    for row in rows:
+        clip_sample = _lance_metadata_row_to_clip_sample(row, verbose=verbose)
+        if clip_sample is not None:
+            clip_samples.append(clip_sample)
+    return clip_samples
+
+
+def _lance_metadata_row_to_clip_sample(row: dict[str, Any], *, verbose: bool = False) -> ClipSample | None:
+    clip_metadata = _lance_metadata_row_to_legacy_metadata(row)
+    if clip_metadata["valid"]:
+        return ClipSample(
+            uuid=str(clip_metadata["span_uuid"]),
+            width=clip_metadata["width"],
+            height=clip_metadata["height"],
+            num_frames=clip_metadata["num_frames"],
+            framerate=clip_metadata["framerate"],
+            num_bytes=clip_metadata["num_bytes"],
+            clip_location=get_full_path(clip_metadata["clip_location"]),
+            clip_metadata=clip_metadata,
+        )
+    logger.warning(f"Clip {clip_metadata['span_uuid']} is invalid, skipping ...")
+    if verbose:
+        logger.warning(clip_metadata)
+    return None
+
+
+def _lance_metadata_row_to_legacy_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "span_uuid": row["clip_uuid"],
+        "source_video": row.get("source_video"),
+        "duration_span": [row.get("span_start_s"), row.get("span_end_s")],
+        "width_source": row.get("source_width"),
+        "height_source": row.get("source_height"),
+        "framerate_source": row.get("source_framerate"),
+        "clip_location": row.get("clip_location"),
+        "width": row.get("clip_width"),
+        "height": row.get("clip_height"),
+        "framerate": row.get("clip_framerate"),
+        "num_frames": row.get("clip_num_frames"),
+        "video_codec": row.get("clip_video_codec"),
+        "num_bytes": row.get("clip_num_bytes"),
+        "valid": row.get("valid"),
+        "has_caption": row.get("has_caption"),
+        "caption_quality_flags_enabled": row.get("caption_quality_flags_enabled"),
+        "total_prompt_tokens": row.get("total_prompt_tokens"),
+        "total_output_tokens": row.get("total_output_tokens"),
+        "num_caption_windows": row.get("num_caption_windows"),
+        "windows": [_lance_window_to_legacy(window) for window in row.get("windows", [])],
+        "filtered_windows": [_lance_filtered_window_to_legacy(window) for window in row.get("filtered_windows", [])],
+    }
+    _copy_optional_lance_field(metadata, row, "motion_score", "motion_score")
+    _copy_optional_lance_field(metadata, row, "aesthetic_score", "aesthetic_score")
+    _copy_optional_lance_field(metadata, row, "qwen_type_classification", "classification_labels")
+    _copy_optional_lance_field(metadata, row, "qwen_rejection_stage", "rejection_stage")
+    _copy_optional_lance_field(metadata, row, "post_production_text", "post_production_text")
+    _copy_optional_lance_field(metadata, row, "sam3_num_instances", "sam3_num_instances")
+    _copy_optional_lance_field(metadata, row, "sam3_num_events", "sam3_num_events")
+    _copy_optional_lance_field(metadata, row, "errors", "errors")
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def _copy_optional_lance_field(
+    metadata: dict[str, Any],
+    row: dict[str, Any],
+    metadata_key: str,
+    row_key: str,
+) -> None:
+    value = row.get(row_key)
+    if value is not None:
+        metadata[metadata_key] = value
+
+
+def _lance_window_to_legacy(window: dict[str, Any]) -> dict[str, Any]:
+    legacy = {
+        "start_frame": window.get("start_frame"),
+        "end_frame": window.get("end_frame"),
+        "caption_status": window.get("caption_status"),
+        "caption_failure_reason": window.get("caption_failure_reason"),
+        "flag_length_outlier": window.get("flag_length_outlier"),
+        "flag_repetition": window.get("flag_repetition"),
+        "flag_near_duplicate": window.get("flag_near_duplicate"),
+        "errors": _lance_map_to_dict(window.get("errors")),
+    }
+    for model, text in _lance_map_to_dict(window.get("captions")).items():
+        legacy[f"{model}_caption"] = text
+    for model, text in _lance_map_to_dict(window.get("enhanced_captions")).items():
+        legacy[f"{model}_enhanced_caption"] = text
+    for model, counts in _lance_map_to_dict(window.get("token_counts")).items():
+        if isinstance(counts, dict):
+            legacy[f"{model}_prompt_tokens"] = counts.get("prompt_tokens")
+            legacy[f"{model}_output_tokens"] = counts.get("output_tokens")
+    return {key: value for key, value in legacy.items() if value is not None and value != {}}
+
+
+def _lance_filtered_window_to_legacy(window: dict[str, Any]) -> dict[str, Any]:
+    legacy = {
+        "start_frame": window.get("start_frame"),
+        "end_frame": window.get("end_frame"),
+        "qwen_rejection_reasons": window.get("rejection_reasons"),
+        "errors": _lance_map_to_dict(window.get("errors")),
+    }
+    return {key: value for key, value in legacy.items() if value is not None and value != {}}
+
+
+def _lance_map_to_dict(value: object) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {str(key): item for key, item in value.items()}
+    if isinstance(value, list):
+        out = {}
+        for item in value:
+            if isinstance(item, tuple) and len(item) == _MAP_PAIR_LENGTH:
+                out[str(item[0])] = item[1]
+            elif isinstance(item, dict) and "key" in item and "value" in item:
+                out[str(item["key"])] = item["value"]
+        return out
+    return {}
+
+
+def _is_lance_dataset_not_found_error(error: ValueError) -> bool:
+    message = str(error)
+    return any(marker in message for marker in _LANCE_NOT_FOUND_MARKERS)
+
+
 def extract_shard_tasks(  # noqa: PLR0913
     input_path: str,
     output_path: str,
@@ -448,6 +599,7 @@ def extract_shard_tasks(  # noqa: PLR0913
     output_s3_profile_name: str,
     version: str,
     *,
+    metadata_input_format: MetadataInputFormat = "json",
     verbose: bool = False,
 ) -> list[ClipSample]:
     """Extract list of clip paths from the input S3 or local path."""
@@ -460,6 +612,15 @@ def extract_shard_tasks(  # noqa: PLR0913
     if len(objects_in_output) > 0:
         error_msg = f"Expect output path {output_path} to be empty"
         raise ValueError(error_msg)
+    if metadata_input_format == "lance":
+        return _extract_shard_tasks_from_lance(input_path, input_s3_profile_name, version, verbose=verbose)
+    if metadata_input_format == "auto":
+        try:
+            return _extract_shard_tasks_from_lance(input_path, input_s3_profile_name, version, verbose=verbose)
+        except ValueError as e:
+            if not _is_lance_dataset_not_found_error(e):
+                raise
+            logger.info(f"No Lance clip metadata found under {input_path}; falling back to per-clip JSON metadata.")
     # extract clip metadata paths
     logger.info(f"Extracting clip metadata from {input_path} ...")
     clip_metadata_paths = _get_clip_metadata_paths_from_summary(input_path, client_input, version)

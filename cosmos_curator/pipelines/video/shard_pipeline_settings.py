@@ -23,6 +23,7 @@ via :func:`~cosmos_curator.pipelines.common_pipeline_settings.composite_from_nam
 """
 
 import argparse
+from typing import Literal
 
 import attrs
 from attrs import NOTHING, validators
@@ -40,6 +41,8 @@ _CAPTION_CHOICES = frozenset(ALL_CAPTION_ALGOS)
 MAX_TARS_PER_PART_DEFAULT = 100
 TARGET_TAR_SIZE_MB_DEFAULT = 500
 MIN_CLIPS_PER_TAR_DEFAULT = 1
+_METADATA_INPUT_FORMAT_CHOICES = frozenset({"auto", "json", "lance"})
+MetadataInputFormat = Literal["auto", "json", "lance"]
 
 
 def add_shard_args(parser: argparse.ArgumentParser) -> None:
@@ -83,6 +86,15 @@ class ShardPipelineSettings:
     annotation_version: str = attrs.field(
         validator=validators.min_len(1),
         metadata=cli(help="Annotation version to use for clip metadata", default="v0"),
+    )
+    metadata_input_format: MetadataInputFormat = attrs.field(
+        validator=validators.in_(_METADATA_INPUT_FORMAT_CHOICES),
+        metadata=cli(
+            help="Metadata input format for clip metadata: auto, json, or lance.",
+            default="json",
+            choices=_METADATA_INPUT_FORMAT_CHOICES,
+            arg_type=str,
+        ),
     )
     input_semantic_dedup_s3_profile_name: str = attrs.field(
         validator=validators.min_len(1),

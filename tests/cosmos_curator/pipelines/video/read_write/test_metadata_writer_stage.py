@@ -30,6 +30,13 @@ import pytest
 from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
 from cosmos_curator.core.utils.storage import storage_client, storage_utils
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
+from cosmos_curator.pipelines.video.read_write.clip_metadata_lance_schema import (
+    CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
+    CLIP_METADATA_LANCE_SCHEMA,
+    CLIP_METADATA_LANCE_SCHEMA_VERSION,
+    build_clip_metadata_lance_table,
+    clip_metadata_row_to_lance_row,
+)
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import (
     ClipWriterStage,
     _archive_processed_sidecars,
@@ -603,15 +610,22 @@ def test_chunked_metadata_writes_lance_dataset(tmp_path: Path) -> None:
     task = SplitPipeTask(session_id="test-session", video=video)
 
     stage.process_data([task])
+    video_uuid = ClipWriterStage.get_video_uuid(video.input_path)
+    sidecar = _read_json(output_dir / "lance_fragments" / "v0" / f"{video_uuid}_0.json")
+    assert sidecar["schema_version"] == CLIP_METADATA_LANCE_SCHEMA_VERSION
+    assert sidecar["data_storage_version"] == CLIP_METADATA_LANCE_DATA_STORAGE_VERSION
+
     consolidate_lance_fragments(str(output_dir), "default")
 
-    video_uuid = ClipWriterStage.get_video_uuid(video.input_path)
     lance_root = output_dir / "lance" / "v0"
     dataset = lance.dataset(lance_root.as_posix())
+    assert dataset.data_storage_version == CLIP_METADATA_LANCE_DATA_STORAGE_VERSION
+    assert dataset.schema.equals(CLIP_METADATA_LANCE_SCHEMA, check_metadata=True)
     rows = dataset.to_table().to_pylist()
     assert len(rows) == 1
     row = rows[0]
-    assert row["span_uuid"] == str(clip.uuid)
+    assert row["schema_version"] == CLIP_METADATA_LANCE_SCHEMA_VERSION
+    assert row["clip_uuid"] == str(clip.uuid)
     assert row["video_uuid"] == str(video_uuid)
     assert row["clip_chunk_index"] == 0
     assert row["caption_quality_flags_enabled"] is True
@@ -620,7 +634,128 @@ def test_chunked_metadata_writes_lance_dataset(tmp_path: Path) -> None:
     assert row["windows"][0]["flag_length_outlier"] is None
     assert row["windows"][0]["flag_repetition"] is None
     assert row["windows"][0]["flag_near_duplicate"] is None
-    assert row["windows"][0]["qwen_caption"] == "lance caption"
+    assert dict(row["windows"][0]["captions"]) == {"qwen": "lance caption"}
+
+
+def test_lance_metadata_schema_normalizes_dynamic_model_fields(tmp_path: Path) -> None:
+    """Model-specific metadata is stored in maps, not dynamic Lance columns."""
+    stage = _create_stage(
+        tmp_path / "out",
+        tmp_path / "in",
+        caption_models=["qwen", "gemini"],
+        enhanced_caption_models=["qwen_plus"],
+    )
+    window = Window(
+        start_frame=0,
+        end_frame=10,
+        caption={"qwen": "qwen caption", "gemini": "gemini caption"},
+        enhanced_caption={"qwen_plus": "enhanced caption"},
+        token_counts={
+            "qwen": TokenCounts(prompt_tokens=11, output_tokens=7),
+            "gemini": TokenCounts(prompt_tokens=13, output_tokens=8),
+        },
+        caption_status="truncated",
+        flag_length_outlier=False,
+        flag_repetition=True,
+        flag_near_duplicate=False,
+    )
+    filter_window = Window(start_frame=0, end_frame=10, caption={"qwen_rejection_reasons": "too blurry"})
+    filter_window.errors["qwen"] = "malformed"
+    clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video="input/video.mp4",
+        span=(1.25, 2.75),
+        encoded_data=bytes_to_numpy(b"data"),
+        windows=[window],
+        filter_windows=[filter_window],
+    )
+    clip.motion_score_global_mean = 0.5
+    clip.motion_score_per_patch_min_256 = 0.25
+    clip.aesthetic_score = 0.9
+    clip.qwen_type_classification = ["nature", "indoor"]
+    clip.qwen_rejection_stage = "classifier"
+    clip.has_artificial_text = True
+    clip.errors["extract_metadata"] = "warning"
+    clip.intern_video_2_embedding = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    video_meta = VideoMetadata(height=720, width=1280, framerate=24.0, num_frames=30, duration=1.25, video_codec="h264")
+
+    metadata_row = stage._make_clip_metadata(clip, video_meta)
+    table = build_clip_metadata_lance_table(
+        [metadata_row],
+        video_uuid="video-id",
+        clip_chunk_index=3,
+    )
+
+    assert table.schema.equals(CLIP_METADATA_LANCE_SCHEMA, check_metadata=True)
+    row = table.to_pylist()[0]
+    assert row["clip_uuid"] == str(clip.uuid)
+    assert row["span_start_s"] == pytest.approx(1.25)
+    assert row["span_end_s"] == pytest.approx(2.75)
+    assert row["duration_s"] == pytest.approx(1.5)
+    assert row["source_width"] == 1280
+    assert row["source_height"] == 720
+    assert row["clip_width"] == 1920
+    assert row["clip_height"] == 1080
+    assert row["motion_score"] == {"global_mean": 0.5, "per_patch_min_256": 0.25}
+    assert row["classification_labels"] == ["nature", "indoor"]
+    assert row["rejection_stage"] == "classifier"
+    assert row["post_production_text"] is True
+    assert row["errors"] == ["extract_metadata"]
+    assert row["embedding_dim"] == 3
+    npt.assert_allclose(np.array(row["embedding"]), np.array([0.1, 0.2, 0.3], dtype=np.float32))
+
+    lance_window = row["windows"][0]
+    assert dict(lance_window["captions"]) == {"gemini": "gemini caption", "qwen": "qwen caption"}
+    assert dict(lance_window["enhanced_captions"]) == {"qwen_plus": "enhanced caption"}
+    assert dict(lance_window["token_counts"]) == {
+        "gemini": {"prompt_tokens": 13, "output_tokens": 8},
+        "qwen": {"prompt_tokens": 11, "output_tokens": 7},
+    }
+    assert lance_window["caption_status"] == "truncated"
+    assert lance_window["flag_repetition"] is True
+    assert row["filtered_windows"] == [
+        {
+            "start_frame": 0,
+            "end_frame": 10,
+            "rejection_reasons": "too blurry",
+            "errors": [("qwen", "malformed")],
+        }
+    ]
+
+
+def test_lance_metadata_schema_parses_string_booleans() -> None:
+    """String booleans should not rely on Python truthiness."""
+    row = clip_metadata_row_to_lance_row(
+        {
+            "span_uuid": "clip-id",
+            "duration_span": [0.0, 1.0],
+            "valid": "False",
+            "has_caption": "yes",
+            "caption_quality_flags_enabled": "1",
+            "post_production_text": "0",
+        },
+        video_uuid="video-id",
+        clip_chunk_index=0,
+    )
+
+    assert row["valid"] is False
+    assert row["has_caption"] is True
+    assert row["caption_quality_flags_enabled"] is True
+    assert row["post_production_text"] is False
+
+
+def test_lance_metadata_schema_rejects_none_embedding_values() -> None:
+    """Embedding normalization should not silently shorten vectors."""
+    with pytest.raises(ValueError, match="Float list values must not be None"):
+        clip_metadata_row_to_lance_row(
+            {
+                "span_uuid": "clip-id",
+                "duration_span": [0.0, 1.0],
+                "embedding": [1.0, None, 3.0],
+            },
+            video_uuid="video-id",
+            clip_chunk_index=0,
+        )
 
 
 def test_lance_consolidation_is_idempotent(tmp_path: Path) -> None:
@@ -681,9 +816,9 @@ def test_lance_consolidation_is_idempotent(tmp_path: Path) -> None:
     dataset = lance.dataset(lance_root.as_posix())
     rows = dataset.to_table().to_pylist()
     assert len(rows) == 2
-    span_uuids = {row["span_uuid"] for row in rows}
-    assert str(clip1.uuid) in span_uuids
-    assert str(clip2.uuid) in span_uuids
+    clip_uuids = {row["clip_uuid"] for row in rows}
+    assert str(clip1.uuid) in clip_uuids
+    assert str(clip2.uuid) in clip_uuids
 
     # Verify second sidecar was also archived
     assert len(list(staging_dir.glob("*.json"))) == 0

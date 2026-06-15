@@ -50,6 +50,12 @@ from cosmos_curator.core.utils.storage.writer_utils import (
     write_text,
 )
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
+from cosmos_curator.pipelines.video.read_write.clip_metadata_lance_schema import (
+    CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
+    CLIP_METADATA_LANCE_SCHEMA,
+    CLIP_METADATA_LANCE_SCHEMA_VERSION,
+    build_clip_metadata_lance_table,
+)
 from cosmos_curator.pipelines.video.tracking.serialization import (
     sam3_events_envelope,
     sam3_instances_envelope,
@@ -524,21 +530,18 @@ class ClipWriterStage(CuratorStage):
             return
 
         video_uuid = str(self.get_video_uuid(video.input_path))
-        enriched_rows = [
-            {
-                **row,
-                "video_uuid": video_uuid,
-                "clip_chunk_index": video.clip_chunk_index,
-            }
-            for row in metadata_rows
-        ]
-        table = pa.Table.from_pylist(enriched_rows)
+        table = build_clip_metadata_lance_table(
+            metadata_rows,
+            video_uuid=video_uuid,
+            clip_chunk_index=video.clip_chunk_index,
+        )
 
         fragment_staging = self.get_output_path_meta_lance(self._output_path, "v0")
         fragments_json, schema_b64 = write_lance_fragments(
             table,
             fragment_staging,
-            schema=table.schema,
+            schema=CLIP_METADATA_LANCE_SCHEMA,
+            data_storage_version=CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
             storage_options=self._lance_storage_options,
             verbose=self._verbose,
         )
@@ -549,6 +552,8 @@ class ClipWriterStage(CuratorStage):
         sidecar_payload = {
             "fragments": fragments_json,
             "schema_b64": schema_b64,
+            "schema_version": CLIP_METADATA_LANCE_SCHEMA_VERSION,
+            "data_storage_version": CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
             "video_uuid": video_uuid,
             "clip_chunk_index": video.clip_chunk_index,
         }
@@ -1208,28 +1213,13 @@ def _consolidate_one(staging_root: str, processed_root: str, final_uri: str, out
     if not sidecars:
         return
 
-    fragments: list[lance.FragmentMetadata] = []
-    schema_b64: str | None = None
-    for rel_path in sidecars:
-        payload = read_json_file(get_full_path(staging_root, rel_path), client)
-        frag_payload = payload.get("fragments", [])
-        fragments.extend(lance.FragmentMetadata.from_json(json.dumps(frag)) for frag in frag_payload)
-        if schema_b64 is None:
-            schema_b64 = payload.get("schema_b64")
-
+    fragments, schema_b64 = _load_lance_sidecars(staging_root, sidecars, client)
     if schema_b64 is None:
         logger.warning(f"No schema found for Lance consolidation under {staging_root}")
         return
 
-    schema_buf = base64.b64decode(schema_b64)
-    schema = pa.ipc.read_schema(pa.py_buffer(schema_buf))
-    try:
-        dataset = lance.dataset(final_uri, storage_options=storage_options)
-        read_version = dataset.version
-        op: lance.LanceOperation.Append | lance.LanceOperation.Overwrite = lance.LanceOperation.Append(fragments)
-    except (FileNotFoundError, ValueError):
-        read_version = 0
-        op = lance.LanceOperation.Overwrite(schema, fragments)
+    schema = _decode_lance_sidecar_schema(schema_b64)
+    read_version, op = _get_lance_commit_operation(final_uri, schema, fragments, storage_options)
 
     lance.LanceDataset.commit(
         final_uri,
@@ -1239,6 +1229,76 @@ def _consolidate_one(staging_root: str, processed_root: str, final_uri: str, out
     )
     _archive_processed_sidecars(sidecars, staging_root, processed_root, client, processed_client)
     logger.info(f"Consolidated {len(fragments)} Lance fragments into {final_uri}")
+
+
+def _load_lance_sidecars(
+    staging_root: str,
+    sidecars: list[str],
+    client: storage_client.StorageClient | None,
+) -> tuple[list[lance.FragmentMetadata], str | None]:
+    fragments: list[lance.FragmentMetadata] = []
+    schema_b64: str | None = None
+    for rel_path in sidecars:
+        payload = read_json_file(get_full_path(staging_root, rel_path), client)
+        _validate_lance_sidecar_payload(payload, rel_path)
+        fragments.extend(lance.FragmentMetadata.from_json(json.dumps(frag)) for frag in payload.get("fragments", []))
+        payload_schema_b64 = payload.get("schema_b64")
+        if schema_b64 is None:
+            schema_b64 = payload_schema_b64
+        elif payload_schema_b64 != schema_b64:
+            error_msg = f"Lance sidecar {rel_path} has a schema that differs from earlier staged sidecars"
+            raise ValueError(error_msg)
+    return fragments, schema_b64
+
+
+def _validate_lance_sidecar_payload(payload: dict[str, Any], rel_path: str) -> None:
+    payload_schema_version = payload.get("schema_version")
+    if payload_schema_version != CLIP_METADATA_LANCE_SCHEMA_VERSION:
+        error_msg = (
+            f"Lance sidecar {rel_path} has schema_version={payload_schema_version!r}; "
+            f"expected {CLIP_METADATA_LANCE_SCHEMA_VERSION}"
+        )
+        raise ValueError(error_msg)
+    payload_data_storage_version = payload.get("data_storage_version")
+    if payload_data_storage_version != CLIP_METADATA_LANCE_DATA_STORAGE_VERSION:
+        error_msg = (
+            f"Lance sidecar {rel_path} has data_storage_version={payload_data_storage_version!r}; "
+            f"expected {CLIP_METADATA_LANCE_DATA_STORAGE_VERSION!r}"
+        )
+        raise ValueError(error_msg)
+
+
+def _decode_lance_sidecar_schema(schema_b64: str) -> pa.Schema:
+    schema_buf = base64.b64decode(schema_b64)
+    schema = pa.ipc.read_schema(pa.py_buffer(schema_buf))
+    if not schema.equals(CLIP_METADATA_LANCE_SCHEMA, check_metadata=True):
+        error_msg = "Staged Lance metadata schema does not match the clip metadata Lance schema"
+        raise ValueError(error_msg)
+    return schema
+
+
+def _get_lance_commit_operation(
+    final_uri: str,
+    schema: pa.Schema,
+    fragments: list[lance.FragmentMetadata],
+    storage_options: dict[str, str] | None,
+) -> tuple[int, lance.LanceOperation.Append | lance.LanceOperation.Overwrite]:
+    try:
+        dataset = lance.dataset(final_uri, storage_options=storage_options)
+    except (FileNotFoundError, ValueError):
+        return 0, lance.LanceOperation.Overwrite(schema, fragments)
+
+    dataset_storage_version = getattr(dataset, "data_storage_version", None)
+    if dataset_storage_version != CLIP_METADATA_LANCE_DATA_STORAGE_VERSION:
+        error_msg = (
+            f"Existing Lance dataset {final_uri} has data_storage_version={dataset_storage_version!r}; "
+            f"expected {CLIP_METADATA_LANCE_DATA_STORAGE_VERSION!r}"
+        )
+        raise ValueError(error_msg)
+    if not dataset.schema.equals(schema, check_metadata=True):
+        error_msg = f"Existing Lance dataset {final_uri} schema differs from staged metadata schema"
+        raise ValueError(error_msg)
+    return dataset.version, lance.LanceOperation.Append(fragments)
 
 
 def _archive_processed_sidecars(
