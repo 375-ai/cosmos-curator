@@ -16,11 +16,16 @@
 
 import logging
 import os
+import pwd
 import shlex
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Self
 
+import attrs
+from attrs import field, validators
 from typer import BadParameter
 
 from cosmos_curator.client.environment import (
@@ -32,7 +37,7 @@ from cosmos_curator.client.environment import (
     LOCAL_COSMOS_CURATOR_CONFIG_FILE,
     SLURM_RAY_ENV_VAR_NAME,
 )
-from cosmos_curator.client.utils.container_launch import SLIM_IMAGE_WARMUP_COMMAND, command_contains
+from cosmos_curator.client.utils.container_launch import SLIM_IMAGE_WARMUP_COMMAND, command_contains, parse_extra_mounts
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,8 @@ _CONTAINER_S3_CREDS_PATH = Path("/creds/s3_creds")
 _DEFAULT_CACHE_PATH = Path("~/.cache").expanduser()
 _DEFAULT_CONTAINER_IMAGE = "~/container_images/cosmos-curator+1.0.0.sqsh"
 _DEFAULT_CONDA_OVERRIDE_CUDA = "13.0.2"
+_DEFAULT_LOGIN_NODE = "localhost"
+_SLURM_ACCOUNT_ENV_VAR = "SBATCH_ACCOUNT"
 _SOURCE_DIRNAMES = ("cosmos_curator", "tools")
 _SOURCE_FILENAMES = ("pixi.toml", "pixi.lock", "pyproject.toml", "pytest.ini", ".coveragerc")
 _PIXI_ACTIVATION_ENV_VARS = (
@@ -104,6 +111,53 @@ class SrunCommand:
     container_env_keys: list[str]
 
 
+@attrs.define
+class MountSpec:
+    """Represents a mount and its mount point."""
+
+    source: str
+    dest: str
+    mode: str = field(default="rw", validator=validators.in_(["rw", "ro"]))
+
+    @classmethod
+    def from_str(cls, mount_str: str) -> Self:
+        """Create a MountSpec instance from a string."""
+        min_parts = 2
+        max_parts = 3
+
+        parts = mount_str.split(":")
+        if len(parts) < min_parts or len(parts) > max_parts:
+            error_message = f"`{mount_str}` must have between {min_parts} and {max_parts} colon-separated parts"
+            raise ValueError(error_message)
+
+        source = parts[0]
+        dest = parts[1]
+        mode = "rw" if len(parts) == min_parts else parts[2]
+
+        return cls(source=source, dest=dest, mode=mode)
+
+    def __str__(self) -> str:
+        """Return a string representation of the mount suitable for use with Docker or Enroot."""
+        return f"{self.source}:{self.dest}:{self.mode}"
+
+
+def _get_username() -> str:
+    """Retrieve the username of the current user."""
+    uid = os.getuid()
+    return pwd.getpwuid(uid).pw_name
+
+
+def _infer_curator_path(curator_path: Path | None) -> Path | None:
+    """Use the current checkout by default when a Slurm command is run from a repo root."""
+    if curator_path is not None:
+        return curator_path
+
+    cwd = Path.cwd()
+    if (cwd / "cosmos_curator").is_dir() and (cwd / "pixi.toml").is_file():
+        return cwd
+    return None
+
+
 def _parse_environment(raw: str | None) -> list[str]:
     if raw is None:
         return []
@@ -118,6 +172,122 @@ def _parse_pixi_envs(raw: str | None) -> list[str] | None:
         msg = "--pixi-envs must include at least one Pixi environment"
         raise BadParameter(msg)
     return envs
+
+
+def _parse_mount_specs(raw: str | None) -> list[MountSpec]:
+    if raw is None:
+        return []
+    return [MountSpec.from_str(entry.strip()) for entry in raw.split(",") if entry.strip()]
+
+
+def _mount_specs_from_strings(mounts: list[str]) -> list[MountSpec]:
+    return [MountSpec.from_str(mount) for mount in mounts]
+
+
+def _merge_mount_specs_by_destination(mounts: list[MountSpec]) -> list[MountSpec]:
+    merged: dict[str, MountSpec] = {}
+    for mount in mounts:
+        if mount.dest in merged:
+            logger.warning(
+                "Replacing duplicate container mount destination %s: %s -> %s",
+                mount.dest,
+                merged[mount.dest],
+                mount,
+            )
+        merged[mount.dest] = mount
+    return list(merged.values())
+
+
+def _build_slurm_container_runtime(  # noqa: PLR0913
+    *,
+    command: list[str],
+    container_image: str,
+    curator_path: Path | None,
+    workspace_path: Path,
+    cache_path: Path,
+    mount_s3_creds: bool,
+    mount_azure_creds: bool,
+    extra_mounts: str,
+    environment: str | None,
+    conda_override_cuda: str | None,
+    pixi_envs: str | None,
+) -> SlurmContainerRuntime:
+    cuda_override = conda_override_cuda or None
+    return SlurmContainerRuntime(
+        container_image=container_image,
+        curator_path=curator_path,
+        command=command,
+        workspace_path=workspace_path,
+        cache_path=cache_path,
+        mount_s3_creds=mount_s3_creds,
+        mount_azure_creds=mount_azure_creds,
+        extra_mounts=parse_extra_mounts(extra_mounts, description="extra mount"),
+        environment=_parse_environment(environment),
+        conda_override_cuda=cuda_override,
+        pixi_envs=_parse_pixi_envs(pixi_envs),
+    )
+
+
+def _container_mount_specs_from_runtime(
+    runtime: SlurmContainerRuntime, container_mounts: str | None = None
+) -> list[MountSpec]:
+    return _merge_mount_specs_by_destination(
+        [
+            *_mount_specs_from_strings(_get_srun_mounts(runtime)),
+            *_parse_mount_specs(container_mounts),
+        ]
+    )
+
+
+def _normalize_optional_slurm_directive(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _resolve_slurm_account(account: str | None) -> str | None:
+    """Resolve the account directive without making it mandatory for all clusters."""
+    account = _normalize_optional_slurm_directive(account)
+    if account is not None:
+        return account
+
+    env_account = os.getenv(_SLURM_ACCOUNT_ENV_VAR)
+    return _normalize_optional_slurm_directive(env_account)
+
+
+def _validate_gpu_options(*, gres: str | None, gpus: str | None) -> tuple[str | None, str | None]:
+    gres = _normalize_optional_slurm_directive(gres)
+    gpus = _normalize_optional_slurm_directive(gpus)
+    if gres is not None and gpus is not None:
+        msg = "--gres and --gpus cannot be used together"
+        raise BadParameter(msg)
+    return gres, gpus
+
+
+def _is_local_host(remote_host: str) -> bool:
+    """Determine whether the provided host refers to the current machine."""
+    normalized = remote_host.lower()
+    if normalized in {"localhost", "127.0.0.1"}:
+        return True
+
+    local_hostnames = {
+        socket.gethostname().lower(),
+        socket.getfqdn().lower(),
+        os.uname().nodename.lower(),
+    }
+    if normalized in local_hostnames:
+        return True
+
+    try:
+        remote_ip = socket.gethostbyname(remote_host)
+        local_ip = socket.gethostbyname(socket.gethostname())
+        if remote_ip == local_ip:
+            return True
+    except OSError:
+        pass
+
+    return False
 
 
 def _mount_string(source: Path | str, dest: Path | str, mode: str = "rw") -> str:

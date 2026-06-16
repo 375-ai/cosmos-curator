@@ -20,7 +20,7 @@ from cosmos_curator.client.image_cli import image_app
 from cosmos_curator.client.local_cli import launch_local
 from cosmos_curator.client.nvcf_cli import launch_nvcf
 from cosmos_curator.client.pipeline_cli import pipeline_app
-from cosmos_curator.client.slurm_cli import slurm
+from cosmos_curator.client.slurm_cli import slurm_app
 from cosmos_curator.client.view_cli import viewer_app
 
 cosmos_curator = typer.Typer(
@@ -37,7 +37,7 @@ cosmos_curator.add_typer(typer_instance=image_app.image_build, name="image", hel
 cosmos_curator.add_typer(typer_instance=launch_local.cc_client_local, name="local", help="Local Functionalities")
 cosmos_curator.add_typer(typer_instance=launch_nvcf.cc_client_nvcf, name="nvcf", help="NVCF Functionalities")
 cosmos_curator.add_typer(typer_instance=pipeline_app.pipeline_app, name="pipeline", help="Pipeline Config Tooling")
-cosmos_curator.add_typer(typer_instance=slurm.slurm_cli, name="slurm", help="Slurm Functionalities")
+cosmos_curator.add_typer(typer_instance=slurm_app.slurm_cli, name="slurm", help="Slurm Functionalities")
 cosmos_curator.add_typer(typer_instance=viewer_app.viewer_app, name="view", help="Viewer Functionalities")
 
 if __name__ == "__main__":

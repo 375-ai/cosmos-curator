@@ -70,6 +70,14 @@ export RAY_STOP_RETRIES_AFTER={{stop_retries_after}}
 # Remove TQDM spam from log files, tqdm is not needed for sbatch jobs
 export TQDM_MININTERVAL=9000
 
+# Scrub launcher activation state inherited by sbatch before srun enters the container.
+unset {{ launcher_env_vars_to_unset | join(' ') }}
+{% if launcher_env_prefixes_to_unset %}
+for launcher_env_var in {% for prefix in launcher_env_prefixes_to_unset %}${!{{ prefix }}@}{% if not loop.last %} {% endif %}{% endfor %}; do
+  unset "$launcher_env_var"
+done
+{% endif %}
+
 export SCRIPT_FILE=$(realpath "$0")
 export SCRIPT_FOLDER=$(dirname "$(realpath "$SCRIPT_FILE")")
 echo "This slurm script is located in folder: $SCRIPT_FOLDER"

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,13 +25,11 @@ import pytest
 from typer.testing import CliRunner
 
 from cosmos_curator.client.cli import cosmos_curator
-from cosmos_curator.client.slurm_cli.slurm import (
-    _SLURM_ACCOUNT_ENV_VAR,
+from cosmos_curator.client.slurm_cli.slurm_common import _SLURM_ACCOUNT_ENV_VAR, MountSpec, _get_username
+from cosmos_curator.client.slurm_cli.slurm_submit import (
     _START_RAY,
     ContainerSpec,
-    MountSpec,
     SlurmJobSpec,
-    _get_username,
     _parse_job_id,
     _render_sbatch_script,
     connect,
@@ -41,7 +39,7 @@ from cosmos_curator.client.slurm_cli.slurm import (
 )
 from cosmos_curator.scripts.onto_slurm import SlurmEnv
 
-MODULE_NAME = "cosmos_curator.client.slurm_cli.slurm"
+MODULE_NAME = "cosmos_curator.client.slurm_cli.slurm_submit"
 GRES = "gpu:8"
 runner = CliRunner()
 
@@ -54,6 +52,45 @@ def _create_repo(root: pathlib.Path) -> pathlib.Path:
     for filename in ("pixi.toml", "pixi.lock", "pyproject.toml", "pytest.ini", ".coveragerc"):
         (repo / filename).write_text("test")
     return repo
+
+
+def _assert_launcher_env_scrubbed_from_submit(env_vars: dict[str, str], sbatch_script: str) -> None:
+    launcher_env_vars = (
+        "PIXI_PROJECT_MANIFEST",
+        "PIXI_PROJECT_ROOT",
+        "PIXI_ENVIRONMENT_NAME",
+        "PIXI_IN_SHELL",
+        "CONDA_PREFIX",
+        "CONDA_DEFAULT_ENV",
+        "CONDA_ENV_SHLVL_2_PIXI_PROJECT_MANIFEST",
+    )
+    for env_var in launcher_env_vars:
+        assert env_var not in env_vars
+
+    unset_line = next(
+        (line for line in sbatch_script.splitlines() if line.startswith("unset PIXI_ENVIRONMENT_NAME")),
+        None,
+    )
+    assert unset_line is not None, "Expected 'unset PIXI_ENVIRONMENT_NAME' line in sbatch script"
+    assert "PIXI_PROJECT_MANIFEST" in unset_line
+    assert "PIXI_ENVIRONMENT_NAME" in unset_line
+    assert "CONDA_PREFIX" in unset_line
+    assert "CONDA_DEFAULT_ENV" in unset_line
+    assert "for launcher_env_var in ${!CONDA_ENV_SHLVL_@} ${!CONDA_PREFIX_@}; do" in sbatch_script
+    assert sbatch_script.index("unset PIXI_ENVIRONMENT_NAME") < sbatch_script.index(
+        "# Export container environment variables"
+    )
+    assert sbatch_script.index("unset PIXI_ENVIRONMENT_NAME") < sbatch_script.index("srun \\")
+
+
+def _seed_launcher_activation_env(monkeypatch: pytest.MonkeyPatch, repo: pathlib.Path) -> None:
+    monkeypatch.setenv("PIXI_PROJECT_MANIFEST", str(repo / "pixi.toml"))
+    monkeypatch.setenv("PIXI_PROJECT_ROOT", str(repo))
+    monkeypatch.setenv("PIXI_ENVIRONMENT_NAME", "cluster")
+    monkeypatch.setenv("PIXI_IN_SHELL", "1")
+    monkeypatch.setenv("CONDA_PREFIX", str(repo / ".pixi" / "envs" / "cluster"))
+    monkeypatch.setenv("CONDA_DEFAULT_ENV", "cosmos-curator:cluster")
+    monkeypatch.setenv("CONDA_ENV_SHLVL_2_PIXI_PROJECT_MANIFEST", str(repo / "pixi.toml"))
 
 
 @pytest.mark.parametrize(
@@ -197,10 +234,11 @@ def test_submit_uses_shared_defaults_for_container_runtime(
     monkeypatch.delenv(_SLURM_ACCOUNT_ENV_VAR, raising=False)
     monkeypatch.setenv("HOST_ONLY", "host-value")
     monkeypatch.setenv("SLURM_JOB_ID", "outer-allocation")
+    _seed_launcher_activation_env(monkeypatch, repo)
 
     with (
-        patch("cosmos_curator.client.slurm_cli.slurm_local.LOCAL_COSMOS_CURATOR_CONFIG_FILE", config),
-        patch("cosmos_curator.client.slurm_cli.slurm_local.LOCAL_AWS_CREDENTIALS_FILE", aws_creds),
+        patch("cosmos_curator.client.slurm_cli.slurm_common.LOCAL_COSMOS_CURATOR_CONFIG_FILE", config),
+        patch("cosmos_curator.client.slurm_cli.slurm_common.LOCAL_AWS_CREDENTIALS_FILE", aws_creds),
         patch(f"{MODULE_NAME}.curator_submit", return_value="12345") as mock_curator_submit,
     ):
         submit_cli(
@@ -264,6 +302,7 @@ def test_submit_uses_shared_defaults_for_container_runtime(
     assert 'exec "$@"' in sbatch_script
     assert "SLURM_PROCID" in sbatch_script
     assert "SLURM_JOB_ID" in sbatch_script
+    _assert_launcher_env_scrubbed_from_submit(env_vars, sbatch_script)
 
 
 def test_submit_container_mounts_override_default_targets(tmp_path: pathlib.Path) -> None:
@@ -511,148 +550,6 @@ def test_submit_rejects_gres_with_gpus(tmp_path: pathlib.Path) -> None:
     assert result.exit_code != 0
     assert "--gres and --gpus cannot be used together" in result.output
     mock_curator_submit.assert_not_called()
-
-
-def test_import_image_uses_enroot_defaults(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Import an image through srun with Enroot paths placed under the image directory."""
-    output_dir = tmp_path / "container_images"
-    monkeypatch.setenv(_SLURM_ACCOUNT_ENV_VAR, "env_account")
-
-    with patch(f"{MODULE_NAME}.subprocess.call", return_value=0) as mock_call:
-        result = runner.invoke(
-            cosmos_curator,
-            [
-                "slurm",
-                "import-image",
-                "nvcr.io/nvidia/cosmos-curator:1.0.0",
-                "--output-dir",
-                str(output_dir),
-            ],
-        )
-
-    assert result.exit_code == 0, result.output
-    assert "Imported docker://nvcr.io/nvidia/cosmos-curator:1.0.0" in result.output
-    srun_cmd = mock_call.call_args.args[0]
-    subprocess_env = mock_call.call_args.kwargs["env"]
-
-    assert srun_cmd[0] == "srun"
-    assert "--nodes=1" in srun_cmd
-    assert "--ntasks=1" in srun_cmd
-    assert "--export=HOME,PATH,ENROOT_CACHE_PATH,ENROOT_DATA_PATH,ENROOT_TEMP_PATH" in srun_cmd
-    assert "--export=ALL" not in srun_cmd
-    assert "--account=env_account" in srun_cmd
-    assert "--partition=cpu" in srun_cmd
-    assert "--job-name=cosmos_curator_import_image" in srun_cmd
-    assert str(output_dir / "cosmos-curator+1.0.0.sqsh") in srun_cmd
-    assert "docker://nvcr.io/nvidia/cosmos-curator:1.0.0" in srun_cmd
-    assert any('mkdir -p "$ENROOT_CACHE_PATH" "$ENROOT_DATA_PATH"' in arg for arg in srun_cmd)
-    assert any('rm -f -- "$1"' in arg for arg in srun_cmd)
-    assert any('exec enroot import --output "$1" "$2"' in arg for arg in srun_cmd)
-
-    assert subprocess_env["ENROOT_CACHE_PATH"] == str(output_dir / ".enroot-cache")
-    assert subprocess_env["ENROOT_DATA_PATH"] == str(output_dir)
-    assert subprocess_env["ENROOT_TEMP_PATH"] == str(pathlib.Path("/") / "tmp")
-    assert "HOME" in subprocess_env
-
-
-def test_import_image_accepts_custom_output_and_no_overwrite(tmp_path: pathlib.Path) -> None:
-    """Allow callers to preserve existing outputs and pass explicit Enroot URI schemes."""
-    output_dir = tmp_path / "images"
-
-    with patch(f"{MODULE_NAME}.subprocess.call", return_value=0) as mock_call:
-        result = runner.invoke(
-            cosmos_curator,
-            [
-                "slurm",
-                "import-image",
-                "dockerd://cosmos-curator:hello-world",
-                "--output-dir",
-                str(output_dir),
-                "--output-filename",
-                "cosmos-curator_hello-world.sqsh",
-                "--no-overwrite",
-            ],
-        )
-
-    assert result.exit_code == 0, result.output
-    srun_cmd = mock_call.call_args.args[0]
-    assert "Imported dockerd://cosmos-curator:hello-world" in result.output
-    assert str(output_dir / "cosmos-curator_hello-world.sqsh") in result.output
-    assert not any('rm -f -- "$1"' in arg for arg in srun_cmd)
-
-
-def test_import_image_remote_login_expands_default_output_dir_with_cluster_username() -> None:
-    """Remote imports should not expand the default output directory against the local user's home."""
-    with (
-        patch(f"{MODULE_NAME}._is_local_host", return_value=False),
-        patch(f"{MODULE_NAME}.subprocess.call", return_value=0) as mock_call,
-    ):
-        result = runner.invoke(
-            cosmos_curator,
-            [
-                "slurm",
-                "import-image",
-                "cosmos-curator:1.0.0",
-                "--login-node",
-                "login.example.com",
-                "--username",
-                "cluster_user",
-            ],
-        )
-
-    assert result.exit_code == 0, result.output
-    ssh_cmd = mock_call.call_args.args[0]
-    assert ssh_cmd[:3] == ["ssh", "-t", "cluster_user@login.example.com"]
-    remote_command = ssh_cmd[-1]
-    assert "HOME=/home/cluster_user" in remote_command
-    assert "ENROOT_CACHE_PATH=/home/cluster_user/container_images/.enroot-cache" in remote_command
-    assert "ENROOT_DATA_PATH=/home/cluster_user/container_images" in remote_command
-    assert "/home/cluster_user/container_images/cosmos-curator+1.0.0.sqsh" in remote_command
-
-
-def test_import_image_rejects_output_filename_path() -> None:
-    """Keep output directory and filename options unambiguous."""
-    with patch(f"{MODULE_NAME}.subprocess.call") as mock_call:
-        result = runner.invoke(
-            cosmos_curator,
-            [
-                "slurm",
-                "import-image",
-                "cosmos-curator:1.0.0",
-                "--output-filename",
-                "nested/cosmos-curator.sqsh",
-            ],
-        )
-
-    assert result.exit_code != 0
-    assert "--output-filename must be a filename" in result.output
-    mock_call.assert_not_called()
-
-
-def test_import_image_retries_failed_srun(tmp_path: pathlib.Path) -> None:
-    """Transient Enroot or Slurm failures should retry like the previous helper script."""
-    with (
-        patch(f"{MODULE_NAME}.subprocess.call", side_effect=[1, 0]) as mock_call,
-        patch(f"{MODULE_NAME}.time_module.sleep") as mock_sleep,
-    ):
-        result = runner.invoke(
-            cosmos_curator,
-            [
-                "slurm",
-                "import-image",
-                "cosmos-curator:1.0.0",
-                "--output-dir",
-                str(tmp_path / "images"),
-                "--retries",
-                "2",
-                "--retry-delay",
-                "0",
-            ],
-        )
-
-    assert result.exit_code == 0, result.output
-    assert mock_call.call_count == 2
-    mock_sleep.assert_called_once_with(0)
 
 
 @pytest.mark.parametrize(
@@ -984,12 +881,12 @@ class TestMountSpec:
 
     def test_mount_spec_from_str_with_invalid_format(self) -> None:
         """Test that the mount spec raises an error if the format is invalid."""
-        with pytest.raises(ValueError, match="`/src` must have at least 2 or colon separated parts"):
+        with pytest.raises(ValueError, match="`/src` must have between 2 and 3 colon-separated parts"):
             MountSpec.from_str("/src")
 
     def test_mount_spec_from_str_with_too_many_parts(self) -> None:
         """Test that the mount spec raises an error if the format has too many parts."""
-        with pytest.raises(ValueError, match="`/src:/dst:ro:extra` must have at least 2 or colon separated parts"):
+        with pytest.raises(ValueError, match="`/src:/dst:ro:extra` must have between 2 and 3 colon-separated parts"):
             MountSpec.from_str("/src:/dst:ro:extra")
 
     def test_mount_spec_valid_mode(self) -> None:
@@ -1095,7 +992,7 @@ class TestSubmit:
 
     def test_submit_invalid_mounts(self, mock_curator_submit: Mock) -> None:
         """Test that the submit function raises an error if the container mounts are invalid."""
-        with pytest.raises(ValueError, match=r"(?i).*must have at least 2 or colon separated parts.*"):
+        with pytest.raises(ValueError, match=r"(?i).*must have between 2 and 3 colon-separated parts.*"):
             submit_cli(
                 command=[str(_START_RAY), "arg1", "arg2"],
                 login_node="login_node",
