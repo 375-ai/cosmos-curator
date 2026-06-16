@@ -12,7 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Heuristic caption quality annotations for caption windows."""
+"""Deterministic structural-health annotations for caption windows.
+
+The ``flag_*`` fields are monitoring signals for suspicious caption shapes, not
+semantic caption-quality scores, output gates, or policy decisions.
+"""
 
 import string
 from collections import Counter
@@ -34,7 +38,9 @@ LENGTH_CEILING_WORDS = 1024
 TRIGRAM_SIZE = 3
 REPEATED_WORD_SHARE_THRESHOLD = 0.5
 REPEATED_WORD_DOMINANCE_MIN_TOTAL_WORDS = 6
-REPEATED_TRIGRAM_MIN_COUNT = 3
+# Keep trigram detection conservative: long structured captions can repeat
+# benign phrasing from function words, list structure, and domain terms.
+REPEATED_TRIGRAM_MIN_COUNT = 5
 LOW_UNIQUE_WORD_RATIO_THRESHOLD = 0.4
 LOW_UNIQUE_WORD_RATIO_MIN_TOTAL_WORDS = 8
 NEAR_DUPLICATE_JACCARD_THRESHOLD = 0.9

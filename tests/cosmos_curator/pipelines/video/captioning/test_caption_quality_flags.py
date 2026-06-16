@@ -32,6 +32,13 @@ def _window(
     return Window(start_frame=start_frame, end_frame=end_frame, caption=captions, caption_status=status)
 
 
+def _caption_with_repeated_trigram(repeat_count: int) -> str:
+    tokens: list[str] = []
+    for index in range(repeat_count):
+        tokens.extend(("alpha", "beta", "gamma", f"context{index}a", f"context{index}b"))
+    return " ".join(tokens)
+
+
 def test_normalization_trims_whitespace_case_and_trailing_punctuation() -> None:
     """Whitespace, case, and trailing punctuation should normalize before checks."""
     window = _window("  A   Car   Drives   Slowly!!!  ")
@@ -78,12 +85,30 @@ def test_repeated_word_dominance_sets_repetition_flag() -> None:
     assert window.flag_repetition is True
 
 
-def test_repeated_trigram_sets_repetition_flag() -> None:
-    """A repeated trigram loop should set the repetition flag."""
-    window = _window("a man walks a man walks a man walks")
+@pytest.mark.parametrize(
+    ("repeat_count", "expected"),
+    [
+        (3, False),
+        (4, False),
+        (5, True),
+    ],
+    ids=["three_repeats", "four_repeats", "five_repeats"],
+)
+def test_repeated_trigram_threshold_sets_repetition_flag(repeat_count: int, *, expected: bool) -> None:
+    """A repeated trigram should flag only at the configured threshold."""
+    window = _window(_caption_with_repeated_trigram(repeat_count))
     apply_caption_quality_flags([[window]], "qwen")
 
-    assert window.flag_repetition is True
+    assert window.flag_repetition is expected
+
+
+def test_structured_caption_with_benign_repeated_trigrams_does_not_flag() -> None:
+    """Structured captions with three benign repeated trigrams should not flag."""
+    # This caption's repeated "in the scene" trigram flagged under the old default.
+    window = _window("in the scene a car drives in the scene a truck drives in the scene a bus drives")
+    apply_caption_quality_flags([[window]], "qwen")
+
+    assert window.flag_repetition is False
 
 
 def test_low_unique_word_ratio_sets_repetition_flag() -> None:

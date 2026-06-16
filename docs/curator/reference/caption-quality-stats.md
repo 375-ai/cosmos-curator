@@ -35,6 +35,21 @@ The artifact answers structural-health questions such as:
 These counters indicate caption structural integrity. They do not define policy,
 thresholds, baseline eligibility, quality scoring, or pass/fail verdicts.
 
+The heuristic flags are deterministic structural-health signals over active
+subject-caption text. They highlight suspicious caption shapes for monitoring and
+triage, not semantic quality scores, output gates, or policy decisions:
+
+- `flag_length_outlier`: the active caption length falls outside heuristic
+  bounds.
+- `flag_repetition`: the active caption contains repeated n-grams, dominant
+  repeated words, or low lexical diversity.
+- `flag_near_duplicate`: adjacent caption windows are textually near-duplicate.
+
+These signals can correlate with caption length, prompt style, and model
+formatting. Consumers should define any policy outside this artifact. Thresholds
+and tokenization details live in the captioning code rather than the artifact
+contract.
+
 ## Artifact Contract
 
 The split-video pipeline owns the artifact schema and emission semantics.
