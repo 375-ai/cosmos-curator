@@ -17,12 +17,15 @@
 
 import json
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
 from cosmos_curator.core.utils.environment import MODEL_WEIGHTS_PREFIX
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.ray_data.video_split_config import (
+    CaptionPreprocessMode,
     ConfigResolutionError,
     ResolvedVideoSplitConfig,
     UserVideoSplitConfig,
@@ -60,6 +63,7 @@ def test_resolve_minimal_config_fills_canonical_defaults() -> None:
     assert config.split.transnetv2.threshold == 0.4
     assert config.caption.enabled is True
     assert config.caption.batch_size == 32
+    assert config.caption.preprocess_mode == "model"
     assert config.output.metadata_format == "json"
     assert config.execution.model_weights_path == MODEL_WEIGHTS_PREFIX
 
@@ -95,6 +99,33 @@ def test_cli_overrides_apply_after_user_fields() -> None:
 
     assert resolution.config.input.limit == 3
     assert resolution.config.caption.enabled is False
+
+
+def test_cli_override_sets_caption_preprocess_mode() -> None:
+    """--set accepts the caption preprocess_mode literal under strict resolution."""
+    resolution = resolve_video_split_config_data(
+        _minimal_raw(),
+        overrides=["caption.preprocess_mode=curator"],
+    )
+
+    assert resolution.config.caption.preprocess_mode == "curator"
+
+
+def test_cli_override_rejects_unknown_preprocess_mode() -> None:
+    """An out-of-vocabulary preprocess_mode override fails strict resolution."""
+    with pytest.raises(ValidationError):
+        resolve_video_split_config_data(_minimal_raw(), overrides=["caption.preprocess_mode=bogus"])
+
+
+def test_caption_preprocess_literal_matches_enum() -> None:
+    """The config Literal stays a subset of the PreprocessMode enum it converts to.
+
+    The config field uses a Literal (strict Pydantic rejects raw strings for a
+    StrEnum) and is converted to PreprocessMode at the vLLM boundary. If the
+    enum drifts from the Literal, resolution would still succeed but execution
+    would raise, so guard the coupling here.
+    """
+    assert set(get_args(CaptionPreprocessMode)) <= {mode.value for mode in PreprocessMode}
 
 
 def test_cli_overrides_reject_preset_fields() -> None:

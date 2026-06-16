@@ -82,6 +82,7 @@ caption:
   enabled: true
   backend: ray_data_llm
   model: qwen
+  preprocess_mode: model
   preset: balanced
 
 output:

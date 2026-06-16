@@ -53,13 +53,16 @@ treats as a pass-through row. The final normalizer converts the row into the sta
 
 ## Model Defaults
 
-The Ray Data path uses the existing Qwen defaults:
+The Ray Data path uses the existing Qwen defaults, with model-side preprocessing enabled by default:
 
 ```python
-VllmConfig(model_variant="qwen", preprocess_mode="curator", num_gpus=1, batch_size=32)
+VllmConfig(model_variant="qwen", preprocess_mode="model", num_gpus=1, batch_size=32)
 WindowConfig()
 VllmSamplingConfig()
 ```
+
+In `preprocess_mode="model"`, Curator still decodes clips, creates caption windows, samples frames. The vLLM/HF processor owns model-specific resize/rescale/normalize.
+Overriding the resolved config with `--set caption.preprocess_mode=curator` restores the CPU preprocessing path.
 
 The processor disables Ray LLM's chat-template, tokenization, detokenization, image-preparation, and
 multimodal-preparation stages because the Xenna/Qwen helpers already produce vLLM-ready inputs.
@@ -131,12 +134,19 @@ sequence, token, and memory limits.
 
 ## Public CLI
 
-Captioning keeps a narrow CLI surface:
+The Ray Data split pipeline has a config-only entrypoint: a positional config file (JSON or YAML) plus optional
+`--set PATH=VALUE` overrides. There are no captioning-specific flags; caption behavior is driven entirely by the
+resolved config. The caption-relevant config keys are:
 
-- `--no-generate-captions`
-- `--model-weights-path`
-- `--caption-batch-size`
-- `--progress/--no-progress`
+- `caption.enabled` (default `true`): set to `false` to skip captioning.
+- `caption.batch_size` (default `32`).
+- `caption.preprocess_mode` (default `model`).
+- `execution.model_weights_path`.
+- `execution.progress` (default `false`).
+
+Caption preprocessing defaults to `model` (vLLM/HF in-process preprocessing). To select the CPU/curator preprocessing
+path, for example when comparing against it or rolling back a model-side preprocessing regression, override the key
+with `--set caption.preprocess_mode=curator`.
 
 Ray LLM scheduling knobs and vLLM scheduler capacity use their library defaults.
 

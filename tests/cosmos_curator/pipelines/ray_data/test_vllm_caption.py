@@ -87,11 +87,11 @@ def test_sampling_params_dict_uses_vllm_sampling_config_defaults() -> None:
 
 
 def test_default_vllm_config_uses_benchmark_batch_size() -> None:
-    """Ray Data Qwen defaults use the best batch size from H100/GB200 sweeps."""
+    """Ray Data Qwen defaults use the benchmark batch size and MODEL preprocessing."""
     config = make_default_vllm_config()
 
     assert config.model_variant == "qwen"
-    assert config.preprocess_mode == PreprocessMode.CURATOR
+    assert config.preprocess_mode == PreprocessMode.MODEL
     assert config.num_gpus == 1
     assert config.batch_size == 32
 

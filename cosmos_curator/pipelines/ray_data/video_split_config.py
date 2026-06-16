@@ -37,6 +37,7 @@ SplitMethod = Literal["transnetv2", "fixed_stride"]
 TransNetV2MaxLengthMode = Literal["truncate", "stride"]
 CaptionBackend = Literal["ray_data_llm"]
 CaptionModel = Literal["qwen"]
+CaptionPreprocessMode = Literal["curator", "model"]
 MetadataFormat = Literal["json"]
 TranscodeEncoder = Literal["libopenh264"]
 
@@ -125,6 +126,9 @@ class CaptionConfig(BaseModel):
     backend: CaptionBackend = "ray_data_llm"
     model: CaptionModel = "qwen"
     batch_size: int = Field(default=32, ge=1)
+    # Owner of caption resize/rescale/normalize. "model" lets vLLM/HF do
+    # in-process preprocessing (default); "curator" preprocesses upstream.
+    preprocess_mode: CaptionPreprocessMode = "model"
 
 
 class VideoSplitOutputConfig(BaseModel):
@@ -228,6 +232,7 @@ class RawCaptionConfig(BaseModel):
     backend: CaptionBackend | None = None
     model: CaptionModel | None = None
     batch_size: int | None = Field(default=None, ge=1)
+    preprocess_mode: CaptionPreprocessMode | None = None
 
 
 class RawVideoSplitOutputConfig(BaseModel):
@@ -307,6 +312,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
         "backend": "ray_data_llm",
         "model": "qwen",
         "batch_size": 32,
+        "preprocess_mode": "model",
     },
     "output": {
         "metadata_format": "json",

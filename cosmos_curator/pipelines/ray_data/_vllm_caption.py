@@ -77,8 +77,13 @@ class _RayDataLlmProcessor(Protocol):
 
 
 def make_default_vllm_config() -> VllmConfig:
-    """Build the Ray Data Qwen config."""
-    return VllmConfig(model_variant=_MODEL_VARIANT, num_gpus=1, batch_size=32)
+    """Build the Ray Data Qwen config (MODEL preprocessing by default)."""
+    return VllmConfig(
+        model_variant=_MODEL_VARIANT,
+        num_gpus=1,
+        batch_size=32,
+        preprocess_mode=PreprocessMode.MODEL,
+    )
 
 
 def make_default_window_config() -> WindowConfig:
@@ -434,6 +439,15 @@ def make_caption_window_rows_fn(
                     else None
                 ),
             )
+            mean_prompt_tokens = sum(
+                len(model_input.get("prompt_token_ids") or ()) for model_input in model_inputs
+            ) / len(model_inputs)
+            logger.info(
+                "[vLLM] caption preprocess_mode=%s windows=%d mean_prompt_tokens=%.1f",
+                resolved_vllm_config.preprocess_mode,
+                len(model_inputs),
+                mean_prompt_tokens,
+            )
             output_rows: list[dict[str, Any]] = []
             for (window_index, window_info, _), model_input in zip(decoded_windows, model_inputs, strict=True):
                 request_row = {
@@ -543,17 +557,21 @@ def _build_processor(
 ) -> Callable[[ray.data.Dataset], ray.data.Dataset]:
     from ray.data.llm import build_processor, vLLMEngineProcessorConfig  # noqa: PLC0415
 
+    mm_processor_kwargs: dict[str, Any] = {
+        "do_resize": vllm_config.model_preprocess_enabled,
+        "do_rescale": vllm_config.model_preprocess_enabled,
+        "do_normalize": vllm_config.model_preprocess_enabled,
+    }
+    if vllm_config.model_preprocess_enabled:
+        mm_processor_kwargs["do_sample_frames"] = False
+
     engine_kwargs: dict[str, Any] = {
         # Mirrors cosmos_curator.models.vllm_qwen.VllmQwen.model without importing
         # vLLM-backed classes on the driver.
         "limit_mm_per_prompt": {"images": 0, "video": 1},
         "max_model_len": 32768,
         "gpu_memory_utilization": 0.85,
-        "mm_processor_kwargs": {
-            "do_resize": vllm_config.model_preprocess_enabled,
-            "do_rescale": vllm_config.model_preprocess_enabled,
-            "do_normalize": vllm_config.model_preprocess_enabled,
-        },
+        "mm_processor_kwargs": mm_processor_kwargs,
         "mm_processor_cache_gb": 0.0 if vllm_config.disable_mmcache else 4.0,
         "max_num_batched_tokens": 32768,
         "tensor_parallel_size": vllm_config.num_gpus,

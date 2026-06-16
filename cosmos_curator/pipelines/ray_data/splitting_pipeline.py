@@ -38,6 +38,7 @@ from cosmos_curator.core.interfaces.pipeline_interface import download_models
 from cosmos_curator.core.utils.ffmpeg_utils import assert_ffmpeg_supports_h264
 from cosmos_curator.core.utils.pixi_runtime_envs import ray_data_gpu_runtime_env
 from cosmos_curator.core.utils.storage.storage_utils import get_files_relative, get_full_path, get_storage_client
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.ray_data._clip_transcoder import make_transcode_fn
 from cosmos_curator.pipelines.ray_data._clip_writer import make_write_fn
 from cosmos_curator.pipelines.ray_data._fixed_stride_splitter import make_split_fn
@@ -153,7 +154,11 @@ def _validate_transnetv2_cluster_resources(
 
 def _caption_vllm_config(config: ResolvedVideoSplitConfig) -> VllmConfig:
     """Return the caption vLLM config selected by the resolved config."""
-    return attrs.evolve(make_default_vllm_config(), batch_size=config.caption.batch_size)
+    return attrs.evolve(
+        make_default_vllm_config(),
+        batch_size=config.caption.batch_size,
+        preprocess_mode=PreprocessMode(config.caption.preprocess_mode),
+    )
 
 
 def _caption_workers_from_downloaded_gpus(total_visible_gpus: int, vllm_config: VllmConfig | None) -> int:

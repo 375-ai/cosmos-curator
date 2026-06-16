@@ -80,6 +80,7 @@ def test_pipeline_render_outputs_resolved_config_with_overrides(tmp_path: Path) 
         "backend": "ray_data_llm",
         "model": "qwen",
         "batch_size": 32,
+        "preprocess_mode": "model",
     }
     assert "preset" not in payload["caption"]
 

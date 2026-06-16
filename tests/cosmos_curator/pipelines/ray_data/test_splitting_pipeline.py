@@ -23,6 +23,7 @@ import pytest
 import ray
 from ray.data import ActorPoolStrategy, TaskPoolStrategy
 
+from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.ray_data import splitting_pipeline as _pipeline
 from cosmos_curator.pipelines.ray_data.video_split_config import (
     ResolvedVideoSplitConfig,
@@ -73,6 +74,20 @@ def test_caption_vllm_config_uses_resolved_batch_size() -> None:
 
     assert config.model_variant == "qwen"
     assert config.batch_size == 9
+
+
+def test_caption_vllm_config_defaults_to_model_preprocessing() -> None:
+    """Caption preprocess mode defaults to model-side preprocessing."""
+    config = _pipeline._caption_vllm_config(_config())
+
+    assert config.preprocess_mode == PreprocessMode.MODEL
+
+
+def test_caption_vllm_config_honors_preprocess_mode_override() -> None:
+    """A curator preprocess_mode in the resolved config reaches the vLLM config."""
+    config = _pipeline._caption_vllm_config(_config(caption={"preprocess_mode": "curator"}))
+
+    assert config.preprocess_mode == PreprocessMode.CURATOR
 
 
 def test_caption_workers_use_downloaded_gpu_count() -> None:
