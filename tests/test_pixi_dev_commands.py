@@ -187,6 +187,8 @@ def test_runtime_features_are_separated_from_core() -> None:
     assert runtime_feature["system-requirements"]["cuda"] == "13.0.2"
     for dependency_name in ("torch", "torchvision", "vllm", "cvcuda-cu13", "PyNvVideoCodec"):
         assert dependency_name in runtime_pypi_dependencies
+    for dependency_name in ("transformers-cosmos3", "vllm-cosmos3"):
+        assert dependency_name not in runtime_pypi_dependencies
     for dependency_name in ("av", "opencv-python-headless", "opencv-python", "opencv-contrib-python"):
         assert dependency_name not in runtime_pypi_dependencies
 

@@ -92,9 +92,7 @@ PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
 torch = "==2.11.0"
 torchvision = "==0.26.0"
-vllm = "==0.21.0"
-transformers-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/transformers-cosmos3", subdirectory = "packages/transformers-cosmos3" }
-vllm-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/vllm-cosmos3", subdirectory = "packages/vllm-cosmos3" }
+vllm = "==0.23.0"
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/" }
 paddleocr = "==2.10.*"
 
@@ -153,7 +151,7 @@ pyasn1 = ">=0.6.3"
 pylance = ">=0.39.0"
 
 [feature.transformers.dependencies]
-transformers = ">=5.6.0,<6.0.0"
+transformers = ">=5.11.0,<6.0.0"
 
 [feature.transformers.pypi-dependencies]
 sentence-transformers = "*"

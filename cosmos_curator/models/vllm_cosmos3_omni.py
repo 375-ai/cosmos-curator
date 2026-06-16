@@ -17,13 +17,11 @@ r"""vLLM plugins for the Cosmos3 omnimodel reasoner head.
 The public ``nvidia/Cosmos3-Nano`` / ``nvidia/Cosmos3-Super`` repos are
 Mixture-of-Transformers omnimodels (autoregressive tower + diffusion tower).
 The autoregressive tower can be served standalone for text-output reasoning
-by overriding the architecture string, which is registered by the
-``vllm-cosmos3`` package (shipped via the ``unified`` pixi env).
+with vLLM's native ``Cosmos3ForConditionalGeneration`` support.
 
 Reference invocation from the model card::
 
     vllm serve nvidia/Cosmos3-Nano \
-        --hf-overrides '{"architectures": ["Cosmos3ReasonerForConditionalGeneration"]}' \
         --tensor-parallel-size 1 --mm-encoder-tp-mode data --async-scheduling \
         --allowed-local-media-path / \
         --media-io-kwargs '{"video": {"num_frames": -1}}'
@@ -47,7 +45,9 @@ from cosmos_curator.models.vllm_qwen import (
 )
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig
 
-_OMNI_HF_OVERRIDES = {"architectures": ["Cosmos3ReasonerForConditionalGeneration"]}
+# Keep an explicit architecture override so older local Cosmos3 config files
+# downloaded before vLLM's native support still route to the built-in executor.
+_OMNI_HF_OVERRIDES = {"architectures": ["Cosmos3ForConditionalGeneration"]}
 _OMNI_MEDIA_IO_KWARGS = {"video": {"num_frames": -1}}
 _OMNI_ALLOWED_LOCAL_MEDIA_PATH = "/"
 _OMNI_MM_ENCODER_TP_MODE = "data"

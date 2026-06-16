@@ -46,7 +46,7 @@ from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, Vll
 # joined this set as part of cosmos_r2 onboarding -- import it from the
 # same conditional so test bodies do not need a per-test local import.
 if pixi_utils.is_running_in_env("default"):
-    from cosmos_curator.models import vllm_cosmos_reason1_vl, vllm_nemotron, vllm_qwen
+    from cosmos_curator.models import vllm_cosmos3_omni, vllm_cosmos_reason1_vl, vllm_nemotron, vllm_qwen
     from cosmos_curator.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
 
 
@@ -239,6 +239,16 @@ def test_cosmos_reason2_inherits_model_async() -> None:
         args = VllmCosmosReason2VL.model_async(_async_cfg(model_variant="cosmos_r2"))
     assert args.served_model_name == ["cosmos_r2"]
     assert args.max_model_len == vllm_cosmos_reason1_vl.MAX_MODEL_LEN  # constants come from base
+
+
+def test_cosmos3_omni_uses_native_vllm_architecture() -> None:
+    """Cosmos3 routes through vLLM's built-in model class, not the old shim package class."""
+    expected_overrides = {"architectures": ["Cosmos3ForConditionalGeneration"]}
+
+    with patch.object(vllm_cosmos3_omni.VllmCosmos3NanoOmniVL, "model_path", return_value="/cosmos3"):
+        args = vllm_cosmos3_omni.VllmCosmos3NanoOmniVL.model_async(_async_cfg(model_variant="cosmos3_nano"))
+
+    assert args.hf_overrides == expected_overrides
 
 
 @pytest.mark.parametrize(

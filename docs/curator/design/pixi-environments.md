@@ -255,7 +255,7 @@ heavy `runtime` stack.
 
 `legacy-transformers` is a model-specific runtime stack for Cosmos-Embed1 and InternVideo2. It should include its own
 Torch, AV/OpenCV, and `timm` dependencies, but it should not include the main `runtime` feature because `runtime` carries
-Cosmos3/vLLM packages that require a newer Transformers version.
+vLLM dependencies that require a newer Transformers version.
 
 ## Target Environments
 

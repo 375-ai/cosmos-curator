@@ -45,6 +45,7 @@ _THRESHOLDS = {
     "qwen": 0.8,
     "cosmos_r1": 0.7,
     "cosmos_r2": 0.7,
+    "cosmos3_nano": 0.7,
     "qwen3_5_27b": 0.8,
 }
 _NUM_CLIPS = 1
@@ -66,10 +67,14 @@ _WINDOW_CONFIG_OVERRIDES: dict[str, dict[str, object]] = {
     "cosmos_r2": {
         "sampling_fps": 4.0,
     },
+    "cosmos3_nano": {
+        "sampling_fps": 4.0,
+    },
     "qwen3_5_27b": {
         "sampling_fps": 2.0,
     },
 }
+_GOLDEN_CAPTION_PLACEHOLDER = "__PLACEHOLDER_CAPTURE_FROM_FIRST_RUN__"
 _EXPECTED_CAPTIONS: dict[str, list[str]] = {
     "qwen": [
         (
@@ -188,6 +193,31 @@ _EXPECTED_CAPTIONS: dict[str, list[str]] = {
             "richness within a visually immersive world crafted with meticulous attention to detail."
         ),
     ],
+    "cosmos3_nano": [
+        (
+            "The video begins with a misty, snowy mountain landscape, setting a cold and desolate atmosphere. A young "
+            "woman emerges from the fog, holding a long wooden staff. She is dressed in rugged, practical clothing "
+            "suitable for harsh weather conditions, including a scarf covering her lower face. Her expression is "
+            "serious and determined as she looks around cautiously, suggesting she is on a mission or searching for "
+            "something important.\n"
+            "\n"
+            "As the scene progresses, the camera focuses more closely on the woman's face, emphasizing her alertness "
+            "and resolve. The background remains shrouded in mist, adding to the sense of isolation and mystery. "
+            'Suddenly, the screen fades to black, and white text appears, reading "THE BLENDER FOUNDATION presents," '
+            "indicating that this is an animation produced by the Blender Foundation.\n"
+            "\n"
+            "The next scene transitions to a dimly lit interior, where an older man with a long beard and traditional "
+            "attire is seen. He has distinctive facial piercings and wears a headband adorned with metal rings. His "
+            "expression is one of concern or contemplation as he speaks, possibly delivering important information or "
+            "advice. The lighting highlights his features, creating a dramatic effect and drawing attention to his "
+            "role in the story.\n"
+            "\n"
+            "Finally, the scene shifts to another character, a young woman with short red hair. She is shown in "
+            "close-up, her expression showing surprise or shock. The background is dark, with some decorative elements "
+            "visible, suggesting an indoor setting. Her reaction implies that she has just received unexpected news or "
+            "witnessed something surprising, adding tension and intrigue to the narrative."
+        ),
+    ],
 }
 
 
@@ -248,19 +278,17 @@ def sample_captioning_task(sample_clip_data: bytes) -> SplitPipeTask:
     )
 
 
-_GOLDEN_CAPTION_PLACEHOLDER = "__PLACEHOLDER_CAPTURE_FROM_FIRST_RUN__"
-
 # Variants that ``cosmos_curate.core.managers.model_cli`` excludes from its
 # default download set (see ``_get_default_models``). For these variants the
 # weights must be downloaded explicitly before this test runs, e.g.::
 #
 #     pixi run -e model-download python -m cosmos_curate.core.managers.model_cli \
 #         download --models <variant>
-_VARIANTS_NOT_DOWNLOADED_BY_DEFAULT: frozenset[str] = frozenset({"qwen3_5_27b"})
+_VARIANTS_NOT_DOWNLOADED_BY_DEFAULT: frozenset[str] = frozenset({"cosmos3_nano", "qwen3_5_27b"})
 
 
-def _skip_if_weights_missing(model_variant: str) -> None:
-    """Skip cleanly when the variant's weights are not present locally.
+def _assert_weights_available(model_variant: str) -> None:
+    """Fail clearly when the variant's weights are not present locally.
 
     ``AutoProcessor.from_pretrained`` falls back to treating a missing local
     path as a Hugging Face repo id, which then fails ``validate_repo_id`` with
@@ -276,16 +304,20 @@ def _skip_if_weights_missing(model_variant: str) -> None:
             f"run `pixi run -e model-download python -m cosmos_curate.core.managers.model_cli "
             f"download --models {model_variant}`)"
         )
-    pytest.skip(f"Model weights for {model_variant} not found at {weights_dir}{hint}")
+    pytest.fail(f"Model weights for {model_variant} not found at {weights_dir}{hint}")
 
 
 @pytest.mark.env("default")
-@pytest.mark.parametrize("model_variant", ["qwen", "cosmos_r1", "cosmos_r2", "qwen3_5_27b"])
+@pytest.mark.parametrize(
+    "model_variant",
+    ["qwen", "cosmos_r1", "cosmos_r2", "cosmos3_nano", "qwen3_5_27b"],
+    ids=["qwen", "cosmos_r1", "cosmos_r2", "cosmos3_nano", "qwen3_5_27b"],
+)
 def test_vllm_caption_generation(
     sample_captioning_task: SplitPipeTask, sequential_runner: RunnerInterface, model_variant: str
 ) -> None:
     """Test the vLLM captioning result."""
-    _skip_if_weights_missing(model_variant)
+    _assert_weights_available(model_variant)
     vllm_config = VllmConfig(
         model_variant=model_variant,
         sampling_config=VllmSamplingConfig(temperature=0.0),

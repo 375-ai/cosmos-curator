@@ -158,23 +158,7 @@ PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmp
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
 torchvision = "==0.26.0"
-vllm = "==0.21.0" # not available on conda-forge
-# transformers-cosmos3 registers the cosmos3_omni HF AutoConfig type; vllm-cosmos3
-# registers Cosmos3ReasonerForConditionalGeneration for the nvidia/Cosmos3-Nano +
-# Cosmos3-Super omnimodel reasoning head. Both are subdirectory packages of the
-# NVIDIA/cosmos-framework monorepo, installed from the archive tarball (no git
-# binary needed in the build container) pinned to a commit for a reproducible lock.
-# They must both be declared here: uv only honors vllm-cosmos3's `[tool.uv.sources]`
-# for a root project, so vllm-cosmos3's transformers-cosmos3 requirement is
-# satisfied by this explicit pin instead.
-#
-# The `subdirectory = "..."` key selects which package to build from the tarball.
-# The `#subdirectory=...` URL fragment is also required and load-bearing: pixi keys
-# source packages by URL, so two deps sharing the identical tarball URL collapse to
-# one (vllm-cosmos3 gets silently dropped). The differing fragment makes the URLs
-# distinct; do not remove it.
-transformers-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/transformers-cosmos3", subdirectory = "packages/transformers-cosmos3" }
-vllm-cosmos3 = { url = "https://github.com/NVIDIA/cosmos-framework/archive/cbaf5b9b22abd59a68a25c4504733d97e3435923.tar.gz#subdirectory=packages/vllm-cosmos3", subdirectory = "packages/vllm-cosmos3" }
+vllm = "==0.23.0" # not available on conda-forge
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
 
@@ -237,7 +221,7 @@ pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as cor
 pylance = ">=0.39.0" # conda-forge package is too old
 
 [feature.transformers.dependencies]
-transformers = ">=5.6.0,<6.0.0" # vLLM 0.21 excludes early Transformers v5 releases before 5.6
+transformers = ">=5.11.0,<6.0.0" # vLLM 0.23 + native Cosmos3 support require recent Transformers v5
 
 [feature.transformers.pypi-dependencies]
 sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch==2.11.0
