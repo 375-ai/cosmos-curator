@@ -15,10 +15,11 @@
 """Validate that a video's embedded header index matches a full packet scan."""
 
 import argparse
+import enum
 import pathlib
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from typing import Any, BinaryIO
 
 import numpy as np
@@ -33,11 +34,36 @@ from cosmos_curator.core.sensors.scripts._cli_cloud import (
     validate_source,
 )
 from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
-from cosmos_curator.core.sensors.utils.video import _HeaderIndexUnavailableError, make_index_and_metadata
+from cosmos_curator.core.sensors.utils.video import (
+    _HeaderIndexUnavailableError,
+    _resolve_auto_index_method,
+    make_index_and_metadata,
+)
 
 PASS_EXIT_CODE = 0
 MISMATCH_EXIT_CODE = 1
 ERROR_EXIT_CODE = 2
+
+
+class IndexVerdict(enum.Enum):
+    """Outcome of checking a file's header index against a full packet scan.
+
+    The check answers "is the fast ``FROM_HEADER`` path safe for this file?":
+
+    - ``CONSISTENT``: no B-frames and the header index matches the full scan, so
+      the fast header path is exact.
+    - ``HEADER_BYPASSED``: the fast header path is not exact for this stream
+      (B-frames or a ``ctts`` composition offset), so the library indexes it with
+      a full demux (PTS order) by default; the header's DTS-ordered index is
+      expected to differ and is intentionally not used. Not a defect.
+    - ``PROBLEM``: the library uses the fast header path, yet the header index is
+      missing or disagrees with the full scan — a genuinely inconsistent header.
+    """
+
+    CONSISTENT = "consistent"
+    HEADER_BYPASSED = "header_bypassed"
+    PROBLEM = "problem"
+
 
 VIDEO_REQUIREMENTS_DOCS_URL = (
     "https://github.com/nvidia-cosmos/cosmos-curate/blob/main/docs/curator/design/"
@@ -106,6 +132,22 @@ def make_mismatch_details(header_index: VideoIndex, full_index: VideoIndex) -> l
     return details
 
 
+def _format_header_bypassed_message(details: list[str]) -> str:
+    detail_lines = "\n".join(f"  - {detail}" for detail in details)
+    return f"""PASS: the fast header index is intentionally bypassed for this file.
+
+The fast header path is not exact for this stream (it has B-frames or a ctts
+composition offset), so the library indexes it with a full packet scan in
+presentation-time (PTS) order by default. The container's fast header index is
+stored in decode-time (DTS) order, which differs from presentation order in that
+case. That difference is expected, not corruption, and the library does not use
+the header index for this file.
+
+Detail:
+{detail_lines}
+"""
+
+
 def _format_mismatch_message(details: list[str]) -> str:
     detail_lines = "\n".join(f"  - {detail}" for detail in details)
     return f"""FAIL: Index mismatch detected.
@@ -162,45 +204,56 @@ def _check_video_index(
     video_format: str | None,
     s3_profile_name: str | None,
     azure_profile_name: str,
-) -> tuple[bool, list[str]]:
-    try:
-        with _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name) as src:
+) -> tuple[IndexVerdict, list[str]]:
+    def _open() -> AbstractContextManager[pathlib.Path | BinaryIO]:
+        return _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name)
+
+    def _index(method: VideoIndexCreationMethod, *, allow_header_fallback: bool = True) -> VideoIndex:
+        with _open() as src:
             data: DataSource = src if isinstance(src, pathlib.Path) else _as_data_source(src)
-            header_index, _ = make_index_and_metadata(
+            index, _ = make_index_and_metadata(
                 data,
                 stream_idx=stream_idx,
                 video_format=video_format,
-                index_method=VideoIndexCreationMethod.FROM_HEADER,
-                allow_header_fallback=False,
+                index_method=method,
+                allow_header_fallback=allow_header_fallback,
             )
+            return index
+
+    # Ask the library which index method AUTO would pick for this file, using the
+    # exact same routing (B-frames *or* a ctts composition offset → FULL_DEMUX).
+    # When the library bypasses the fast header path, its DTS-ordered header index
+    # is expected to differ and is never used, so comparing the two would be a
+    # false positive.
+    with _open() as src:
+        data = src if isinstance(src, pathlib.Path) else _as_data_source(src)
+        resolved = _resolve_auto_index_method(data, stream_idx, video_format)
+
+    full_index = _index(VideoIndexCreationMethod.FULL_DEMUX)
+
+    if resolved is VideoIndexCreationMethod.FULL_DEMUX:
+        return IndexVerdict.HEADER_BYPASSED, [
+            f"Full demux found {len(full_index)} packets, "
+            f"{len(full_index.kf_pts_ns)} keyframes, "
+            f"{len(full_index.display_pts_ns)} displayable packets.",
+        ]
+
+    # The library uses the fast header path for this file, so the header index
+    # should match the full scan exactly. A missing or divergent header index here
+    # is a genuine inconsistency.
+    try:
+        header_index = _index(VideoIndexCreationMethod.FROM_HEADER, allow_header_fallback=False)
     except _HeaderIndexUnavailableError as e:
-        with _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name) as src:
-            data = src if isinstance(src, pathlib.Path) else _as_data_source(src)
-            full_index, _ = make_index_and_metadata(
-                data,
-                stream_idx=stream_idx,
-                video_format=video_format,
-                index_method=VideoIndexCreationMethod.FULL_DEMUX,
-            )
-        return False, [
+        return IndexVerdict.PROBLEM, [
             f"Header index could not be read from the file: {e}.",
             f"Full demux found {len(full_index)} packets.",
             f"Full demux found {len(full_index.kf_pts_ns)} keyframes.",
             f"Full demux found {len(full_index.display_pts_ns)} displayable packets.",
         ]
 
-    with _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name) as src:
-        data = src if isinstance(src, pathlib.Path) else _as_data_source(src)
-        full_index, _ = make_index_and_metadata(
-            data,
-            stream_idx=stream_idx,
-            video_format=video_format,
-            index_method=VideoIndexCreationMethod.FULL_DEMUX,
-        )
-
     if header_index == full_index:
-        return True, []
-    return False, make_mismatch_details(header_index, full_index)
+        return IndexVerdict.CONSISTENT, []
+    return IndexVerdict.PROBLEM, make_mismatch_details(header_index, full_index)
 
 
 def _as_data_source(stream: BinaryIO) -> DataSource:
@@ -216,8 +269,11 @@ def _as_data_source(stream: BinaryIO) -> DataSource:
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check whether an MP4 header index matches a full packet scan.",
-        epilog="Exit codes: 0 = index consistent; 1 = mismatch detected; 2 = input, configuration, or runtime error.",
+        description="Check whether an MP4's fast header index is safe to use (matches a full packet scan).",
+        epilog=(
+            "Exit codes: 0 = header path safe (consistent, or bypassed because the stream has B-frames); "
+            "1 = inconsistent header index; 2 = input, configuration, or runtime error."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--source", required=True, help="Local path, s3:// URI, or az:// URI to the MP4 file.")
@@ -235,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         validate_source(args.source)
-        ok, details = _check_video_index(
+        verdict, details = _check_video_index(
             args.source,
             stream_idx=args.stream_idx,
             video_format=args.video_format,
@@ -249,9 +305,15 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"error: could not check video index for {args.source!r}: {e}\n")
         return ERROR_EXIT_CODE
 
-    if ok:
+    if verdict is IndexVerdict.CONSISTENT:
         sys.stdout.write("PASS: Video index is consistent.\n\n")
-        sys.stdout.write("The video header matches the full packet scan for this file.\n")
+        sys.stdout.write(
+            "The header index matches the full packet scan, so the fast header path is safe for this file.\n"
+        )
+        return PASS_EXIT_CODE
+
+    if verdict is IndexVerdict.HEADER_BYPASSED:
+        sys.stdout.write(_format_header_bypassed_message(details))
         return PASS_EXIT_CODE
 
     sys.stdout.write(_format_mismatch_message(details))

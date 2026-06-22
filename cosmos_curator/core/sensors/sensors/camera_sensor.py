@@ -65,7 +65,7 @@ class CameraSensor:
         source: DataSource,
         stream_idx: int = 0,
         decode_config: VideoDecodeConfig = DEFAULT_VIDEO_DECODE_CONFIG,
-        index_method: VideoIndexCreationMethod = VideoIndexCreationMethod.FROM_HEADER,
+        index_method: VideoIndexCreationMethod = VideoIndexCreationMethod.AUTO,
         intrinsics: CameraIntrinsics | None = None,
         extrinsics: SensorExtrinsics | None = None,
     ) -> None:
@@ -85,8 +85,8 @@ class CameraSensor:
                 for the future GPU backend.
             index_method: How ``VideoIndex`` packet metadata is built. See
                 :class:`~cosmos_curator.core.sensors.types.types.VideoIndexCreationMethod`.
-                Prefer ``FROM_HEADER``. Use ``FULL_DEMUX`` only for tests or rare
-                validation; if production needs full demux, file an issue.
+                Defaults to ``AUTO`` (fast ``FROM_HEADER`` for B-frame-free
+                streams, ``FULL_DEMUX`` otherwise).
             intrinsics: Optional pre-parsed camera calibration for the decoded
                 image geometry. Callers using parser objects should parse them
                 before constructing ``CameraSensor``.

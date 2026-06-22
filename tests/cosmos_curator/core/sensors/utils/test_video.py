@@ -15,6 +15,7 @@
 """Test video utilities for the sensor library."""
 
 import io
+from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from fractions import Fraction
 from pathlib import Path
@@ -36,7 +37,9 @@ from cosmos_curator.core.sensors.utils.video import (
     GpuVideoDecodeConfig,
     GpuVideoDecoder,
     _get_video_index_from_header,
+    _has_composition_offset,
     _HeaderIndexUnavailableError,
+    _resolve_auto_index_method,
     make_decode_plan,
     make_index_and_metadata,
     open_video_container,
@@ -1589,7 +1592,9 @@ def test_make_index_and_metadata_sorts_pts_by_presentation_order(synthetic_video
         return_value=(mock_offsets, mock_sizes, mock_pts, mock_keyframes, mock_discards),
     ):
         synthetic_video.seek(0)
-        index, _ = make_index_and_metadata(synthetic_video)
+        # Exercise FROM_HEADER explicitly: this test patches the header index
+        # builder, which the AUTO default may bypass by routing to FULL_DEMUX.
+        index, _ = make_index_and_metadata(synthetic_video, index_method=VideoIndexCreationMethod.FROM_HEADER)
 
     # pts_ns must be monotonically non-decreasing.
     assert np.all(index.pts_ns[:-1] <= index.pts_ns[1:]), "pts_ns must be sorted ascending"
@@ -1633,11 +1638,77 @@ def test_make_index_and_metadata_falls_back_to_full_demux_when_header_index_unav
         ) as mock_full_demux,
     ):
         synthetic_video.seek(0)
-        index, _ = make_index_and_metadata(synthetic_video)
+        # Exercise FROM_HEADER explicitly: this test patches the header index
+        # builder, which the AUTO default may bypass by routing to FULL_DEMUX.
+        index, _ = make_index_and_metadata(synthetic_video, index_method=VideoIndexCreationMethod.FROM_HEADER)
 
     mock_full_demux.assert_called_once()
     np.testing.assert_array_equal(index.offset, np.array(mock_offsets, dtype=np.int64))
     np.testing.assert_array_equal(index.size, np.array(mock_sizes, dtype=np.int64))
+
+
+def test_make_index_and_metadata_auto_routes_by_b_frames(h264_video: Callable[..., bytes]) -> None:
+    """AUTO uses FULL_DEMUX for B-frame video (PTS-correct) and FROM_HEADER otherwise."""
+    # The B-frame input is a checked-in pre-encoded clip: this env's H.264 encoder
+    # is openh264 (LGPL ffmpeg), which can't emit B-frames. See conftest.h264_video.
+    bframe = h264_video(bframes=2)
+    no_bframe = h264_video(bframes=0)
+
+    auto_b = make_index_and_metadata(bframe, index_method=VideoIndexCreationMethod.AUTO)[0]
+    full_b = make_index_and_metadata(bframe, index_method=VideoIndexCreationMethod.FULL_DEMUX)[0]
+    header_b = make_index_and_metadata(bframe, index_method=VideoIndexCreationMethod.FROM_HEADER)[0]
+    assert auto_b == full_b  # B-frame video → AUTO picks FULL_DEMUX
+    assert auto_b != header_b  # and avoids the DTS-based FROM_HEADER path
+
+    auto_n = make_index_and_metadata(no_bframe, index_method=VideoIndexCreationMethod.AUTO)[0]
+    header_n = make_index_and_metadata(no_bframe, index_method=VideoIndexCreationMethod.FROM_HEADER)[0]
+    assert auto_n == header_n  # no B-frames → AUTO takes the fast FROM_HEADER path
+
+
+def _fake_container(pts_dts: list[tuple[int | None, int | None]]) -> SimpleNamespace:
+    """Return a stand-in container whose ``demux`` yields packets with the given pts/dts."""
+    packets = [SimpleNamespace(pts=pts, dts=dts) for pts, dts in pts_dts]
+    return SimpleNamespace(demux=lambda **_kw: iter(packets))
+
+
+def test_has_composition_offset_detects_pts_dts_gap() -> None:
+    """A packet whose PTS != DTS (a ctts offset) is detected."""
+    assert _has_composition_offset(_fake_container([(0, 0), (5, 4)]), 0) is True
+
+
+def test_has_composition_offset_false_when_pts_equals_dts() -> None:
+    """No offset when every packet's PTS equals its DTS."""
+    assert _has_composition_offset(_fake_container([(0, 0), (1, 1), (2, 2)]), 0) is False
+
+
+def test_has_composition_offset_skips_packets_missing_timestamps() -> None:
+    """Packets missing PTS or DTS are ignored rather than counted as a mismatch."""
+    assert _has_composition_offset(_fake_container([(None, 0), (1, None), (2, 2)]), 0) is False
+
+
+def test_has_composition_offset_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe stops after the bounded prefix instead of scanning the whole stream."""
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._AUTO_COMPOSITION_PROBE_PACKETS", 4)
+    consumed = 0
+
+    def gen() -> object:
+        nonlocal consumed
+        while True:
+            consumed += 1
+            yield SimpleNamespace(pts=consumed, dts=consumed)  # always equal → never short-circuits
+
+    assert _has_composition_offset(SimpleNamespace(demux=lambda **_kw: gen()), 0) is False
+    assert consumed == 4  # stopped at the bound, did not run the infinite stream
+
+
+def test_resolve_auto_uses_full_demux_on_composition_offset(
+    monkeypatch: pytest.MonkeyPatch, h264_video: Callable[..., bytes]
+) -> None:
+    """A B-frame-free stream with a composition offset still routes to FULL_DEMUX."""
+    no_bframe = h264_video(bframes=0)  # has_b_frames == 0, so only the offset probe can trip
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._has_composition_offset", lambda *_a, **_k: True)
+
+    assert _resolve_auto_index_method(no_bframe) is VideoIndexCreationMethod.FULL_DEMUX
 
 
 # ===========================================================================

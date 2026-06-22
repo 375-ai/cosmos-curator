@@ -47,12 +47,19 @@ class VideoIndexCreationMethod(enum.Enum):
     """How packet-level metadata is collected when building a video index.
 
     ``FROM_HEADER`` reads the stream's index entries parsed from the container
-    header (fast). ``FULL_DEMUX`` walks every packet via demux (slow, I/O heavy).
+    header (fast), but the entry timestamps are decode timestamps (DTS). For
+    B-frame video DTS != PTS, so a header-built index is sorted by DTS and does
+    not match the true presentation order — producing wrong decode plans and
+    spurious header-vs-demux mismatches.
 
-    Prefer ``FROM_HEADER`` in production. Reserve ``FULL_DEMUX`` for tests or
-    when header-only metadata is proven insufficient for a format (please file
-    an issue in that case).
+    ``FULL_DEMUX`` walks every packet via demux (slow, I/O heavy) and reads each
+    packet's PTS, so it is always correct.
+
+    ``AUTO`` (default) reads ``FROM_HEADER`` when the stream has no B-frames
+    (``codec_context.has_b_frames`` is 0; DTS == PTS, so the fast path is exact)
+    and otherwise falls back to ``FULL_DEMUX``.
     """
 
     FROM_HEADER = "from_header"
     FULL_DEMUX = "full_demux"
+    AUTO = "auto"

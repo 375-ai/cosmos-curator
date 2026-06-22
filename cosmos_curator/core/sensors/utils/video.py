@@ -22,6 +22,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from fractions import Fraction
+from itertools import islice
 from typing import (
     Any,
     BinaryIO,
@@ -612,11 +613,68 @@ def _get_video_index_from_header(
     return offset, size, pts, is_keyframe, is_discard
 
 
+# Bounded packet prefix scanned to detect a ctts composition offset for AUTO.
+# A composition offset, when present, manifests on the earliest packets, so a
+# small prefix is enough; this keeps the FROM_HEADER fast path from degrading
+# into a full demux. The bound is the residual gap the AUTO heuristic accepts:
+# an offset that first appears only after this many packets is not detected.
+_AUTO_COMPOSITION_PROBE_PACKETS = 300
+
+
+def _has_composition_offset(container: InputContainer, stream_idx: int) -> bool:
+    """Return whether the stream's first packets carry a ctts composition offset.
+
+    A composition offset means ``PTS = DTS + offset`` for some packets, so the
+    DTS-based ``FROM_HEADER`` index would not match presentation order even when
+    no B-frames are signaled. Detected by checking the first
+    :data:`_AUTO_COMPOSITION_PROBE_PACKETS` packets that carry both timestamps for
+    any ``pts != dts`` (packets missing PTS or DTS are ignored, and the bound
+    applies to packets actually inspected).
+    """
+    timed_packets = (
+        packet for packet in container.demux(video=stream_idx) if packet.pts is not None and packet.dts is not None
+    )
+    return any(packet.pts != packet.dts for packet in islice(timed_packets, _AUTO_COMPOSITION_PROBE_PACKETS))
+
+
+def _resolve_auto_index_method(
+    data: DataSource,
+    stream_idx: int = 0,
+    video_format: str | None = None,
+) -> VideoIndexCreationMethod:
+    """Resolve ``AUTO`` to ``FROM_HEADER`` (fast) or ``FULL_DEMUX`` (correct) for *data*.
+
+    ``FROM_HEADER`` reads ``AVIndexEntry.timestamp`` (DTS), which equals PTS only
+    when presentation order matches decode order. Two things break that:
+
+    * B-frames — signaled by ``codec_context.has_b_frames`` (the decoder reorder
+      delay, parsed from the codec header at open without decoding frames).
+      ``max_b_frames`` is the *encoder* config and reads 0 on a decoded stream,
+      so it cannot be used here.
+    * A ``ctts`` composition offset — not reflected in ``has_b_frames``, so it is
+      checked separately over a bounded packet prefix (see
+      :func:`_has_composition_offset`).
+
+    Either condition routes to ``FULL_DEMUX``; otherwise the fast header path is
+    exact. Runs in its own short-lived container so the probe demux does not
+    perturb the index build, which reopens the source.
+    """
+    with (
+        open_data_source(data, mode="rb") as stream,
+        open_video_container(stream, stream_idx=stream_idx, video_format=video_format) as (container, video_stream),
+    ):
+        if video_stream.codec_context.has_b_frames:
+            return VideoIndexCreationMethod.FULL_DEMUX
+        if _has_composition_offset(container, stream_idx):
+            return VideoIndexCreationMethod.FULL_DEMUX
+        return VideoIndexCreationMethod.FROM_HEADER
+
+
 def make_index_and_metadata(
     data: DataSource,
     stream_idx: int = 0,
     video_format: str | None = None,
-    index_method: VideoIndexCreationMethod = VideoIndexCreationMethod.FROM_HEADER,
+    index_method: VideoIndexCreationMethod = VideoIndexCreationMethod.AUTO,
     allow_header_fallback: bool = True,  # noqa: FBT001, FBT002
 ) -> tuple[VideoIndex, VideoMetadata]:
     """Build a :class:`VideoIndex` and :class:`VideoMetadata` from a video source.
@@ -636,9 +694,12 @@ def make_index_and_metadata(
             :class:`io.BufferedIOBase` by the caller.
         stream_idx: index of the video stream to use (default: 0).
         video_format: container format hint (default: ``None``; let libav detect).
-        index_method: how to collect per-packet metadata.  ``FROM_HEADER`` (default)
-            reads from the container index (fast).  ``FULL_DEMUX`` scans every
-            packet (slow; for tests or rare validation).
+        index_method: how to collect per-packet metadata. ``AUTO`` (default)
+            picks ``FROM_HEADER`` when the fast header path is exact for the
+            stream and ``FULL_DEMUX`` otherwise (see
+            :func:`_resolve_auto_index_method`). ``FROM_HEADER`` reads from the
+            container index (fast, DTS-based); ``FULL_DEMUX`` scans every packet
+            (slow, always PTS-correct).
         allow_header_fallback: If ``True`` and ``FROM_HEADER`` is unavailable,
             transparently fall back to ``FULL_DEMUX``. If ``False``, raise the
             header-index error instead. Diagnostics should set this to ``False``
@@ -654,6 +715,11 @@ def make_index_and_metadata(
         ValueError: if the stream contains no keyframes.
 
     """
+    # Resolve AUTO before the index build (in its own container) so the
+    # composition-offset probe demux does not perturb the build below.
+    if index_method == VideoIndexCreationMethod.AUTO:
+        index_method = _resolve_auto_index_method(data, stream_idx, video_format)
+
     with (
         open_data_source(data, mode="rb") as stream,
         open_video_container(stream, stream_idx=stream_idx, video_format=video_format) as (
@@ -665,6 +731,7 @@ def make_index_and_metadata(
             error_msg = f"Time base is None for video stream {stream_idx}"
             raise ValueError(error_msg)
         time_base = video_stream.time_base
+
         match index_method:
             case VideoIndexCreationMethod.FULL_DEMUX:
                 offset, size, pts, is_keyframe, is_discard = _get_video_index_full_demux(container, stream_idx)
