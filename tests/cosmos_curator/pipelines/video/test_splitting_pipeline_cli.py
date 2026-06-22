@@ -139,10 +139,14 @@ def test_write_all_caption_json_opt_in() -> None:
     assert args.write_all_caption_json is True
 
 
-def test_no_write_all_caption_json_flag_removed() -> None:
+def test_no_write_all_caption_json_flag_removed(capsys: pytest.CaptureFixture[str]) -> None:
     """The old negative flag should no longer be accepted."""
     with pytest.raises(SystemExit):
         _parser().parse_args(["--no-write-all-caption-json"])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "unrecognized arguments: --no-write-all-caption-json" in captured.err
 
 
 def test_deprecated_vllm_preprocess_args_default_to_none() -> None:

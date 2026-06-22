@@ -252,7 +252,7 @@ def test_shard_settings_validation_rejects_invalid_values(
         _shard_settings_from_args(args)
 
 
-def test_shard_parser_rejects_invalid_metadata_input_format() -> None:
+def test_shard_parser_rejects_invalid_metadata_input_format(capsys: pytest.CaptureFixture[str]) -> None:
     """``metadata_input_format`` is limited to supported metadata readers."""
     parser = _shard_parser()
     with pytest.raises(SystemExit):
@@ -266,6 +266,10 @@ def test_shard_parser_rejects_invalid_metadata_input_format() -> None:
                 "parquet",
             ],
         )
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "argument --metadata-input-format: invalid choice: 'parquet'" in captured.err
 
 
 def test_common_settings_rejects_invalid_execution_mode() -> None:
