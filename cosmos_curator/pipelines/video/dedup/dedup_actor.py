@@ -179,14 +179,20 @@ class SemDedupActor(RAFTActor):
             logger.debug(f"{self.display_name}: downloaded {len(buffers)}/{len(files)} parquet files")
         return buffers
 
-    def kmeans(self, parquet_files: list[StoragePrefix | pathlib.Path]) -> None:
-        """Perform semantic dedup on the assigned parquet files.
+    def load(self, parquet_files: list[StoragePrefix | pathlib.Path]) -> int:
+        """Download and load this actor's assigned parquet shard into GPU memory.
+
+        Builds the unit-normalized ``(n, d)`` embedding matrix and caches it (along
+        with the source DataFrame) on the actor for the subsequent ``kmeans`` call.
+        Returning the local sample count lets the driver pick a globally consistent
+        ``n_clusters`` that does not exceed any actor's partition size (cuML's
+        ``KMeansMG`` requires ``n_samples >= n_clusters`` on every partition).
 
         Args:
-            parquet_files (list[StoragePrefix | pathlib.Path]): Parquet files assigned to this actor for processing.
+            parquet_files (list[StoragePrefix | pathlib.Path]): Parquet files assigned to this actor.
 
         Returns:
-            None
+            int: The number of embedding rows (samples) loaded by this actor.
 
         Raises:
             ValueError: If there are no rows to cluster or embeddings are ragged (inconsistent lengths).
@@ -194,7 +200,6 @@ class SemDedupActor(RAFTActor):
         """
         cudf = importlib.import_module("cudf")
         cp = importlib.import_module("cupy")
-        KMeansMG = importlib.import_module("cuml.cluster.kmeans_mg").KMeansMG
 
         parquet_buffers = self._download(parquet_files)
 
@@ -227,6 +232,33 @@ class SemDedupActor(RAFTActor):
         norms = cp.linalg.norm(X, axis=1, keepdims=True)
         X /= cp.maximum(norms, 1e-12)  # avoid div-by-zero
 
+        self._embeddings_df = embeddings_df
+        self._X = X
+        return n
+
+    def kmeans(self, n_clusters: int) -> None:
+        """Run multi-GPU K-means on this actor's loaded shard and write per-cluster parquet.
+
+        Must be called after ``load``. ``n_clusters`` is chosen by the driver to be
+        consistent across all actors and no larger than the smallest partition.
+
+        Args:
+            n_clusters (int): Number of clusters for K-means (shared by all actors).
+
+        Returns:
+            None
+
+        """
+        cudf = importlib.import_module("cudf")
+        cp = importlib.import_module("cupy")
+        KMeansMG = importlib.import_module("cuml.cluster.kmeans_mg").KMeansMG
+
+        if getattr(self, "_embeddings_df", None) is None or getattr(self, "_X", None) is None:
+            error_message = f"{self.display_name}: kmeans() called before load()"
+            raise RuntimeError(error_message)
+        embeddings_df = self._embeddings_df
+        X = self._X
+
         # ---- Fit MG KMeans ----
         # handle= is required for RAFT comms but triggers a spurious deprecation
         # warning in cuml >=26.02 (KMeansMG inherits the KMeans warning even though
@@ -235,7 +267,7 @@ class SemDedupActor(RAFTActor):
             warnings.filterwarnings("ignore", message=r".*\bhandle\b.*deprecated", category=FutureWarning)
             km = KMeansMG(
                 handle=self._raft_handle,
-                n_clusters=self._config.n_clusters,
+                n_clusters=n_clusters,
                 max_iter=self._config.max_iter,
                 random_state=self._config.random_state,
                 verbose=self._verbose,
@@ -287,7 +319,7 @@ class SemDedupActor(RAFTActor):
         )
 
         # ---- Write one parquet per cluster ----
-        for cluster_id in range(self._config.n_clusters):
+        for cluster_id in range(n_clusters):
             cluster_rows = out_df[out_df["_nearest_cent"] == cluster_id][["id", "embedding", "cosine_dist_to_cent"]]
             if len(cluster_rows) == 0:
                 continue
@@ -311,6 +343,14 @@ class SemDedupActor(RAFTActor):
                 client=write_client,
                 overwrite=True,
             )
+
+        # Release the cached shard and GPU pool now that clustering output is
+        # persisted; dedup() re-reads per-cluster shards from storage and never
+        # reuses these, so holding them only adds memory pressure before dedup.
+        self._embeddings_df = None
+        self._X = None
+        del out_df, embeddings_df, X, labels, centroids, centroids_unit, cosine_sim, cosine_dist
+        cp.get_default_memory_pool().free_all_blocks()
 
     def dedup(self, clusters: list[int]) -> dict[str, int] | None:  # noqa: PLR0915
         """Compute per-row maximum cosine similarity to any earlier row and emit pruning tables for the given clusters.

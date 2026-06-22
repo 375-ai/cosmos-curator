@@ -279,13 +279,27 @@ def _dedup(args: argparse.Namespace) -> None:
     ray.get([pool[i].config.remote(params) for i in range(pool_size)])  # type: ignore[attr-defined]
     logger.info("Configured all actors with dedup parameters.")
 
-    # Split parquet files evenly across actors and launch k-means on each actor
+    # Split parquet files evenly across actors and load each shard into GPU memory.
     sublists = [list(chunk) for chunk in np.array_split(parquet_files, pool_size)]  # type: ignore[arg-type, var-annotated]
-    ray.get([pool[i].kmeans.remote(sublists[i]) for i in range(pool_size)])  # type: ignore[attr-defined]
-    logger.info("K-means clustering completed on all actors.")
+    per_actor_counts = ray.get([pool[i].load.remote(sublists[i]) for i in range(pool_size)])  # type: ignore[attr-defined]
+
+    # cuML KMeansMG requires n_samples >= n_clusters on every partition. Clamp the
+    # cluster count to the smallest partition so tiny inputs (e.g. CI smoke tests)
+    # don't fail; all actors must use the same value for the collective fit.
+    min_partition = min(per_actor_counts)
+    n_clusters = min(args.n_clusters, min_partition)
+    if n_clusters < args.n_clusters:
+        logger.warning(
+            f"Reducing n_clusters from {args.n_clusters} to {n_clusters}: smallest actor partition has "
+            f"{min_partition} sample(s) and KMeans requires n_samples >= n_clusters per partition."
+        )
+
+    # Launch k-means on each actor using the effective cluster count.
+    ray.get([pool[i].kmeans.remote(n_clusters) for i in range(pool_size)])  # type: ignore[attr-defined]
+    logger.info(f"K-means clustering completed on all actors with {n_clusters} clusters.")
 
     # Split cluster ids across actors and run dedup on each actor's assigned clusters
-    sublists = [list(chunk) for chunk in np.array_split(list(range(args.n_clusters)), pool_size)]
+    sublists = [list(chunk) for chunk in np.array_split(list(range(n_clusters)), pool_size)]
     stats = ray.get([pool[i].dedup.remote(sublists[i]) for i in range(pool_size)])  # type: ignore[attr-defined]
     logger.info("Deduplication completed on all actors.")
 
