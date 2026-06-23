@@ -15,6 +15,7 @@
 """Test nvcf_main functionality."""
 
 import argparse
+import asyncio
 import io
 import itertools
 import json
@@ -30,6 +31,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from cosmos_curator.core.cf import nvcf_main
@@ -594,6 +596,108 @@ class TestFastAPIEndpoints:
             data = response.json()
             assert "could not be terminated" in data["error"]
 
+    def test_run_pipeline_status_check_reads_nvcf_status_progress_file(
+        self, test_client: TestClient, mock_request_id: str, tmp_path: Path
+    ) -> None:
+        """Test status check reads output-dir progress when present."""
+        progress_file = tmp_path / "progress"
+        progress_file.write_text(
+            json.dumps({"partialResponse": {"progress": "42.25", "logs": "nvcf status log"}}), encoding="utf-8"
+        )
+        output_dir_file = tmp_path / f"request_output_dir_{mock_request_id}.txt"
+
+        with patch("tempfile.gettempdir", return_value=str(tmp_path)):
+            nvcf_main._write_request_output_dir(mock_request_id, str(tmp_path))
+            nvcf_main._mark_direct_request(mock_request_id)
+            assert output_dir_file.exists()
+            with (
+                patch("cosmos_curator.core.cf.nvcf_main._get_request_status", return_value="running"),
+                patch.dict(nvcf_main.using_nvcf_status, {"get_req_sts": True}),
+            ):
+                response = test_client.post(
+                    "/v1/run_pipeline",
+                    headers={
+                        "CURATOR-STATUS-CHECK": "true",
+                        "CURATOR-NVCF-REQID": mock_request_id,
+                    },
+                )
+
+        assert response.status_code == HTTP_OK
+        assert response.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] == "42.25"
+        with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+            assert zf.read(f"log-{mock_request_id}.txt").decode().startswith("nvcf status log")
+
+    def test_run_pipeline_status_check_handles_unmarked_request_when_nvcf_status_is_enabled(
+        self, mock_request_id: str
+    ) -> None:
+        """Test status probes use the full endpoint even for pexec-enqueued requests."""
+        middleware = nvcf_main.PipelineLockMiddleware(FastAPI())
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/run_pipeline"),
+            headers={"CURATOR-STATUS-CHECK": "true", "CURATOR-NVCF-REQID": mock_request_id},
+        )
+
+        async def call_next(_request: object) -> JSONResponse:
+            return JSONResponse(status_code=HTTP_OK, content={"passed_through": True})
+
+        with (
+            patch.dict(nvcf_main.using_nvcf_status, {"get_req_sts": True}),
+            patch.object(
+                nvcf_main.PipelineLockMiddleware,
+                "_handle_status_check",
+                return_value=JSONResponse(status_code=HTTP_OK, content={"handled": True}),
+            ) as mock_status_check,
+        ):
+            response = asyncio.run(middleware.dispatch(request, call_next))  # type: ignore[arg-type]
+
+        assert response.status_code == HTTP_OK
+        assert json.loads(response.body) == {"handled": True}
+        mock_status_check.assert_called_once()
+
+    def test_run_pipeline_status_check_handles_marked_direct_request_when_nvcf_status_is_enabled(
+        self, mock_request_id: str, tmp_path: Path
+    ) -> None:
+        """Test direct status probes are handled after direct invocation creates the request."""
+        middleware = nvcf_main.PipelineLockMiddleware(FastAPI())
+        request = SimpleNamespace(
+            url=SimpleNamespace(path="/v1/run_pipeline"),
+            headers={"CURATOR-STATUS-CHECK": "true", "CURATOR-NVCF-REQID": mock_request_id},
+        )
+
+        async def call_next(_request: object) -> JSONResponse:
+            return JSONResponse(status_code=HTTP_OK, content={"passed_through": True})
+
+        with (
+            patch("tempfile.gettempdir", return_value=str(tmp_path)),
+            patch.dict(nvcf_main.using_nvcf_status, {"get_req_sts": True}),
+            patch.object(
+                nvcf_main.PipelineLockMiddleware,
+                "_handle_status_check",
+                return_value=JSONResponse(status_code=HTTP_OK, content={"handled": True}),
+            ) as mock_status_check,
+        ):
+            nvcf_main._mark_direct_request(mock_request_id)
+            response = asyncio.run(middleware.dispatch(request, call_next))  # type: ignore[arg-type]
+
+        assert response.status_code == HTTP_OK
+        assert json.loads(response.body) == {"handled": True}
+        mock_status_check.assert_called_once()
+
+    def test_run_pipeline_rechecks_busy_status_after_acquiring_lock(self) -> None:
+        """Test a racing invoke is rejected if busy marker appears after the first check."""
+        middleware = nvcf_main.PipelineLockMiddleware(FastAPI())
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/run_pipeline"), headers={})
+
+        async def call_next(_request: object) -> JSONResponse:
+            return JSONResponse(status_code=HTTP_OK, content={"accepted": True})
+
+        with patch.object(middleware, "_is_pipeline_busy", side_effect=[False, True]) as mock_busy:
+            response = asyncio.run(middleware.dispatch(request, call_next))  # type: ignore[arg-type]
+
+        assert response.status_code == 429
+        assert json.loads(response.body) == {"error": "Pipeline is currently busy. Please try again later."}
+        assert mock_busy.call_count == 2
+
     def test_run_pipeline_status_check(self, test_client: TestClient, mock_request_id: str) -> None:
         """Test /v1/run_pipeline handles status check request."""
         with patch("cosmos_curator.core.cf.nvcf_main._read_progress_and_log_files") as mock_read:
@@ -612,6 +716,197 @@ class TestFastAPIEndpoints:
                     assert response.status_code == HTTP_OK
                     assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
                     assert "CURATOR-PIPELINE-PERCENT-COMPLETE" in response.headers
+
+    def test_run_pipeline_pexec_request_runs_synchronously(self, test_client: TestClient, mock_request_id: str) -> None:
+        """Test pexec-shaped requests keep the synchronous request lifecycle."""
+        fake_manager = MagicMock()
+        fake_manager.Value.return_value = SimpleNamespace(value=False)
+        fake_manager.Queue.return_value = queue.Queue()
+        fake_manager.list.return_value = []
+        fake_thread = MagicMock()
+        fake_stop_event = threading.Event()
+
+        with (
+            patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
+            patch("cosmos_curator.core.cf.nvcf_main._setup_request", return_value=(fake_thread, fake_stop_event)),
+            patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline") as mock_run,
+            patch("cosmos_curator.core.cf.nvcf_main.gather_and_upload_outputs"),
+        ):
+            response = test_client.post(
+                "/v1/run_pipeline",
+                headers={"NVCF-REQID": mock_request_id},
+                json={"pipeline": "split", "args": {"input_video_path": "/in", "output_clip_path": "/out"}},
+            )
+
+            assert response.status_code == HTTP_OK
+            assert response.json()["message"] == "Pipeline executed successfully"
+            mock_run.assert_called_once()
+
+    def test_run_pipeline_direct_request_returns_request_id(self, test_client: TestClient) -> None:
+        """Test direct requests return quickly and upload before publishing terminal status."""
+        fake_manager = MagicMock()
+        ipc_status = SimpleNamespace(value=False)
+        fake_manager.Value.return_value = ipc_status
+        fake_manager.Queue.return_value = queue.Queue()
+        fake_manager.list.return_value = []
+        fake_stop_event = threading.Event()
+        executed = threading.Event()
+        events: list[str] = []
+
+        class FakeProgressThread:
+            def join(self) -> None:
+                events.append("join")
+                assert events == ["execute", "upload", "stop", "join"]
+
+        def fake_execute(*_args: object) -> None:
+            ipc_status.value = True
+            events.append("execute")
+            executed.set()
+
+        def fake_upload(*_args: object) -> None:
+            events.append("upload")
+            assert not fake_stop_event.is_set()
+
+        def fake_stop() -> None:
+            events.append("stop")
+            threading.Event.set(fake_stop_event)
+
+        with (
+            patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
+            patch(
+                "cosmos_curator.core.cf.nvcf_main._setup_request",
+                return_value=(FakeProgressThread(), fake_stop_event),
+            ),
+            patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline", side_effect=fake_execute),
+            patch("cosmos_curator.core.cf.nvcf_main.gather_and_upload_outputs", side_effect=fake_upload),
+            patch.object(fake_stop_event, "set", side_effect=fake_stop),
+        ):
+            response = test_client.post(
+                "/v1/run_pipeline",
+                headers={"CURATOR-DIRECT-MODE": "true"},
+                json={
+                    "pipeline": "split",
+                    "args": {
+                        "input_video_path": "/in",
+                        "output_clip_path": "/out",
+                        "output_presigned_s3_url": "https://example.test/output.zip",
+                    },
+                },
+            )
+            assert executed.wait(timeout=1)
+
+            assert response.status_code == HTTP_OK
+            assert response.headers["nvcf-status"] == "in-progress"
+            assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
+            assert response.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] == "0.00"
+            assert response.headers["nvcf-reqid"]
+            assert events == ["execute", "upload", "stop", "join"]
+
+    def test_run_pipeline_direct_upload_failure_marks_request_failed(self, test_client: TestClient) -> None:
+        """Test direct upload failures are visible before terminal progress status is written."""
+        fake_manager = MagicMock()
+        ipc_status = SimpleNamespace(value=False)
+        fake_manager.Value.return_value = ipc_status
+        fake_manager.Queue.return_value = queue.Queue()
+        fake_manager.list.return_value = []
+        fake_stop_event = threading.Event()
+        executed = threading.Event()
+        joined = threading.Event()
+        events: list[str] = []
+
+        class FakeProgressThread:
+            def join(self) -> None:
+                events.append(f"join:{ipc_status.value}")
+                joined.set()
+
+        def fake_execute(*_args: object) -> None:
+            ipc_status.value = True
+            events.append("execute")
+            executed.set()
+
+        def fake_upload(*_args: object) -> None:
+            events.append("upload")
+            msg = "upload failed"
+            raise RuntimeError(msg)
+
+        def fake_stop() -> None:
+            events.append(f"stop:{ipc_status.value}")
+            threading.Event.set(fake_stop_event)
+
+        with (
+            patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
+            patch(
+                "cosmos_curator.core.cf.nvcf_main._setup_request",
+                return_value=(FakeProgressThread(), fake_stop_event),
+            ),
+            patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline", side_effect=fake_execute),
+            patch("cosmos_curator.core.cf.nvcf_main.gather_and_upload_outputs", side_effect=fake_upload),
+            patch.object(fake_stop_event, "set", side_effect=fake_stop),
+        ):
+            response = test_client.post(
+                "/v1/run_pipeline",
+                headers={"CURATOR-DIRECT-MODE": "true"},
+                json={
+                    "pipeline": "split",
+                    "args": {
+                        "input_video_path": "/in",
+                        "output_clip_path": "/out",
+                        "output_presigned_s3_url": "https://example.test/output.zip",
+                    },
+                },
+            )
+            assert executed.wait(timeout=1)
+            assert joined.wait(timeout=1)
+
+            assert response.status_code == HTTP_OK
+            assert events == ["execute", "upload", "stop:False", "join:False"]
+            assert ipc_status.value is False
+
+    def test_run_pipeline_direct_non_presigned_request_returns_request_id(self, test_client: TestClient) -> None:
+        """Test direct non-presigned requests do not add a separate upload step."""
+        fake_manager = MagicMock()
+        fake_manager.Value.return_value = SimpleNamespace(value=False)
+        fake_manager.Queue.return_value = queue.Queue()
+        fake_manager.list.return_value = []
+        fake_stop_event = threading.Event()
+        executed = threading.Event()
+        events: list[str] = []
+
+        class FakeProgressThread:
+            def join(self) -> None:
+                events.append("join")
+
+        def fake_execute(*_args: object) -> None:
+            events.append("execute")
+            executed.set()
+
+        def fake_stop() -> None:
+            events.append("stop")
+            threading.Event.set(fake_stop_event)
+
+        with (
+            patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
+            patch(
+                "cosmos_curator.core.cf.nvcf_main._setup_request",
+                return_value=(FakeProgressThread(), fake_stop_event),
+            ),
+            patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline", side_effect=fake_execute),
+            patch.object(fake_stop_event, "set", side_effect=fake_stop),
+        ):
+            response = test_client.post(
+                "/v1/run_pipeline",
+                headers={"CURATOR-DIRECT-MODE": "true"},
+                json={
+                    "pipeline": "split",
+                    "args": {"input_video_path": "/in", "output_clip_path": "/out"},
+                },
+            )
+            assert executed.wait(timeout=1)
+
+            assert response.status_code == HTTP_OK
+            assert response.headers["nvcf-status"] == "in-progress"
+            assert response.headers["nvcf-reqid"]
+            assert events == ["execute", "stop", "join"]
 
     @pytest.mark.parametrize(
         ("method", "path", "request_kwargs"),
@@ -819,12 +1114,11 @@ class TestExecutePipeline:
                 pipeline_args,
                 log_queue,  # type: ignore[arg-type]
                 ipc_status,  # type: ignore[arg-type]
-                stop_event,
             )
 
             # Verify executor was used
             mock_executor.submit.assert_called_once()
-            assert stop_event.is_set()
+            assert not stop_event.is_set()
 
 
 def test_setup_pipeline_middleware() -> None:

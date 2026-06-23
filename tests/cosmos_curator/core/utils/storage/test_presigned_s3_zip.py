@@ -305,6 +305,40 @@ def test_gather_and_upload_outputs_cleans_annotate_temp_dir(tmp_path: Path, monk
     assert not output_path.exists()
 
 
+def test_gather_and_upload_outputs_raises_upload_failure_and_cleans_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Upload failures should be visible to callers while temp dirs are still cleaned."""
+    output_path = tmp_path / "output_annotate_abc"
+    output_path.mkdir()
+    (output_path / "summary.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "cosmos_curator.core.utils.storage.presigned_s3_zip.gather_outputs_from_all_nodes",
+        lambda _path: None,
+    )
+
+    def fail_upload(_path: str, _url: str) -> None:
+        msg = "upload failed"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        "cosmos_curator.core.utils.storage.presigned_s3_zip.zip_and_upload_directory",
+        fail_upload,
+    )
+
+    with pytest.raises(RuntimeError, match="upload failed"):
+        gather_and_upload_outputs(
+            "annotate",
+            argparse.Namespace(
+                output_path=str(output_path),
+                output_presigned_s3_url="https://example.test/output.zip",
+            ),
+        )
+
+    assert not output_path.exists()
+
+
 def test_zip_and_upload_directory_multipart(tmp_path: Path) -> None:
     """Split large uploads across presigned part URLs and reassemble."""
     src_dir = tmp_path / "multipart"

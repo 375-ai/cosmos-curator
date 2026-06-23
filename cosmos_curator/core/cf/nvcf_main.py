@@ -73,7 +73,9 @@ _PIPELINE_LOCK_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline.lock"
 _PIPELINE_STATUS_FILE = pathlib.Path(tempfile.gettempdir()) / "pipeline_status"
 _FORCE_TERMINATE_REQUEST_ID = "12345678-1234-1234-1234-123456789abc"
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-
+_REQUEST_OUTPUT_DIR_PATTERN = "request_output_dir_{req_id}.txt"
+_DIRECT_REQUEST_PATTERN = "direct_request_{req_id}"
+_CURATOR_DIRECT_MODE_HEADER = "CURATOR-DIRECT-MODE"
 _RAY_DASHBOARD = f"http://127.0.0.1:{os.getenv('RAY_DASHBOARD_PORT', '8265')}"
 _METRICS_PORT = 9002
 
@@ -162,6 +164,34 @@ def _get_progress_file(req_id: str) -> pathlib.Path:
     return pathlib.Path(tempfile.gettempdir()) / f"progress_{_validate_request_id(req_id)}.json"
 
 
+def _get_request_output_dir_file(req_id: str) -> pathlib.Path:
+    return pathlib.Path(tempfile.gettempdir()) / _REQUEST_OUTPUT_DIR_PATTERN.format(req_id=_validate_request_id(req_id))
+
+
+def _get_direct_request_file(req_id: str) -> pathlib.Path:
+    return pathlib.Path(tempfile.gettempdir()) / _DIRECT_REQUEST_PATTERN.format(req_id=_validate_request_id(req_id))
+
+
+def _mark_direct_request(req_id: str) -> None:
+    _get_direct_request_file(req_id).touch()
+
+
+def _is_direct_request(req_id: str) -> bool:
+    return _get_direct_request_file(req_id).exists()
+
+
+def _write_request_output_dir(req_id: str, output_dir: str) -> None:
+    _get_request_output_dir_file(req_id).write_text(output_dir, encoding="utf-8")
+
+
+def _read_request_output_dir(req_id: str) -> str | None:
+    output_dir_file = _get_request_output_dir_file(req_id)
+    if not output_dir_file.exists():
+        return None
+    output_dir = output_dir_file.read_text(encoding="utf-8").strip()
+    return output_dir or None
+
+
 def _get_log_file(req_id: str) -> pathlib.Path:
     return pathlib.Path(tempfile.gettempdir()) / f"logs_{_validate_request_id(req_id)}.txt"
 
@@ -197,6 +227,21 @@ def _list_all_jobs() -> dict[str, tuple[str, str, str]]:
     return jlist
 
 
+def _read_nvcf_status_progress_file(req_id: str) -> tuple[float, str] | None:
+    output_dir = _read_request_output_dir(req_id)
+    if output_dir is None:
+        return None
+    progress_file = pathlib.Path(output_dir) / "progress"
+    if not progress_file.exists():
+        return None
+    with progress_file.open() as fp:
+        progress_data = json.load(fp)
+    partial_response = progress_data.get("partialResponse", {})
+    progress_pct = float(partial_response.get("progress", 0.0))
+    log_lines = str(partial_response.get("logs", ""))
+    return progress_pct, log_lines
+
+
 def _read_progress_and_log_files(
     req_id: str | None,
     *,
@@ -207,16 +252,20 @@ def _read_progress_and_log_files(
     # Initialize to a sane default to avoid UnboundLocalError if req_id is None
     progress_pct: float = 0.0
     if req_id is not None:
-        # avoid race condition
-        with file_lock(_LOG_RDWR_LOCK_FILE):
-            # read progress
-            if read_progress and _get_progress_file(req_id).exists():
-                with _get_progress_file(req_id).open() as fp:
-                    progress_pct = json.load(fp).get("progress", 0)
-            # read log and create a zip file in the buffer
-            if read_log and _get_log_file(req_id).exists():
-                with _get_log_file(req_id).open() as fp:
-                    log_lines = fp.read()
+        nvcf_status_progress = _read_nvcf_status_progress_file(req_id) if using_nvcf_status["get_req_sts"] else None
+        if nvcf_status_progress is not None:
+            progress_pct, log_lines = nvcf_status_progress
+        else:
+            # avoid race condition
+            with file_lock(_LOG_RDWR_LOCK_FILE):
+                # read progress
+                if read_progress and _get_progress_file(req_id).exists():
+                    with _get_progress_file(req_id).open() as fp:
+                        progress_pct = json.load(fp).get("progress", 0)
+                # read log and create a zip file in the buffer
+                if read_log and _get_log_file(req_id).exists():
+                    with _get_log_file(req_id).open() as fp:
+                        log_lines = fp.read()
     else:
         log_lines = "_read_progress_and_log_files called without req_id"
     try:
@@ -404,6 +453,18 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
             return False
 
     @staticmethod
+    def _pipeline_busy_response() -> JSONResponse:
+        logger.warning(
+            "Pipeline is busy (another worker is processing), rejecting request",
+        )
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "Pipeline is currently busy. Please try again later.",
+            },
+        )
+
+    @staticmethod
     def _create_zip_file(
         req_id: str,
         progress_pct: float,
@@ -495,7 +556,7 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
         )
         return zresponse
 
-    async def dispatch(
+    async def dispatch(  # noqa: PLR0911
         self,
         request: Request,
         call_next: RequestResponseEndpoint,
@@ -514,43 +575,40 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
             if request.headers.get("CURATOR-REQ-TERMINATE", ""):
                 return self._handle_termination_request(request)
             # status check request
-            if request.headers.get("CURATOR-STATUS-CHECK", "") and not using_nvcf_status["get_req_sts"]:
+            if request.headers.get("CURATOR-STATUS-CHECK", ""):
                 return self._handle_status_check(request)
 
             # real pipeline request
             if self._is_pipeline_busy():
-                logger.warning(
-                    "Pipeline is busy (another worker is processing), rejecting request",
-                )
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": "Pipeline is currently busy. Please try again later.",
-                    },
-                )
+                return self._pipeline_busy_response()
 
             try:
                 # Try to acquire lock with timeout
                 with self._file_lock.acquire(timeout=1):
+                    cleanup_in_background = False
                     try:
+                        if self._is_pipeline_busy():
+                            return self._pipeline_busy_response()
+
                         # Create status file to indicate pipeline is running
                         async with aiofiles.open(self._status_file.resolve(), "w", encoding="utf-8") as f:
                             await f.write("busy")
 
                         logger.info("Pipeline started - acquired lock")
-                        return await call_next(request)
+                        response = await call_next(request)
+                        if response.headers.get("CURATOR-INVOCATION-MODE") == "direct":
+                            cleanup_in_background = True
+                            logger.info("Direct pipeline accepted - keeping lock files for background run")
+                            return response
+                        return response
                     finally:
-                        # Clean up lock files
-                        _cleanup_pipeline_lock_files()
-                        logger.info("Pipeline completed - released lock")
+                        if not cleanup_in_background:
+                            # Clean up lock files
+                            _cleanup_pipeline_lock_files()
+                            logger.info("Pipeline completed - released lock")
             except filelock.Timeout:
                 logger.warning("Could not acquire lock, pipeline appears to be busy")
-                return JSONResponse(
-                    status_code=429,
-                    content={
-                        "error": "Pipeline is currently busy. Please try again later.",
-                    },
-                )
+                return self._pipeline_busy_response()
 
         return await call_next(request)
 
@@ -714,6 +772,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
     progress_thread = None
     nvcf_output_dir = None
     pipeline_args = None
+    should_cleanup = True
 
     try:
         nvcf_output_dir = get_asset_output_path(request)
@@ -736,6 +795,11 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         logger.info(f"NVCF-Curator node={socket.gethostname()} pid={os.getpid()}")
 
         request_id = request.headers.get("NVCF-REQID")
+        is_direct_invocation = request.headers.get(_CURATOR_DIRECT_MODE_HEADER, "").lower() == "true"
+        logger.info(
+            f"NVCF request classification: has_nvcf_reqid={request_id is not None}, "
+            f"is_direct_invocation={is_direct_invocation}",
+        )
         if request_id is None:
             logger.warning("NVCF-REQID is missing, generating fake request-id")
             request_id = str(uuid.uuid4())  # Generate a fake request-id
@@ -748,6 +812,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         output_dir = nvcf_output_dir if using_nvcf_status["get_req_sts"] else None
         if output_dir is None:
             output_dir = tempfile.gettempdir()  # do not leave as None
+        _write_request_output_dir(request_id, output_dir)
 
         progress_thread, stop_event = _setup_request(
             output_dir,
@@ -759,106 +824,138 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
 
         invoke_args = await request.json()
         pipeline_type = invoke_args.get("pipeline", "unknown")
-
         pipeline_args = argparse.Namespace(**(invoke_args.get("args", {})))
 
-        # Handle any presigned URL processing and ensure we now have a concrete Namespace
-        pipeline_args = handle_presigned_urls(pipeline_type, pipeline_args)
+        def prepare_and_run_pipeline() -> None:  # noqa: C901, PLR0912
+            nonlocal did_init_s3_profile, pipeline_args
 
-        # At this point `pipeline_args` **must** be a populated Namespace object.
-        # Add an explicit runtime assertion so static type-checkers understand this.
-        assert isinstance(pipeline_args, argparse.Namespace)
+            # Handle any presigned URL processing and ensure we now have a concrete Namespace.
+            # For direct invocation this must happen in the background thread, after the
+            # request id has been returned to the caller.
+            assert isinstance(pipeline_args, argparse.Namespace)
+            pipeline_args = handle_presigned_urls(pipeline_type, pipeline_args)
 
-        if hasattr(pipeline_args, "s3_config"):
-            did_init_s3_profile = create_s3_profile(pipeline_args.s3_config)
-            # set it to redacted so that it cannot be saved in script file
-            # the pipeline script dont need it once the profile is created
-            pipeline_args.s3_config = "REDACTED"
+            # At this point `pipeline_args` **must** be a populated Namespace object.
+            # Add an explicit runtime assertion so static type-checkers understand this.
+            assert isinstance(pipeline_args, argparse.Namespace)
 
-        logger.info(f"Launching pipeline {pipeline_type} with args: {pipeline_args}")
-        if pipeline_type == "split":
-            # handle possible assets. Do not override presigned URL paths.
-            if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
-                pipeline_args.input_video_path = get_asset_input_dir(request)
+            if hasattr(pipeline_args, "s3_config"):
+                did_init_s3_profile = create_s3_profile(pipeline_args.s3_config)
+                # set it to redacted so that it cannot be saved in script file
+                # the pipeline script dont need it once the profile is created
+                pipeline_args.s3_config = "REDACTED"
 
-            if not getattr(pipeline_args, "output_presigned_s3_url", None) and input_assets_present(request):
-                pipeline_args.output_clip_path = get_asset_output_path(request)
-            if not getattr(pipeline_args, "output_clip_path", None):
-                pipeline_args.output_clip_path = get_asset_output_path(request)
+            logger.info(f"Launching pipeline {pipeline_type} with args: {pipeline_args}")
+            pipeline_func: Callable[[argparse.Namespace], None] | None = None
 
-            # Validate that we have either a direct path or a presigned URL for both input and output
-            missing_input_path = not getattr(pipeline_args, "input_video_path", None)
-            missing_input_url = not getattr(pipeline_args, "input_presigned_s3_url", None)
-
-            missing_output_path = not getattr(pipeline_args, "output_clip_path", None)
-            missing_output_url = not getattr(pipeline_args, "output_presigned_s3_url", None)
-
-            if missing_input_path and missing_input_url:
-                _value_error(
-                    "Invalid Pipeline args: Either input_video_path or input_presigned_s3_url must be provided",
-                )
-
-            if missing_output_path and missing_output_url:
-                _value_error(
-                    "Invalid Pipeline args: Either output_clip_path or output_presigned_s3_url must be provided",
-                )
-
-            # run the pipeline
             if pipeline_type == "split":
-                execute_pipeline(
-                    _run_in_process,
-                    nvcf_run_split,
-                    request_id,
-                    pipeline_args,
-                    log_queue,
-                    ipc_status,
-                    stop_event,
-                )
-        elif pipeline_type == "shard":
-            execute_pipeline(
-                _run_in_process,
-                nvcf_run_shard,
-                request_id,
-                pipeline_args,
-                log_queue,
-                ipc_status,
-                stop_event,
-            )
-        elif pipeline_type == "annotate":
-            has_input_assets = input_assets_present(request)
-            if has_input_assets and not getattr(pipeline_args, "input_image_path", None):
-                pipeline_args.input_image_path = get_asset_input_dir(request)
-            if not getattr(pipeline_args, "output_path", None):
-                pipeline_args.output_path = get_asset_output_path(request)
+                # handle possible assets. Do not override presigned URL paths.
+                if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
+                    pipeline_args.input_video_path = get_asset_input_dir(request)
 
-            if not getattr(pipeline_args, "input_image_path", None):
-                _value_error("Invalid Pipeline args: input_image_path must be provided")
-            if not getattr(pipeline_args, "output_path", None):
-                _value_error("Invalid Pipeline args: output_path must be provided")
+                if not getattr(pipeline_args, "output_presigned_s3_url", None) and input_assets_present(request):
+                    pipeline_args.output_clip_path = get_asset_output_path(request)
+                if not getattr(pipeline_args, "output_clip_path", None):
+                    pipeline_args.output_clip_path = get_asset_output_path(request)
 
+                # Validate that we have either a direct path or a presigned URL for both input and output
+                missing_input_path = not getattr(pipeline_args, "input_video_path", None)
+                missing_input_url = not getattr(pipeline_args, "input_presigned_s3_url", None)
+
+                missing_output_path = not getattr(pipeline_args, "output_clip_path", None)
+                missing_output_url = not getattr(pipeline_args, "output_presigned_s3_url", None)
+
+                if missing_input_path and missing_input_url:
+                    _value_error(
+                        "Invalid Pipeline args: Either input_video_path or input_presigned_s3_url must be provided",
+                    )
+
+                if missing_output_path and missing_output_url:
+                    _value_error(
+                        "Invalid Pipeline args: Either output_clip_path or output_presigned_s3_url must be provided",
+                    )
+
+                pipeline_func = nvcf_run_split
+            elif pipeline_type == "shard":
+                pipeline_func = nvcf_run_shard
+            elif pipeline_type == "annotate":
+                has_input_assets = input_assets_present(request)
+                if has_input_assets and not getattr(pipeline_args, "input_image_path", None):
+                    pipeline_args.input_image_path = get_asset_input_dir(request)
+                if not getattr(pipeline_args, "output_path", None):
+                    pipeline_args.output_path = get_asset_output_path(request)
+
+                if not getattr(pipeline_args, "input_image_path", None):
+                    _value_error("Invalid Pipeline args: input_image_path must be provided")
+                if not getattr(pipeline_args, "output_path", None):
+                    _value_error("Invalid Pipeline args: output_path must be provided")
+
+                pipeline_func = nvcf_run_annotate
+            elif pipeline_type in ("image-caption", "image-embed", "av-split"):
+                pass
+            elif pipeline_type == "semantic-dedup":
+                pipeline_func = nvcf_run_semdedup
+            else:
+                _value_error(f"Invalid Pipeline type {pipeline_type}")
+
+            if pipeline_func is None:
+                return
             execute_pipeline(
                 _run_in_process,
-                nvcf_run_annotate,
+                pipeline_func,
                 request_id,
                 pipeline_args,
                 log_queue,
                 ipc_status,
-                stop_event,
             )
-        elif pipeline_type in ("image-caption", "image-embed", "av-split"):
-            pass
-        elif pipeline_type == "semantic-dedup":
-            execute_pipeline(
-                _run_in_process,
-                nvcf_run_semdedup,
-                request_id,
-                pipeline_args,
-                log_queue,
-                ipc_status,
-                stop_event,
+
+        if is_direct_invocation:
+            should_cleanup = False
+            _mark_direct_request(request_id)
+
+            def run_direct_pipeline() -> None:
+                try:
+                    logger.info(f"Background direct pipeline starting for request {request_id}")
+                    prepare_and_run_pipeline()
+                except Exception as e:  # noqa: BLE001
+                    logger.exception(f"Error in background pipeline for request {request_id}: {e}")
+                    ipc_status.value = False
+                finally:
+                    logger.info("Cleaning up after finishing the invoke")
+                    if ipc_status.value and pipeline_args is not None:
+                        try:
+                            gather_and_upload_outputs(pipeline_type, pipeline_args)
+                        except Exception as e:  # noqa: BLE001
+                            logger.exception(f"Error uploading pipeline outputs for request {request_id}: {e}")
+                            ipc_status.value = False
+                    if stop_event and not stop_event.is_set():
+                        stop_event.set()
+                    if progress_thread:
+                        progress_thread.join()
+                    if did_init_s3_profile:
+                        remove_s3_profile()
+                    if manager:
+                        manager.shutdown()
+                    _cleanup_pipeline_lock_files()
+                    logger.info("Background pipeline completed - released lock")
+
+            threading.Thread(target=run_direct_pipeline, daemon=True).start()
+            return JSONResponse(
+                status_code=200,
+                content={"message": "Pipeline accepted", "reqid": request_id, "status": "in-progress"},
+                headers={
+                    "nvcf-reqid": request_id,
+                    "nvcf-status": "in-progress",
+                    "CURATOR-PIPELINE-STATUS": "running",
+                    "CURATOR-PIPELINE-PERCENT-COMPLETE": "0.00",
+                    "CURATOR-INVOCATION-MODE": "direct",
+                    "access-control-expose-headers": (
+                        "nvcf-reqid, nvcf-status, CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE"
+                    ),
+                },
             )
-        else:
-            _value_error(f"Invalid Pipeline type {pipeline_type}")
+
+        prepare_and_run_pipeline()
 
         return JSONResponse(
             status_code=200,
@@ -895,17 +992,22 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
         logger.error(f"Error in pipeline: {error_details}")
         return JSONResponse(status_code=500, content={"error": error_details})
     finally:
-        logger.info("Cleaning up after finishing the invoke")
-        if stop_event and not stop_event.is_set():
-            stop_event.set()
-        if progress_thread:
-            progress_thread.join()
-        if did_init_s3_profile:
-            remove_s3_profile()
-        if pipeline_args is not None:
-            gather_and_upload_outputs(pipeline_type, pipeline_args)
-        if manager:
-            manager.shutdown()
+        if should_cleanup:
+            logger.info("Cleaning up after finishing the invoke")
+            if ipc_status.value and pipeline_args is not None:
+                try:
+                    gather_and_upload_outputs(pipeline_type, pipeline_args)
+                except Exception as e:  # noqa: BLE001
+                    logger.exception(f"Error uploading pipeline outputs for request {request_id}: {e}")
+                    ipc_status.value = False
+            if stop_event and not stop_event.is_set():
+                stop_event.set()
+            if progress_thread:
+                progress_thread.join()
+            if did_init_s3_profile:
+                remove_s3_profile()
+            if manager:
+                manager.shutdown()
 
 
 def _run_in_process(
@@ -994,7 +1096,6 @@ def execute_pipeline(  # noqa: PLR0913
     pipeline_args: argparse.Namespace,
     log_queue: multiprocessing.Queue,  # type: ignore[type-arg]
     ipc_status: Synchronized,  # type: ignore[type-arg]
-    stop_event: threading.Event,
 ) -> None:
     """Run the video pipeline in a separate process and capture its output."""
     if request_id is None:
@@ -1008,11 +1109,7 @@ def execute_pipeline(  # noqa: PLR0913
             log_queue,
             ipc_status,
         )
-        try:
-            _ = future.result()
-        finally:
-            if stop_event and not stop_event.is_set():
-                stop_event.set()
+        _ = future.result()
 
 
 def get_pipeline_progress() -> float:

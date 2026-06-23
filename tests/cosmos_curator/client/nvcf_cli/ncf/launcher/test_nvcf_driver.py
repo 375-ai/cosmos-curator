@@ -63,7 +63,7 @@ def test_deploy_function_no_id_version(tmp_path: Path, caplog: pytest.LogCapture
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
 def test_deploy_function_no_backend_gpu_instance(mock_cc: MagicMock, tmp_path: Path) -> None:
-    """Test that deploy-function fails with no backened, gpu, or instance.
+    """Test that deploy-function fails with no gpu or instance.
 
     Args:
         mock_cc: A mock to return a fake helper.
@@ -79,9 +79,80 @@ def test_deploy_function_no_backend_gpu_instance(mock_cc: MagicMock, tmp_path: P
     fname = tmp_path / "fake.json"
     fname.touch()
 
-    # Mock return values to test backend = None
     mock_instance.id_version.return_value = (True, 1234, 5678)
+
+    # Mock return values to test gpu = None
     mock_instance.get_cluster.return_value = (True, None, None, None)
+    args = [
+        "nvcf",
+        "function",
+        "deploy-function",
+        "--data-file",
+        str(fname),
+    ]
+    result = runner.invoke(cosmos_curator, args)
+    mock_instance.logger.error.assert_called_with("Could not deploy function: gpu is required")
+    assert result.exit_code != 0
+
+    # Mock return values to test instance = None
+    mock_instance.get_cluster.return_value = (True, True, True, None)
+    result = runner.invoke(cosmos_curator, args)
+    mock_instance.logger.error.assert_called_with("Could not deploy function: instance is required")
+    assert result.exit_code != 0
+
+
+@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
+def test_deploy_function_backend_optional_with_region_and_availability_zone(
+    mock_cc: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test deploy-function can pass region/AZ without backend clusters."""
+    monkeypatch.delenv("NVCF_BACKEND", raising=False)
+    mock_instance = MagicMock()
+    mock_func = MagicMock(return_value=mock_instance)
+    mock_cc.return_value = {"function": {"help": "A fake function", "type": mock_func}}
+
+    fname = tmp_path / "fake.json"
+    fname.touch()
+
+    mock_instance.id_version.return_value = (True, 1234, 5678)
+    mock_instance.get_cluster.return_value = (True, None, "test-gpu", "test-instance")
+
+    args = [
+        "nvcf",
+        "function",
+        "deploy-function",
+        "--data-file",
+        str(fname),
+        "--region",
+        "test-region",
+        "--availability-zone",
+        "test-az",
+    ]
+
+    result = runner.invoke(cosmos_curator, args)
+
+    assert result.exit_code == 0
+    mock_instance.nvcf_helper_deploy_function.assert_called_once()
+    assert mock_instance.nvcf_helper_deploy_function.call_args.args[2] is None
+    assert mock_instance.nvcf_helper_deploy_function.call_args.kwargs["regions"] == ["test-region"]
+    assert mock_instance.nvcf_helper_deploy_function.call_args.kwargs["availability_zones"] == ["test-az"]
+
+
+@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
+def test_deploy_function_omits_config_backend_when_backend_option_is_omitted(
+    mock_cc: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Test deploy-function can omit backend even when config has a default backend."""
+    monkeypatch.delenv("NVCF_BACKEND", raising=False)
+    mock_instance = MagicMock()
+    mock_func = MagicMock(return_value=mock_instance)
+    mock_cc.return_value = {"function": {"help": "A fake function", "type": mock_func}}
+
+    fname = tmp_path / "fake.json"
+    fname.touch()
+
+    mock_instance.id_version.return_value = (True, 1234, 5678)
+    mock_instance.get_cluster.return_value = (True, "configured-backend", "test-gpu", "test-instance")
 
     args = [
         "nvcf",
@@ -92,20 +163,10 @@ def test_deploy_function_no_backend_gpu_instance(mock_cc: MagicMock, tmp_path: P
     ]
 
     result = runner.invoke(cosmos_curator, args)
-    mock_instance.logger.error.assert_called_with("Could not deploy function: backend is required")
-    assert result.exit_code != 0
 
-    # Mock return values to test gpu = None
-    mock_instance.get_cluster.return_value = (True, True, None, None)
-    result = runner.invoke(cosmos_curator, args)
-    mock_instance.logger.error.assert_called_with("Could not deploy function: gpu is required")
-    assert result.exit_code != 0
-
-    # Mock return values to test instance = None
-    mock_instance.get_cluster.return_value = (True, True, True, None)
-    result = runner.invoke(cosmos_curator, args)
-    mock_instance.logger.error.assert_called_with("Could not deploy function: instance is required")
-    assert result.exit_code != 0
+    assert result.exit_code == 0
+    mock_instance.nvcf_helper_deploy_function.assert_called_once()
+    assert mock_instance.nvcf_helper_deploy_function.call_args.args[2] is None
 
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")

@@ -663,8 +663,9 @@ def gather_and_upload_outputs(pipeline_type: str, args: argparse.Namespace) -> N
             logger.info("Uploading zipped outputs via single URL …")
             zip_and_upload_directory(output_path, single_url)
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception(f"Failed to gather/upload outputs: {exc}")
+        raise
     finally:
         if "output_split_" in output_path or "output_dedup_" in output_path or "output_annotate_" in output_path:
             with contextlib.suppress(OSError):

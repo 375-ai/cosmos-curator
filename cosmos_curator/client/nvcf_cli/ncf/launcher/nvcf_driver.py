@@ -321,7 +321,7 @@ def nvcf_deploy_function(  # noqa: PLR0913
     backend: Annotated[
         str | None,
         Option(
-            help="The Name of Backend CSP [required]",
+            help="Optional backend/cluster group name",
             rich_help_panel="Deploy",
             envvar="NVCF_BACKEND",
         ),
@@ -340,6 +340,22 @@ def nvcf_deploy_function(  # noqa: PLR0913
             help="The Hardware Instance Type [required]",
             rich_help_panel="Deploy",
             envvar="NVCF_INSTANCE_TYPE",
+        ),
+    ] = None,
+    regions: Annotated[
+        list[str] | None,
+        Option(
+            "--region",
+            help="Region allowed for deployment. May be specified multiple times.",
+            rich_help_panel="Deploy",
+        ),
+    ] = None,
+    availability_zones: Annotated[
+        list[str] | None,
+        Option(
+            "--availability-zone",
+            help="Availability zone allowed for deployment. May be specified multiple times.",
+            rich_help_panel="Deploy",
         ),
     ] = None,
     funcid: Annotated[
@@ -396,9 +412,11 @@ def nvcf_deploy_function(  # noqa: PLR0913
     Args:
         ctx: The Typer context object.
         data_file: JSON file with deployment configuration.
-        backend: Name of the backend CSP.
+        backend: Optional backend or cluster group name.
         gpu: GPU hardware type.
         instance: Hardware instance type.
+        regions: Regions allowed for deployment.
+        availability_zones: Availability zones allowed for deployment.
         funcid: Function ID to deploy.
         version: Function version ID.
         min_instances: Minimum number of instances.
@@ -417,10 +435,8 @@ def nvcf_deploy_function(  # noqa: PLR0913
             error_msg = "id and version are required"
             _raise_runtime_err(error_msg)
 
-        _, backend, gpu, instance = nvcf_hdl.get_cluster(ctx, backend, gpu, instance)
-        if backend is None:
-            error_msg = "backend is required"
-            _raise_runtime_err(error_msg)
+        requested_backend = backend
+        _, _, gpu, instance = nvcf_hdl.get_cluster(ctx, backend, gpu, instance)
         if gpu is None:
             error_msg = "gpu is required"
             _raise_runtime_err(error_msg)
@@ -431,7 +447,7 @@ def nvcf_deploy_function(  # noqa: PLR0913
         _ = nvcf_hdl.nvcf_helper_deploy_function(
             funcid,
             version,
-            backend,
+            requested_backend,
             gpu,
             instance,
             min_instances,
@@ -439,6 +455,8 @@ def nvcf_deploy_function(  # noqa: PLR0913
             max_concurrency,
             data_file,
             instance_count,
+            regions=regions,
+            availability_zones=availability_zones,
         )
         nvcf_hdl.console.print(
             f"Function with id '{funcid}' and version '{version}' is being deployed; "

@@ -667,6 +667,45 @@ def test_nvcf_helper_deploy_function_no_data(monkeypatch: MonkeyPatch, tmp_path:
     )
 
 
+def test_nvcf_helper_deploy_function_omits_clusters_without_backend(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Test deploy payload can rely on regions/AZs without backend clusters."""
+    mock_ncg_client = MagicMock()
+    mock_ncg_client.post.return_value = NVCFResponse(
+        {"status": 200, "deployment": {"id": "test-id", "version": "test-version"}}
+    )
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.ncg_api_hdl = mock_ncg_client
+
+    tmp_file = tmp_path / "test-data.json"
+    with Path.open(tmp_file, "w") as f:
+        json.dump({"configuration": {"replicas": 1, "metrics": {"extraExternalLabels": {}}}}, f)
+
+    nvcf_helper.nvcf_helper_deploy_function(
+        funcid="test-id",
+        version="test-version",
+        backend=None,
+        gpu="test-gpu",
+        instance="test-instance",
+        data_file=str(tmp_file),
+        min_instances=1,
+        max_instances=2,
+        max_concurrency=3,
+        regions=["test-region"],
+        availability_zones=["test-az"],
+    )
+
+    spec = mock_ncg_client.post.call_args.kwargs["data"]["deploymentSpecifications"][0]
+    assert "clusters" not in spec
+    assert spec["regions"] == ["test-region"]
+    assert spec["availabilityZones"] == ["test-az"]
+    labels = spec["configuration"]["metrics"]["extraExternalLabels"]
+    assert "backend" not in labels
+    assert labels["regions"] == "test-region"
+    assert labels["availability_zones"] == "test-az"
+
+
 def test_nvcf_helper_deploy_function_with_data(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     """Test that nvcf_helper_deploy_function returns the expected dictionary on success.
 
@@ -745,6 +784,8 @@ def test_nvcf_helper_deploy_function_with_data(monkeypatch: MonkeyPatch, tmp_pat
                             "version_id": "test-version",
                             "gpu": "test-gpu",
                             "org": "",
+                            "regions": "test-region",
+                            "availability_zones": "test-availability-zone",
                         }
                     },
                 },
@@ -911,7 +952,6 @@ def test_nvcf_helper_invoke_batch_fail(monkeypatch: MonkeyPatch, tmp_path: Path)
         (NVCFResponse({"status": 500}), RuntimeError),
         (NVCFResponse({"status": 400, "timeout": True}), TimeoutError),
         (NVCFResponse({"status": 400, "detail": "test-detail"}), RuntimeError),
-        (NVCFResponse({"status": 200, "headers": {}}), RuntimeError),
     ],
 )
 def test_nvcf_helper_invoke_function_failures(
@@ -932,6 +972,7 @@ def test_nvcf_helper_invoke_function_failures(
     mock_nvcf_client = MagicMock()
     mock_nvcf_client.post.return_value = response
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
@@ -967,6 +1008,7 @@ def test_nvcf_helper_invoke_function_success(monkeypatch: MonkeyPatch, tmp_path:
         }
     )
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
@@ -1007,10 +1049,10 @@ def test_nvcf_helper_invoke_function_success(monkeypatch: MonkeyPatch, tmp_path:
     assert result is not None
     assert result["status"] == "test-status"
     assert result["reqid"] == "test-reqid"
-    assert mock_nvcf_client.post.call_args[0][0] == "/v2/nvcf/pexec/functions/test-id"
-    assert mock_nvcf_client.post.call_args[1]["extra_head"] is None
+    assert mock_nvcf_client.post.call_args[0][0] == "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline"
+    assert mock_nvcf_client.post.call_args[1]["extra_head"] == {"CURATOR-DIRECT-MODE": "true"}
     assert mock_nvcf_client.post.call_args[1]["addl_headers"]
-    assert mock_nvcf_client.post.call_args[1]["enable_504"]
+    assert mock_nvcf_client.post.call_args[1]["full_url"]
 
     # Test with location
     mock_nvcf_client.post.return_value = NVCFResponse(
@@ -1066,14 +1108,15 @@ def test_nvcf_helper_get_request_status_failures(
 
     """
     mock_nvcf_client = MagicMock()
-    mock_nvcf_client.get.return_value = response
+    mock_nvcf_client.post.return_value = response
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
 
     with pytest.raises(exception):
-        nvcf_helper.nvcf_helper_get_request_status(reqid="test-reqid", ddir="")
+        nvcf_helper.nvcf_helper_get_request_status(reqid="test-reqid", ddir="", funcid="test-id")
 
 
 def test_nvcf_helper_get_request_status_success(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
@@ -1088,30 +1131,455 @@ def test_nvcf_helper_get_request_status_success(monkeypatch: MonkeyPatch, tmp_pa
 
     """
     mock_nvcf_client = MagicMock()
-    mock_nvcf_client.get.return_value = NVCFResponse(
+    mock_nvcf_client.post.return_value = NVCFResponse(
         {
             "status": 200,
             "headers": {
-                "test-header": "test-value",
                 "reqid": "test-reqid",
-                "pct": "test-pct",
-                "status": "test-status",
-                "location": "test-location",
+                "pct": "42.0",
+                "status": "in-progress",
             },
+            "invoke-based-status": "in-progress",
         }
     )
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
     mock_nvcf_client.download.return_value = None
 
-    result = nvcf_helper.nvcf_helper_get_request_status(reqid="test-reqid", ddir=str(tmp_path))
+    result = nvcf_helper.nvcf_helper_get_request_status(
+        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version"
+    )
     assert result is not None
-    assert result["status"] == "test-status"
+    assert result["status"] == "in-progress"
     assert result["reqid"] == "test-reqid"
-    assert mock_nvcf_client.get.call_args[0][0] == "/v2/nvcf/pexec/status/test-reqid"
-    mock_nvcf_client.download.assert_called_once()
+    assert mock_nvcf_client.post.call_args[0][0] == "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline"
+    assert mock_nvcf_client.post.call_args[1]["extra_head"] == {
+        "CURATOR-NVCF-REQID": "test-reqid",
+        "CURATOR-STATUS-CHECK": "true",
+    }
+    mock_nvcf_client.download.assert_not_called()
+
+
+def test_nvcf_helper_invoke_function_can_use_pexec(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Test invocation can use the legacy pexec endpoint during migration."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}
+    )
+
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "pexec")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+
+    assert result["reqid"] == "test-reqid"
+    mock_nvcf_client.post.assert_called_once_with(
+        "/v2/nvcf/pexec/functions/test-id/versions/test-version",
+        data={},
+        extra_head=None,
+        timeout=15,
+        addl_headers=True,
+        enable_504=True,
+    )
+
+
+def test_nvcf_helper_pexec_invocation_requires_request_headers(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Test pexec invocation keeps the old requirement for request tracking headers."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse({"status": 200, "headers": {}})
+
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "pexec")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    with pytest.raises(RuntimeError, match="missing request status headers"):
+        nvcf_helper.nvcf_helper_invoke_function(
+            funcid="test-id",
+            ddir=str(tmp_path),
+            version="test-version",
+            data_file=None,
+            prompt_file=None,
+            asset_id=None,
+            s3_config=None,
+        )
+
+
+def test_nvcf_helper_direct_invocation_allows_synchronous_success_without_tracking_fields(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test direct invocation can complete in the HTTP response without later polling."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse({"status": 200, "headers": {}})
+
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+
+    assert result == {"reqid": "direct-invocation", "status": "fulfilled"}
+
+
+def test_nvcf_helper_direct_invocation_uses_async_tracking_fields_from_body(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test direct async invocation can track requests even when headers are missing."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {"status": 200, "headers": {}, "reqid": "test-reqid", "body-status": "in-progress"}
+    )
+
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+
+    assert result == {"reqid": "test-reqid", "status": "in-progress"}
+
+
+def test_nvcf_helper_direct_invocation_rejects_async_status_without_request_id(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test direct async invocation cannot poll a non-terminal response without a reqid."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse({"status": 200, "headers": {}, "body-status": "in-progress"})
+
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    with pytest.raises(RuntimeError, match="without a request id"):
+        nvcf_helper.nvcf_helper_invoke_function(
+            funcid="test-id",
+            ddir=str(tmp_path),
+            version="test-version",
+            data_file=None,
+            prompt_file=None,
+            asset_id=None,
+            s3_config=None,
+        )
+
+
+def test_nvcf_helper_auto_invocation_falls_back_to_direct_status(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Test default auto invocation tries pexec first and falls back to direct status."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        NVCFResponse({"status": 410, "detail": "pexec deprecated"}),
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}),
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "100.0", "status": "fulfilled"}}),
+    ]
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+    assert result["reqid"] == "test-reqid"
+
+    status = nvcf_helper.nvcf_helper_get_request_status(
+        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version"
+    )
+
+    assert status is not None
+    assert status["status"] == "fulfilled"
+    assert mock_nvcf_client.post.call_args_list[0].args[0] == "/v2/nvcf/pexec/functions/test-id/versions/test-version"
+    assert (
+        mock_nvcf_client.post.call_args_list[1].args[0]
+        == "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline"
+    )
+    assert mock_nvcf_client.post.call_args_list[1].kwargs["full_url"]
+    assert mock_nvcf_client.post.call_args_list[2].kwargs["extra_head"] == {
+        "CURATOR-NVCF-REQID": "test-reqid",
+        "CURATOR-STATUS-CHECK": "true",
+    }
+    assert mock_nvcf_client.post.call_args_list[2].kwargs["full_url"]
+    mock_nvcf_client.get.assert_not_called()
+
+
+def test_nvcf_helper_auto_invocation_does_not_fallback_after_pexec_timeout(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test pexec invocation timeout is not retried as direct invocation."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse({"status": 504, "timeout": True})
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    with pytest.raises(TimeoutError):
+        nvcf_helper.nvcf_helper_invoke_function(
+            funcid="test-id",
+            ddir=str(tmp_path),
+            version="test-version",
+            data_file=None,
+            prompt_file=None,
+            asset_id=None,
+            s3_config=None,
+        )
+
+    mock_nvcf_client.post.assert_called_once()
+
+
+def test_nvcf_helper_auto_status_preserves_non_legacy_direct_status(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """Test default auto status keeps the old non-legacy direct status path."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}),
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "100.0", "status": "fulfilled"}}),
+    ]
+    mock_nvcf_client.get.return_value = NVCFResponse({"status": 504, "timeout": True})
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+    assert result["status"] == "in-progress"
+
+    status = nvcf_helper.nvcf_helper_get_request_status(
+        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version"
+    )
+
+    assert status is not None
+    assert status["status"] == "fulfilled"
+    assert mock_nvcf_client.post.call_count == 2
+    mock_nvcf_client.get.assert_not_called()
+    mock_nvcf_client.post.assert_any_call(
+        "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline",
+        extra_head={"CURATOR-NVCF-REQID": "test-reqid", "CURATOR-STATUS-CHECK": "true"},
+        addl_headers=True,
+        full_url=True,
+    )
+
+
+def test_nvcf_helper_auto_legacy_status_from_pexec_invoke_does_not_fallback_after_timeout(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test pexec-invoked requests keep pexec status timeout behavior."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}
+    )
+    mock_nvcf_client.get.return_value = NVCFResponse({"status": 504, "timeout": True})
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+    assert result["status"] == "in-progress"
+
+    with pytest.raises(TimeoutError):
+        nvcf_helper.nvcf_helper_get_request_status(
+            reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version", legacy_cf=True
+        )
+
+    mock_nvcf_client.post.assert_called_once()
+    mock_nvcf_client.get.assert_called_once_with(
+        "/v2/nvcf/pexec/status/test-reqid", timeout=15, addl_headers=True, enable_504=True
+    )
+    assert "test-reqid" not in nvcf_helper._direct_fallback_reqids
+
+
+def test_nvcf_helper_auto_status_without_invoke_provenance_falls_back_to_direct_when_pexec_is_gone(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test status-only auto fallback is still available when pexec is unavailable."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.get.return_value = NVCFResponse({"status": 410, "detail": "pexec deprecated"})
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {"status": 200, "headers": {"reqid": "test-reqid", "pct": "100.0", "status": "fulfilled"}}
+    )
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    status = nvcf_helper.nvcf_helper_get_request_status(
+        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version", legacy_cf=True
+    )
+
+    assert status is not None
+    assert status["status"] == "fulfilled"
+    mock_nvcf_client.get.assert_called_once_with(
+        "/v2/nvcf/pexec/status/test-reqid", timeout=15, addl_headers=True, enable_504=True
+    )
+    mock_nvcf_client.post.assert_called_once_with(
+        "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline",
+        extra_head={"CURATOR-NVCF-REQID": "test-reqid", "CURATOR-STATUS-CHECK": "true"},
+        addl_headers=True,
+        full_url=True,
+    )
+    assert "test-reqid" in nvcf_helper._direct_fallback_reqids
+
+
+def test_nvcf_helper_auto_status_without_invoke_provenance_does_not_fallback_after_timeout(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test status-only auto preserves old pexec timeout behavior."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.get.return_value = NVCFResponse({"status": 504, "timeout": True})
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    with pytest.raises(TimeoutError):
+        nvcf_helper.nvcf_helper_get_request_status(
+            reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version", legacy_cf=True
+        )
+
+    mock_nvcf_client.post.assert_not_called()
+    assert "test-reqid" not in nvcf_helper._direct_fallback_reqids
+
+
+def test_nvcf_helper_auto_asset_probe_timeout_does_not_fallback_to_direct(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test post-fulfilled asset probe timeout is not treated as direct fallback."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}),
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "100.0", "status": "fulfilled"}}),
+    ]
+    mock_nvcf_client.get.return_value = NVCFResponse({"status": 504, "timeout": True})
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+    )
+    assert result["status"] == "in-progress"
+
+    nvcf_helper.nvcf_helper_get_request_status_with_wait(
+        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version"
+    )
+
+    assert mock_nvcf_client.post.call_count == 2
+    mock_nvcf_client.post.assert_any_call(
+        "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline",
+        extra_head={"CURATOR-NVCF-REQID": "test-reqid", "CURATOR-STATUS-CHECK": "true"},
+        addl_headers=True,
+        full_url=True,
+    )
+    mock_nvcf_client.get.assert_called_once_with(
+        "/v2/nvcf/pexec/status/test-reqid", timeout=15, addl_headers=True, enable_504=True
+    )
+    assert "test-reqid" not in nvcf_helper._direct_fallback_reqids
+    assert "test-reqid" in nvcf_helper._pexec_invocation_reqids
+
+
+def test_nvcf_helper_invoke_wait_does_not_poll_after_direct_invocation(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test direct invocation wait path does not call deprecated status polling."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = NVCFResponse(
+        {
+            "status": 200,
+            "headers": {
+                "reqid": "test-reqid",
+                "pct": "100.0",
+                "status": "fulfilled",
+            },
+        }
+    )
+
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    nvcf_helper.nvcf_helper_invoke_wait_retry_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        asset_id=None,
+        s3_config=None,
+        legacy_cf=False,
+        wait=True,
+        retry_cnt=1,
+        retry_delay=1,
+    )
+
+    mock_nvcf_client.post.assert_called_once()
+    mock_nvcf_client.get.assert_not_called()
 
 
 def test_nvcf_helper_invoke_batch_success(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
@@ -1132,13 +1600,13 @@ def test_nvcf_helper_invoke_batch_success(monkeypatch: MonkeyPatch, tmp_path: Pa
             "headers": {
                 "test-header": "test-value",
                 "reqid": "test-reqid",
-                "pct": "test-pct",
-                "status": "test-status",
-                "location": "test-location",
+                "pct": "100.0",
+                "status": "fulfilled",
             },
         }
     )
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
@@ -1204,14 +1672,15 @@ def test_nvcf_helper_get_request_status_with_wait_get_failures(
 
     """
     mock_nvcf_client = MagicMock()
-    mock_nvcf_client.get.return_value = response
+    mock_nvcf_client.post.return_value = response
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
 
     with pytest.raises(exception):
-        nvcf_helper.nvcf_helper_get_request_status_with_wait(reqid="test-reqid", ddir="")
+        nvcf_helper.nvcf_helper_get_request_status_with_wait(reqid="test-reqid", ddir="", funcid="test-id")
 
 
 def test_nvcf_helper_get_request_status_with_wait_success(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
@@ -1223,27 +1692,34 @@ def test_nvcf_helper_get_request_status_with_wait_success(monkeypatch: MonkeyPat
 
     """
     mock_nvcf_client = MagicMock()
-    mock_nvcf_client.get.return_value = NVCFResponse(
+    mock_nvcf_client.post.return_value = NVCFResponse(
         {
             "status": 200,
             "headers": {
                 "test-header": "test-value",
                 "reqid": "test-reqid",
-                "pct": "test-pct",
-                "status": "test-status",
-                "location": "test-location",
-                "zip": "test-zip",
+                "pct": "100.0",
+                "status": "fulfilled",
             },
+            "invoke-based-status": "fulfilled",
         }
     )
 
+    monkeypatch.setenv("NVCF_INVOCATION_MODE", "direct")
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
     nvcf_helper.nvcf_api_hdl = mock_nvcf_client
 
     # Happy Path
-    nvcf_helper.nvcf_helper_get_request_status_with_wait(reqid="test-reqid", ddir=str(tmp_path), wait=False)
-    mock_nvcf_client.get.assert_called_once()
+    nvcf_helper.nvcf_helper_get_request_status_with_wait(
+        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", wait=False
+    )
+    mock_nvcf_client.post.assert_called_with(
+        "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline",
+        extra_head={"CURATOR-NVCF-REQID": "test-reqid", "CURATOR-STATUS-CHECK": "true"},
+        addl_headers=True,
+        full_url=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1536,9 +2012,10 @@ def test_nvcf_helper_get_request_status_new_success(monkeypatch: MonkeyPatch, tm
             "headers": {
                 "test-header": "test-value",
                 "reqid": "test-reqid",
-                "pct": 100,
-                "status": "test-status",
+                "pct": "100.0",
+                "status": "fulfilled",
             },
+            "invoke-based-status": "fulfilled",
         }
     )
 
@@ -1551,7 +2028,7 @@ def test_nvcf_helper_get_request_status_new_success(monkeypatch: MonkeyPatch, tm
     )
     assert result is not None
     assert result["reqid"] == "test-reqid"
-    assert result["status"] == "test-status"
+    assert result["status"] == "fulfilled"
 
 
 @pytest.mark.parametrize(

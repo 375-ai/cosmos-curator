@@ -216,6 +216,31 @@ def test_nvcf_client_post() -> None:
     assert response.status == _OK
 
 
+def test_nvcf_client_post_uses_full_url_without_poll_header() -> None:
+    """Test posting to a full URL without NVCF pexec polling headers."""
+    client = NvcfClient(logger=MagicMock(), url="testurl")
+
+    mock_response = MagicMock()
+    mock_response.status_code = _OK
+    mock_response.json.return_value = {"message": "ok"}
+    mock_response.text = json.dumps({"message": "ok"})
+    mock_response.headers = {}
+
+    client.ses.post = MagicMock(return_value=mock_response)
+
+    response = client.post(
+        "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline",
+        data={"test": "test"},
+        full_url=True,
+    )
+
+    assert response is not None
+    assert response.status == _OK
+    client.ses.post.assert_called_once()
+    assert client.ses.post.call_args.args[0] == "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline"
+    assert "NVCF-POLL-SECONDS" not in client.ses.post.call_args.kwargs["headers"]
+
+
 def test_nvcf_client_put() -> None:
     """Test nvcf client put."""
     client = NvcfClient(logger=MagicMock(), url="testurl")

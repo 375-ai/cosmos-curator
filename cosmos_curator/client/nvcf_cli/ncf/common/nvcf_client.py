@@ -314,23 +314,27 @@ class NvcfClient:
         *,
         addl_headers: bool = False,
         enable_504: bool = False,
+        full_url: bool = False,
     ) -> NVCFResponse | None:
         """Make a POST request to the NVCF API.
 
         Args:
-            endpoint: API endpoint to request
+            endpoint: API endpoint to request, or full URL when full_url is True
             data: Optional data to send in the request body
             timeout: Request timeout in seconds (-1 for no timeout)
             extra_head: Optional additional headers to include
             addl_headers: Whether to include additional headers
             enable_504: Whether to enable special handling for 504 responses
+            full_url: Whether endpoint already contains the full URL
 
         Returns:
             NVCFResponse object or None if the request fails
 
         """
-        url = f"{self.url}{endpoint}"
+        url = endpoint if full_url else f"{self.url}{endpoint}"
         hdrs = None
+        if full_url:
+            hdrs = copy.deepcopy(self.headers)
         if timeout > -1:
             hdrs = copy.deepcopy(self.headers)
             hdrs["NVCF-POLL-SECONDS"] = str(timeout)
