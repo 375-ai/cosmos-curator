@@ -23,7 +23,7 @@ from cosmos_curator.pipelines.video.clipping.transnetv2_extraction_stages import
 from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_transnetv2_requires_frame_extraction(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -34,7 +34,7 @@ def test_transnetv2_requires_frame_extraction(
     assert len(result_tasks[0].video.clips) == 0
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_transnetv2_default_extraction(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -63,7 +63,7 @@ def test_transnetv2_default_extraction(
     assert "TransNetV2ClipExtractionStage" in result_tasks[0].stage_perf
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_transnetv2_no_transitions_entire_scene_false(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -77,7 +77,7 @@ def test_transnetv2_no_transitions_entire_scene_false(
     assert len(video.clips) == 0
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_transnetv2_entire_scene_when_no_transitions(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -95,7 +95,7 @@ def test_transnetv2_entire_scene_when_no_transitions(
     assert end == pytest.approx(duration, abs=1e-2)
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_transnetv2_limit_clips(sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface) -> None:
     """Test that limit_clips parameter limits the number of extracted clips."""
     stages = [

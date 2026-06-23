@@ -26,7 +26,7 @@ from cosmos_curator.pipelines.video.utils.decoder_utils import extract_video_met
 _FIXTURE_CLIP = Path(__file__).parents[2] / "pipelines" / "video" / "data" / "test_clip_10s.mp4"
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_write_emits_mp4_and_json(tmp_path: Path) -> None:
     """Writer emits both ``clips/{uuid}.mp4`` and ``metas/v0/{uuid}.json``."""
     clip_bytes = _FIXTURE_CLIP.read_bytes()
@@ -88,7 +88,7 @@ def test_write_emits_mp4_and_json(tmp_path: Path) -> None:
     }
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_write_without_metadata_can_keep_clip_bytes(tmp_path: Path) -> None:
     """Captioning path writes MP4 first, keeps bytes, and defers metadata JSON."""
     clip_bytes = _FIXTURE_CLIP.read_bytes()

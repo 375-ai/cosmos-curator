@@ -14,7 +14,7 @@
 # limitations under the License.
 """Integration tests for timestamp population using real video samples.
 
-These tests are env-gated (cosmos-curator environment) and require ffprobe/ffmpeg
+These tests are env-gated (default environment) and require ffprobe/ffmpeg
 on PATH. They are excluded from the default CPU test selection and must be run
 explicitly or via the env-marked suite:
 
@@ -40,7 +40,7 @@ _SAMPLE_VIDEO_PATH = _FIXTURES_DIR / "test_video_30s.mp4"
 
 _DURATION_TOLERANCE_S = 0.1
 
-pytestmark = pytest.mark.env("cosmos-curator")
+pytestmark = pytest.mark.env("default")
 
 
 def _make_downloader() -> VideoDownloader:

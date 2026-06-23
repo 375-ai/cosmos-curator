@@ -97,7 +97,7 @@ def test_fixed_stride_extractor_custom_parameters() -> None:
     assert stage._log_stats is True
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_fixed_stride_extraction_default_parameters(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -143,7 +143,7 @@ def test_fixed_stride_extraction_default_parameters(
     assert "FixedStrideExtractorStage" in result_task.stage_perf
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_fixed_stride_extraction_5s_stride(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -187,7 +187,7 @@ def test_fixed_stride_extraction_5s_stride(
             assert clip_span[1] == pytest.approx(expected_span[1], abs=0.01)
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_fixed_stride_extraction_overlapping_clips(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -241,7 +241,7 @@ def test_fixed_stride_extraction_overlapping_clips(
             assert clip_span[1] == pytest.approx(expected_span[1], abs=0.01)
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_fixed_stride_extraction_with_limit(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -283,7 +283,7 @@ def test_fixed_stride_extraction_with_limit(
         assert clip_span[1] == pytest.approx(expected_span[1], abs=0.01)
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_fixed_stride_extraction_min_clip_length(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface
 ) -> None:
@@ -402,7 +402,7 @@ def test_error_handling_incomplete_metadata(sequential_runner: RunnerInterface) 
     assert len(video.clips) == 0
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_clip_uuid_generation(sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface) -> None:
     """Test that clip UUIDs are generated consistently and uniquely.
 
@@ -437,7 +437,7 @@ def test_clip_uuid_generation(sample_splitting_task: SplitPipeTask, sequential_r
     assert len(uuids) == len(set(uuids))  # All UUIDs are unique
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_clip_properties(sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface) -> None:
     """Test that extracted clips have correct properties.
 
@@ -479,7 +479,7 @@ def test_clip_properties(sample_splitting_task: SplitPipeTask, sequential_runner
         assert clip_duration <= stage.clip_len_s + 0.01  # Small tolerance
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_verbose_logging(
     sample_splitting_task: SplitPipeTask, sequential_runner: RunnerInterface, caplog: pytest.LogCaptureFixture
 ) -> None:

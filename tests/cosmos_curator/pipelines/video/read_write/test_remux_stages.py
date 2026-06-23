@@ -92,14 +92,14 @@ def synthetic_mkv_video() -> io.BytesIO:
     return _make_synthetic_video("matroska")
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_remux_bad_encoded_data() -> None:
     """Test that remuxing fails if encoded_data is not set."""
     with pytest.raises(RuntimeError):
         remux_to_mp4(b"", threads=1)
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_remux_if_needed_mp4_no_change(synthetic_mp4_video: io.BytesIO) -> None:
     """Test that MP4 videos are not remuxed."""
     # Arrange
@@ -115,7 +115,7 @@ def test_remux_if_needed_mp4_no_change(synthetic_mp4_video: io.BytesIO) -> None:
     assert np.array_equal(video.encoded_data.resolve(), original_data)  # Should be unchanged
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_remux_if_needed_mpegts_to_mp4(synthetic_mpegts_video: io.BytesIO) -> None:
     """Test that MPEG-TS videos are remuxed to MP4."""
     # Arrange
@@ -146,7 +146,7 @@ def test_remux_if_needed_mpegts_to_mp4(synthetic_mpegts_video: io.BytesIO) -> No
         assert len(container.streams.video) > 0
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_remux_if_needed_avi_to_mp4(synthetic_avi_video: io.BytesIO) -> None:
     """Test that AVI videos are unchanged."""
     # Arrange
@@ -175,7 +175,7 @@ def test_remux_if_needed_avi_to_mp4(synthetic_avi_video: io.BytesIO) -> None:
         assert len(container.streams.video) > 0
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_remux_if_needed_mkv_to_mp4(synthetic_mkv_video: io.BytesIO) -> None:
     """Test that MKV videos are unchanged."""
     # Arrange
@@ -205,7 +205,7 @@ def test_remux_if_needed_mkv_to_mp4(synthetic_mkv_video: io.BytesIO) -> None:
         assert len(container.streams.video) > 0
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_remux_if_needed_preserves_video_content(synthetic_mpegts_video: io.BytesIO) -> None:
     """Test that remuxing preserves the actual video content."""
 

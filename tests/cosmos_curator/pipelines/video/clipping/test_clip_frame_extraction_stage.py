@@ -219,7 +219,7 @@ def test_split_parser_and_assemble_stages_pass_clip_extraction_decoder_mode() ->
     assert extraction_stages[0]._decoder_mode == ClipFrameExtractionStage.CAMERA_SENSOR_DECODER_MODE
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_clip_frame_extraction_stage_compare_camera_sensor_matches_default(
     tmp_path: Path, sample_clip_data: bytes
 ) -> None:
@@ -261,7 +261,7 @@ def test_clip_frame_extraction_stage_compare_camera_sensor_matches_default(
     assert report_path.exists()
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_clip_frame_extraction_camera_sensor_matches_default_backend_exactly(
     tmp_path: Path, sample_clip_data: bytes
 ) -> None:
@@ -300,7 +300,7 @@ def test_clip_frame_extraction_camera_sensor_matches_default_backend_exactly(
         np.testing.assert_array_equal(golden[key], candidate[key])
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_clip_frame_extraction_camera_sensor_matches_default_backend_exactly_multi_fps(
     tmp_path: Path, sample_clip_data: bytes
 ) -> None:
@@ -339,7 +339,7 @@ def test_clip_frame_extraction_camera_sensor_matches_default_backend_exactly_mul
         np.testing.assert_array_equal(golden[key], candidate[key])
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_clip_frame_extraction_camera_sensor_matches_default_backend_exactly_with_resize(
     tmp_path: Path, sample_clip_data: bytes
 ) -> None:

@@ -133,7 +133,7 @@ def motion_filter_stage() -> MotionFilterStage:
     )
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_motion_vector_decode(
     motion_decode_stage: MotionVectorDecodeStage,
     sample_filtering_task: SplitPipeTask,
@@ -169,7 +169,7 @@ def test_motion_vector_decode(
     assert "MotionVectorDecodeStage" in result_task.stage_perf
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 def test_motion_filter_calculation(
     motion_decode_stage: MotionVectorDecodeStage,
     motion_filter_stage: MotionFilterStage,
@@ -213,7 +213,7 @@ def test_motion_filter_calculation(
     assert "MotionFilterStage" in result_task.stage_perf
 
 
-@pytest.mark.env("cosmos-curator")
+@pytest.mark.env("default")
 @pytest.mark.parametrize(
     ("global_threshold", "patch_threshold", "should_be_filtered"),
     [
