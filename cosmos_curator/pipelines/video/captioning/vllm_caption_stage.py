@@ -54,6 +54,7 @@ from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.core.utils.model import model_utils, pixi_utils
 from cosmos_curator.models.all_models import get_all_models_by_id
 from cosmos_curator.models.prompts import get_prompt, get_stage2_prompt
+from cosmos_curator.models.vllm_exceptions import FatalVllmDecodeError
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
@@ -1172,7 +1173,11 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         major_size = sum(task.get_major_size() for task in tasks)
         self._timer.reinit(self, major_size)
 
-        @tenacity.retry(stop=tenacity.stop_after_attempt(self._vllm_config.max_retries), reraise=True)
+        @tenacity.retry(
+            stop=tenacity.stop_after_attempt(self._vllm_config.max_retries),
+            reraise=True,
+            retry=tenacity.retry_if_not_exception_type(FatalVllmDecodeError),
+        )
         def _vllm_caption(
             model_inputs: list[dict[str, Any]], stage2_prompts: list[str | None]
         ) -> list["VllmWindowResult"]:
@@ -1187,6 +1192,8 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
                     max_inflight_requests=self._max_inflight_requests,
                     stage2_prompts=stage2_prompts,
                 )
+            except FatalVllmDecodeError:
+                raise
             except Exception as e:
                 input_videos = [str(get_video_from_task(t).input_video) for t in tasks]
                 input_videos_str = ", ".join(input_videos)
@@ -1219,6 +1226,8 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
             # Generate captions
             try:
                 results = _vllm_caption(model_inputs, stage2_prompts)
+            except FatalVllmDecodeError:
+                raise
             except Exception:  # noqa: BLE001
                 logger.error(f"All {self._vllm_config.max_retries} retry attempts exhausted; captioning failed")
                 results = [

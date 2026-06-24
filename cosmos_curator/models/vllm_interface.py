@@ -117,6 +117,7 @@ from cosmos_curator.core.utils.misc import grouping
 from cosmos_curator.models.vllm_cosmos3_omni import VllmCosmos3NanoOmniVL, VllmCosmos3SuperOmniVL
 from cosmos_curator.models.vllm_cosmos_reason1_vl import VllmCosmosReason1VL
 from cosmos_curator.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
+from cosmos_curator.models.vllm_exceptions import FatalVllmDecodeError
 from cosmos_curator.models.vllm_nemotron import VllmNemotronNano12Bv2VL
 from cosmos_curator.models.vllm_plugin import VllmPlugin
 from cosmos_curator.models.vllm_qwen import (
@@ -987,10 +988,11 @@ class _AsyncCaptioner:
         """Route one completed task to stage-2 dispatch, final emit, or sentinel on failure."""
         req = self._pending.pop(task)
         phase = self._phase.pop(task)
-        # task.result() re-raises EngineDeadError so the caller restarts the actor.
+        # task.result() re-raises fatal errors so the caller restarts or fails the actor.
         try:
             req = task.result()
-        except EngineDeadError:
+        except (EngineDeadError, FatalVllmDecodeError):
+            req.inputs = None  # type: ignore[assignment]
             raise
         except Exception as exc:  # noqa: BLE001 - per-window containment
             idx = self._request_id_to_index[req.request_id]
@@ -1016,6 +1018,9 @@ class _AsyncCaptioner:
         # Build refined request for stage-2 refinement.
         try:
             refined = self.plugin.make_refined_llm_request(req, self.processor, req.stage2_prompt)
+        except FatalVllmDecodeError:
+            req.inputs = None  # type: ignore[assignment]
+            raise
         except Exception as exc:  # noqa: BLE001 - per-window containment
             self._emit_unknown(idx)
             if self.on_window_error is not None:

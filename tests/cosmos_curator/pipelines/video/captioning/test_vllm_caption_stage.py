@@ -26,6 +26,7 @@ import psutil
 import pytest
 
 from cosmos_curator.core.utils.model import pixi_utils
+from cosmos_curator.models.vllm_exceptions import ReasoningOutputTruncatedError
 from cosmos_curator.models.vllm_model_ids import _VLLM_MODELS
 from cosmos_curator.models.vllm_sentinels import VLLM_UNKNOWN_CAPTION
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
@@ -516,6 +517,34 @@ def test_process_data_skips_caption_quality_flags_for_filter_windows(monkeypatch
     quality_mock, _ = _process_caption_stage_with_quality_patch(monkeypatch, use_filter_windows=True)
 
     quality_mock.assert_not_called()
+
+
+@pytest.mark.env("default")
+def test_process_data_reraises_fatal_decode_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fatal decode errors should bypass retry cleanup and empty-result fallback."""
+    task = _make_caption_stage_task()
+    stage = vllm_caption_stage.VllmCaptionStage(vllm_config=VllmConfig(model_variant="qwen"))
+    stage._llm = object()  # type: ignore[attr-defined]
+    stage._sampling_params = object()  # type: ignore[attr-defined]
+    stage._processor = object()  # type: ignore[attr-defined]
+    monkeypatch.setattr(stage, "_engine_core_is_alive", lambda: True)
+    monkeypatch.setattr(stage, "_reset", lambda: pytest.fail("fatal decode errors must not reset/retry"))
+
+    calls = 0
+
+    def _raise_fatal(*_args: object, **_kwargs: object) -> list[VllmWindowResult]:
+        nonlocal calls
+        calls += 1
+        msg = "reasoning output was truncated"
+        raise ReasoningOutputTruncatedError(msg)
+
+    monkeypatch.setattr(vllm_caption_stage, "vllm_caption", _raise_fatal, raising=False)
+
+    with pytest.raises(ReasoningOutputTruncatedError, match="reasoning output was truncated"):
+        stage.process_data([task])
+
+    assert calls == 1
+    assert task.video.clips[0].windows[0].caption_status is None
 
 
 @pytest.mark.env("default")

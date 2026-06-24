@@ -31,7 +31,7 @@ These tests require the ``default`` pixi env (vLLM installed).
 """
 
 import importlib
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -48,6 +48,7 @@ from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, Vll
 if pixi_utils.is_running_in_env("default"):
     from cosmos_curator.models import vllm_cosmos3_omni, vllm_cosmos_reason1_vl, vllm_nemotron, vllm_qwen
     from cosmos_curator.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
+    from cosmos_curator.models.vllm_exceptions import ReasoningOutputTruncatedError
 
 
 pytestmark = pytest.mark.env("default")
@@ -249,6 +250,37 @@ def test_cosmos3_omni_uses_native_vllm_architecture() -> None:
         args = vllm_cosmos3_omni.VllmCosmos3NanoOmniVL.model_async(_async_cfg(model_variant="cosmos3_nano"))
 
     assert args.hf_overrides == expected_overrides
+
+
+def test_cosmos3_omni_decode_uses_cosmos3_name_for_truncated_reasoning() -> None:
+    """Cosmos3 inherits Qwen3-style reasoning parsing but should not report itself as Qwen3."""
+    raw_output = MagicMock()
+    raw_output.outputs[0].text = "reasoning without a closing marker"
+    raw_output.outputs[0].finish_reason = "length"
+
+    with pytest.raises(ReasoningOutputTruncatedError, match="Cosmos3 output hit max_tokens"):
+        vllm_cosmos3_omni.VllmCosmos3NanoOmniVL.decode(raw_output)
+
+
+def test_cosmos3_omni_prefills_closed_thinking_tokens() -> None:
+    """Cosmos3 captioning should render a closed reasoning block as an assistant prefill."""
+    prompt_row = MagicMock()
+    prompt_row.tolist.return_value = [101, 102]
+    processor = MagicMock()
+    processor.apply_chat_template.return_value = [prompt_row]
+
+    result = vllm_cosmos3_omni.VllmCosmos3NanoOmniVL.make_llm_input(
+        "Describe the video.",
+        MagicMock(),
+        {"fps": 1.0},
+        processor,
+        VllmConfig(model_variant="cosmos3_nano"),
+    )
+
+    assert result["prompt_token_ids"] == [101, 102]
+    messages = processor.apply_chat_template.call_args.args[0]
+    assert messages[-1] == {"role": "assistant", "content": "<think></think>"}
+    assert processor.apply_chat_template.call_args.kwargs["continue_final_message"] is True
 
 
 @pytest.mark.parametrize(

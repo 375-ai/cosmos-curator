@@ -23,6 +23,7 @@ from cosmos_curator.core.utils.model import pixi_utils
 from cosmos_curator.pipelines.video.utils.data_model import VllmCaptionRequest, VllmConfig
 
 if pixi_utils.is_running_in_env("default"):
+    from cosmos_curator.models.vllm_exceptions import ReasoningOutputTruncatedError
     from cosmos_curator.models.vllm_qwen import (
         VllmQwen,
         VllmQwen3VL,
@@ -393,19 +394,21 @@ def test_strip_qwen3_reasoning(raw_text: str, expected: str) -> None:
 
 
 @pytest.mark.env("default")
-def test_qwen3vl_decode_returns_empty_on_truncated_reasoning() -> None:
-    """Truncation mid-reasoning (finish_reason='length' + no </think>) yields empty.
-
-    Aligns with vLLM's own qwen3_reasoning_parser semantics so the caption pipeline
-    can mark the window as failed (via VLLM_UNKNOWN_CAPTION fallthrough in
-    vllm_interface._make_window_result) rather than persisting reasoning text as
-    a successful caption.
-    """
+def test_qwen3vl_decode_raises_on_truncated_reasoning() -> None:
+    """Truncation mid-reasoning is fatal instead of becoming a per-window failure."""
     raw_output = MagicMock()
     raw_output.outputs[0].text = "The user wants a detailed breakdown. Let me think about this..."
     raw_output.outputs[0].finish_reason = "length"
 
-    assert VllmQwen3VL.decode(raw_output) == ""
+    with pytest.raises(
+        ReasoningOutputTruncatedError, match="before a complete answer could be safely extracted"
+    ) as exc_info:
+        VllmQwen3VL.decode(raw_output)
+
+    msg = str(exc_info.value)
+    assert "output_chars=" in msg
+    assert "output_sha256_prefix=" in msg
+    assert "detailed breakdown" not in msg
 
 
 @pytest.mark.env("default")

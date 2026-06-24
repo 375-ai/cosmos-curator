@@ -34,6 +34,7 @@ if pixi_utils.is_running_in_env("default"):
         make_prompt,
     )
     from cosmos_curator.models.vllm_cosmos_reason2_vl import VllmCosmosReason2VL
+    from cosmos_curator.models.vllm_exceptions import ReasoningOutputTruncatedError
     from cosmos_curator.pipelines.video.utils.vision_process import VIDEO_MIN_PIXELS
 
     _PLUGIN_CLASSES = (VllmCosmosReason1VL, VllmCosmosReason2VL)
@@ -112,6 +113,17 @@ def test_extract_from_reasoning_format() -> None:
     # Fallback if missing tags
     plain = "no tags here"
     assert _extract_from_reasoning_format(plain) == plain
+
+
+@pytest.mark.env("default")
+def test_decode_raises_on_truncated_reasoning() -> None:
+    """Cosmos-Reason should fail fast when max_tokens is exhausted inside reasoning."""
+    raw_output = MagicMock()
+    raw_output.outputs[0].text = "<think>still reasoning without an answer"
+    raw_output.outputs[0].finish_reason = "length"
+
+    with pytest.raises(ReasoningOutputTruncatedError, match="before a complete answer could be safely extracted"):
+        VllmCosmosReason1VL.decode(raw_output)
 
 
 @pytest.mark.env("default")

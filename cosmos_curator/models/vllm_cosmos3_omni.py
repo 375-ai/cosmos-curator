@@ -29,9 +29,9 @@ Reference invocation from the model card::
 We mirror those flags in-process here so the captioner gets the same setup.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from vllm import LLM
+from vllm import LLM, RequestOutput
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 
@@ -42,8 +42,15 @@ from cosmos_curator.models.vllm_qwen import (
     MAX_MODEL_LEN,
     TRUST_REMOTE_CODE,
     VllmQwen3VL,
+    decode_qwen3_reasoning_output,
+    make_message,
+    qwen3_video_size_kwargs,
 )
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig
+
+if TYPE_CHECKING:
+    import torch
+    from transformers import AutoProcessor
 
 # Keep an explicit architecture override so older local Cosmos3 config files
 # downloaded before vLLM's native support still route to the built-in executor.
@@ -51,6 +58,43 @@ _OMNI_HF_OVERRIDES = {"architectures": ["Cosmos3ForConditionalGeneration"]}
 _OMNI_MEDIA_IO_KWARGS = {"video": {"num_frames": -1}}
 _OMNI_ALLOWED_LOCAL_MEDIA_PATH = "/"
 _OMNI_MM_ENCODER_TP_MODE = "data"
+_OMNI_CLOSED_THINKING_PREFILL = "<think></think>"
+
+
+def _make_prompt_with_closed_thinking_prefill(
+    prompt: str,
+    frames: "torch.Tensor",
+    metadata: dict[str, Any],
+    processor: "AutoProcessor",
+    config: VllmConfig,
+) -> dict[str, Any]:
+    """Render a Cosmos3 prompt with a final assistant message prefilled as non-thinking."""
+    user_message = make_message(prompt, use_image=config.use_image_input)
+    prompt_ids = processor.apply_chat_template(  # type: ignore[attr-defined]
+        [
+            user_message,
+            {"role": "assistant", "content": _OMNI_CLOSED_THINKING_PREFILL},
+        ],
+        continue_final_message=True,
+        tokenize=True,
+        return_tensors="pt",
+    )[0].tolist()
+
+    if config.use_image_input:
+        multi_modal_data: dict[str, Any] = {"image": frames}
+    else:
+        multi_modal_data = {"video": [(frames, metadata)]}
+
+    inputs: dict[str, Any] = {
+        "prompt_token_ids": prompt_ids,
+        "multi_modal_data": multi_modal_data,
+    }
+    if config.video_max_pixels_per_frame is not None and not config.use_image_input:
+        inputs["mm_processor_kwargs"] = qwen3_video_size_kwargs(
+            int(frames.shape[0]),
+            config.video_max_pixels_per_frame,
+        )
+    return inputs
 
 
 class VllmCosmos3NanoOmniVL(VllmQwen3VL):
@@ -124,6 +168,22 @@ class VllmCosmos3NanoOmniVL(VllmQwen3VL):
             use_tqdm_on_load=False,
             **extra_kwargs,
         )
+
+    @staticmethod
+    def make_llm_input(
+        prompt: str,
+        frames: "torch.Tensor",
+        metadata: dict[str, Any],
+        processor: "AutoProcessor",
+        config: VllmConfig,
+    ) -> dict[str, Any]:
+        """Make LLM inputs and pre-close Cosmos3's reasoning block for captioning."""
+        return _make_prompt_with_closed_thinking_prefill(prompt, frames, metadata, processor, config)
+
+    @staticmethod
+    def decode(vllm_output: RequestOutput) -> str:
+        """Decode Cosmos3 output, using the Cosmos3 name in reasoning truncation errors."""
+        return decode_qwen3_reasoning_output(vllm_output, model_name="Cosmos3")
 
 
 class VllmCosmos3SuperOmniVL(VllmCosmos3NanoOmniVL):

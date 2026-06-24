@@ -24,6 +24,7 @@ from vllm import LLM, RequestOutput
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 
+from cosmos_curator.models.vllm_exceptions import raise_if_reasoning_output_truncated
 from cosmos_curator.models.vllm_plugin import VllmPlugin
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmCaptionRequest, VllmConfig
 
@@ -320,4 +321,11 @@ class VllmCosmosReason1VL(VllmPlugin):
     @staticmethod
     def decode(vllm_output: RequestOutput) -> str:
         """Decode vLLM output into a caption (extract <answer> section)."""
-        return _extract_from_reasoning_format(vllm_output.outputs[0].text)
+        output = vllm_output.outputs[0]
+        text = str(output.text)
+        raise_if_reasoning_output_truncated(
+            text=text,
+            finish_reason=output.finish_reason,
+            model_name="Cosmos-Reason",
+        )
+        return _extract_from_reasoning_format(text)

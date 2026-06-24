@@ -24,6 +24,7 @@ from vllm import LLM, RequestOutput
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 
+from cosmos_curator.models.vllm_exceptions import raise_if_reasoning_output_truncated
 from cosmos_curator.models.vllm_plugin import VllmPlugin
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmCaptionRequest, VllmConfig
 from cosmos_curator.pipelines.video.utils.vision_process import VIDEO_MIN_PIXELS
@@ -50,6 +51,18 @@ def _strip_qwen3_reasoning(text: str) -> str:
     if "</think>" not in text:
         return text
     return _QWEN3_REASONING_PATTERN.sub("", text, count=1)
+
+
+def decode_qwen3_reasoning_output(vllm_output: RequestOutput, *, model_name: str) -> str:
+    """Decode a Qwen3-style reasoning output, raising on reasoning-only truncation."""
+    output = vllm_output.outputs[0]
+    text = str(output.text)
+    raise_if_reasoning_output_truncated(
+        text=text,
+        finish_reason=output.finish_reason,
+        model_name=model_name,
+    )
+    return _strip_qwen3_reasoning(text)
 
 
 def qwen3_video_size_kwargs(num_frames: int, cap: int) -> dict[str, dict[str, int]]:
@@ -471,16 +484,11 @@ class VllmQwen3VL(VllmQwen):
         Qwen3 reasoning models emit ``<think>...</think>`` before their answer by
         default. This override removes that block so the stored caption is the
         answer payload only. If generation hit ``max_tokens`` before ``</think>``
-        was emitted, the entire output is reasoning-only with no answer; return
-        empty so the caption pipeline marks the window as failed rather than
-        persist reasoning text as caption (matches vLLM's qwen3_reasoning_parser
-        behavior).
+        was emitted, the entire output is reasoning-only with no answer; raise a
+        fatal decode error so the caption pipeline stops instead of recording a
+        misleading per-window exception bucket.
         """
-        output = vllm_output.outputs[0]
-        text = str(output.text)
-        if output.finish_reason == "length" and "</think>" not in text:
-            return ""
-        return _strip_qwen3_reasoning(text)
+        return decode_qwen3_reasoning_output(vllm_output, model_name="Qwen3-VL")
 
 
 class VllmQwen3VL30B(VllmQwen3VL):

@@ -887,6 +887,27 @@ class TestAsyncCaptionerHandleCompletedReleasesInputs:
         assert captioner._results[0].text == VLLM_UNKNOWN_CAPTION
 
     @pytest.mark.asyncio
+    async def test_reraises_fatal_decode_error_without_sentinel(self) -> None:
+        """Fatal decode errors should bypass per-window containment."""
+        from cosmos_curator.models.vllm_exceptions import ReasoningOutputTruncatedError  # noqa: PLC0415
+
+        captioner = self._build_captioner()
+        payload: dict[str, Any] = {"prompt": "p"}
+        req = VllmCaptionRequest(request_id="r1", inputs=payload, stage2_prompt=None)
+
+        task = asyncio.create_task(self._failing_task(ReasoningOutputTruncatedError("truncated reasoning")))
+        await asyncio.sleep(0)
+        captioner._pending[task] = req
+        captioner._phase[task] = "stage1"
+        captioner._request_id_to_index[req.request_id] = 0
+
+        with pytest.raises(ReasoningOutputTruncatedError, match="truncated reasoning"):
+            captioner._handle_completed(task)
+
+        assert req.inputs is None
+        assert captioner._results == {}
+
+    @pytest.mark.asyncio
     async def test_clears_stage1_inputs_after_stage2_spawn(self) -> None:
         """Stage-2 dispatch succeeds -> stage-1 ``req.inputs is None`` (refined owns its own)."""
         import contextlib  # noqa: PLC0415
