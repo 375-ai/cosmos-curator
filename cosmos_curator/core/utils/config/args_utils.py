@@ -24,12 +24,18 @@ _CLI_ONLY_ARGS = ["config_file"]
 def fill_default_args(
     args: argparse.Namespace,
     setup_parser: Callable[[argparse.ArgumentParser], None],
+    omit_dests: frozenset[str] = frozenset(),
 ) -> argparse.Namespace:
     """Fill default arguments.
 
     Args:
         args: The arguments to fill.
         setup_parser: The parser to setup.
+        omit_dests: Destinations to leave untouched. A dest listed here is never
+            backfilled with its parser default, so an argument omitted from a JSON
+            invoke payload stays genuinely absent rather than looking like an
+            explicit CLI invocation. Callers own their own deprecated/pipeline-specific
+            flags via this set.
 
     Returns:
         The filled arguments.
@@ -38,6 +44,8 @@ def fill_default_args(
     parser = argparse.ArgumentParser()
     setup_parser(parser)
     for action in parser._actions:  # noqa: SLF001
+        if action.dest in omit_dests:
+            continue
         if not hasattr(args, action.dest):
             if action.required and action.dest not in _CLI_ONLY_ARGS:
                 error_msg = f"Required argument {action.dest} not provided"

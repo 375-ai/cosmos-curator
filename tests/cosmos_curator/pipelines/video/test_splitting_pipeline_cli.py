@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
+from cosmos_curator.core.utils.config.args_utils import fill_default_args
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.captioning_builders import CaptioningConfig
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
@@ -200,6 +201,38 @@ def test_split_invoke_templates_use_supported_vllm_preprocess_mode() -> None:
 
         assert deprecated_args.isdisjoint(invoke_args), template_path.as_posix()
         assert invoke_args["vllm_preprocess_mode"] == PreprocessMode.CURATOR.value
+
+
+def test_fill_default_args_does_not_inject_qwen_model_does_preprocess() -> None:
+    """JSON config mode must not backfill a falsey default for the deprecated store_true flag."""
+    input_path = Path.cwd() / "tmp-input"
+    output_path = Path.cwd() / "tmp-output"
+    args = argparse.Namespace(
+        input_video_path=input_path.as_posix(),
+        output_clip_path=output_path.as_posix(),
+        vllm_preprocess_mode=PreprocessMode.CURATOR.value,
+    )
+
+    fill_default_args(args, _setup_parser, omit_dests=frozenset({"qwen_model_does_preprocess"}))
+    assert not hasattr(args, "qwen_model_does_preprocess")
+
+
+def test_legacy_qwen_model_does_preprocess_false_in_json_config_is_ignored() -> None:
+    """Pre-migration invoke JSON used ``false`` for the deprecated store_true flag."""
+    args = _caption_args([])
+    args.qwen_model_does_preprocess = False
+    args.vllm_preprocess_mode = PreprocessMode.CURATOR.value
+
+    _assemble_stages(args)
+
+
+def test_legacy_qwen_model_does_preprocess_true_raises_migration_error() -> None:
+    """Explicit legacy model-preprocess opt-in must still fail."""
+    args = _caption_args([])
+    args.qwen_model_does_preprocess = True
+
+    with pytest.raises(ValueError, match="--vllm-preprocess-mode"):
+        _assemble_stages(args)
 
 
 @pytest.mark.parametrize(

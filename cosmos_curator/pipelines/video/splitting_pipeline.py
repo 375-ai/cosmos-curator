@@ -369,7 +369,10 @@ def _validate_deprecated_vllm_preprocess_args(args: argparse.Namespace) -> None:
     deprecated_args = []
     if getattr(args, "qwen_preprocess_dtype", None) is not None:
         deprecated_args.append("--qwen-preprocess-dtype")
-    if getattr(args, "qwen_model_does_preprocess", None) is not None:
+    # Invoke JSON can carry ``false`` for this store_true flag; only an
+    # explicit ``true`` (or CLI ``--qwen-model-does-preprocess``) is a
+    # migration error.
+    if getattr(args, "qwen_model_does_preprocess", None) is True:
         deprecated_args.append("--qwen-model-does-preprocess")
 
     if deprecated_args:
@@ -2355,7 +2358,9 @@ def nvcf_run_split(args: argparse.Namespace) -> None:
         args: Command line arguments.
 
     """
-    args_utils.fill_default_args(args, _setup_parser)
+    # Keep the deprecated store_true flag absent when omitted from a JSON invoke payload;
+    # backfilling its default would make config mode look like an explicit legacy CLI invocation.
+    args_utils.fill_default_args(args, _setup_parser, omit_dests=frozenset({"qwen_model_does_preprocess"}))
     cli_run_split(args)
 
 
