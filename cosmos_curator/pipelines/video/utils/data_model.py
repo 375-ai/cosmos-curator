@@ -430,6 +430,14 @@ class Clip:
     source_video: str
     span: tuple[float, float]
     encoded_data: LazyData[npt.NDArray[np.uint8]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
+    # Source-timeline clip bounds in integer nanoseconds, derived from decoded
+    # source PTS at extraction. None until populated (e.g. errored clips).
+    start_ns: int | None = None
+    end_ns: int | None = None
+    # Clip's own per-frame PTS in integer nanoseconds, decoded from the transcoded
+    # clip and used to map window frame ranges to clip-relative nanoseconds. eq=False:
+    # numpy arrays are not safely comparable for attrs equality.
+    pts_ns: npt.NDArray[np.int64] | None = attrs.field(default=None, eq=False)
     # decoded frames (dict of numpy arrays keyed by extraction signature);
     # wrapped in LazyData for zero-copy inter-stage transport via PEP 574.
     # No converter: producer must compute nbytes explicitly (dict has no .nbytes attr)
@@ -552,6 +560,8 @@ class Clip:
             total_size += self.cosmos_embed1_embedding.nbytes
         if self.openai_embedding is not None:
             total_size += self.openai_embedding.nbytes
+        if self.pts_ns is not None:
+            total_size += self.pts_ns.nbytes
         for window in self.windows:
             total_size += window.get_major_size()
         return total_size

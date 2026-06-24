@@ -20,10 +20,39 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 
-from cosmos_curator.pipelines.video.clipping.clip_extraction_stages import ClipTranscodingStage, slice_video_clips
+from cosmos_curator.pipelines.video.clipping.clip_extraction_stages import (
+    ClipTranscodingStage,
+    _clip_source_ns_bounds,
+    slice_video_clips,
+)
 from cosmos_curator.pipelines.video.utils.data_model import Clip, Video, VideoMetadata
+
+
+class TestClipSourceNsBounds:
+    """Tests for _clip_source_ns_bounds (0-based span -> source-PTS nanosecond bounds)."""
+
+    def test_zero_based_pts(self) -> None:
+        """When source PTS start at 0, a 0-based span maps directly to ns."""
+        ts = np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=np.float32)
+        assert _clip_source_ns_bounds(ts, (1.0, 2.0)) == (1_000_000_000, 2_000_000_000)
+
+    def test_nonzero_base_pts_offsets_span(self) -> None:
+        """A non-zero first PTS must offset the 0-based span before lookup.
+
+        The clip is the first 2s of the video; with source PTS starting at 5.0s its
+        bounds on the source timeline are 5.0s..7.0s. The buggy version looked up the
+        raw span (0.0, 2.0) against absolute PTS and collapsed to (5e9, 5e9).
+        """
+        ts = np.array([5.0, 5.5, 6.0, 6.5, 7.0], dtype=np.float32)
+        assert _clip_source_ns_bounds(ts, (0.0, 2.0)) == (5_000_000_000, 7_000_000_000)
+
+    def test_missing_timestamps_return_none(self) -> None:
+        """Absent or empty source PTS yields (None, None)."""
+        assert _clip_source_ns_bounds(None, (0.0, 2.0)) == (None, None)
+        assert _clip_source_ns_bounds(np.array([], dtype=np.float32), (0.0, 2.0)) == (None, None)
 
 
 def _make_video_for_slice(num_clips: int, clip_chunk_index: int = 0) -> Video:

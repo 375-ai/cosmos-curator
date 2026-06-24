@@ -291,7 +291,8 @@ def _legacy_clip_metadata(clip_path: Path, clip_uuid: str = "clip-1") -> dict[st
     return {
         "span_uuid": clip_uuid,
         "source_video": "input/video.mp4",
-        "duration_span": [0.0, 1.0],
+        "start_ns": 0,
+        "end_ns": 1_000_000_000,
         "width_source": 640,
         "height_source": 360,
         "framerate_source": 24.0,
@@ -310,8 +311,8 @@ def _legacy_clip_metadata(clip_path: Path, clip_uuid: str = "clip-1") -> dict[st
         "num_caption_windows": 1,
         "windows": [
             {
-                "start_frame": 0,
-                "end_frame": 24,
+                "start_ns": 0,
+                "end_ns": 1_000_000_000,
                 "caption_status": "success",
                 "caption_failure_reason": None,
                 "flag_length_outlier": False,
@@ -362,8 +363,62 @@ def test_extract_shard_tasks_reads_lance_metadata(tmp_path: Path) -> None:
     assert sample.uuid == "clip-1"
     assert sample.clip_location == clip_path
     assert sample.clip_metadata["span_uuid"] == "clip-1"
+    assert sample.clip_metadata["start_ns"] == 0
+    assert sample.clip_metadata["end_ns"] == 1_000_000_000
+    assert sample.clip_metadata["windows"][0]["start_ns"] == 0
+    assert sample.clip_metadata["windows"][0]["end_ns"] == 1_000_000_000
     assert sample.clip_metadata["windows"][0]["qwen_caption"] == "caption text"
     assert sample.clip_metadata["windows"][0]["qwen_prompt_tokens"] == 7
+
+
+def test_extract_shard_tasks_reads_lance_metadata_with_null_ns(tmp_path: Path) -> None:
+    """Lance rows with null ns timing round-trip without error.
+
+    start_ns/end_ns (and window ns) can be null for a clip whose PTS decode failed.
+    The reader applies a uniform None-filter, so null timing fields are dropped and
+    consumers read them back as None via .get() (keys absent, not present-with-None).
+    """
+    input_root = tmp_path / "split"
+    output_root = tmp_path / "dataset" / "v0"
+    input_root.mkdir()
+    clip_path = input_root / "clips" / "clip-1.mp4"
+    clip_path.parent.mkdir()
+    clip_path.write_bytes(b"clip")
+
+    metadata = _legacy_clip_metadata(clip_path)
+    metadata["start_ns"] = None
+    metadata["end_ns"] = None
+    metadata["windows"][0]["start_ns"] = None
+    metadata["windows"][0]["end_ns"] = None
+
+    table = build_clip_metadata_lance_table([metadata], video_uuid="video-1", clip_chunk_index=0)
+    lance.write_dataset(
+        table,
+        input_root / "lance" / "v0",
+        schema=CLIP_METADATA_LANCE_SCHEMA,
+        mode="overwrite",
+        data_storage_version=CLIP_METADATA_LANCE_DATA_STORAGE_VERSION,
+    )
+
+    samples = extract_shard_tasks(
+        str(input_root),
+        str(output_root),
+        "default",
+        "default",
+        "v0",
+        metadata_input_format="lance",
+    )
+
+    assert len(samples) == 1
+    clip_metadata = samples[0].clip_metadata
+    # Null timing fields are dropped by the reader's uniform None-filter (keys absent).
+    assert "start_ns" not in clip_metadata
+    assert "end_ns" not in clip_metadata
+    window = clip_metadata["windows"][0]
+    assert "start_ns" not in window
+    assert "end_ns" not in window
+    # the rest of the window is intact
+    assert window["qwen_caption"] == "caption text"
 
 
 def test_extract_shard_tasks_auto_falls_back_to_json_metadata(tmp_path: Path) -> None:

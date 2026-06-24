@@ -21,7 +21,6 @@ import pyarrow as pa  # type: ignore[import-untyped]
 
 CLIP_METADATA_LANCE_SCHEMA_VERSION = 1
 CLIP_METADATA_LANCE_DATA_STORAGE_VERSION: Literal["2.2"] = "2.2"
-_SPAN_BOUND_COUNT = 2
 _TRUE_STRINGS = frozenset({"1", "on", "true", "yes", "y"})
 _FALSE_STRINGS = frozenset({"", "0", "false", "no", "n", "off"})
 
@@ -38,8 +37,10 @@ _TOKEN_COUNTS_MAP = pa.map_(
 
 _WINDOW_STRUCT = pa.struct(
     [
-        pa.field("start_frame", pa.int64()),
-        pa.field("end_frame", pa.int64()),
+        # Window bounds in nanoseconds, relative to the clip start (derived from the
+        # clip's own per-frame PTS), not the source timeline.
+        pa.field("start_ns", pa.int64()),
+        pa.field("end_ns", pa.int64()),
         pa.field("caption_status", pa.string()),
         pa.field("caption_failure_reason", pa.string()),
         pa.field("captions", _STRING_MAP),
@@ -54,8 +55,10 @@ _WINDOW_STRUCT = pa.struct(
 
 _FILTERED_WINDOW_STRUCT = pa.struct(
     [
-        pa.field("start_frame", pa.int64()),
-        pa.field("end_frame", pa.int64()),
+        # Window bounds in nanoseconds, relative to the clip start (derived from the
+        # clip's own per-frame PTS), not the source timeline.
+        pa.field("start_ns", pa.int64()),
+        pa.field("end_ns", pa.int64()),
         pa.field("rejection_reasons", pa.large_string()),
         pa.field("errors", _STRING_MAP),
     ]
@@ -76,9 +79,9 @@ CLIP_METADATA_LANCE_SCHEMA = pa.schema(
         pa.field("clip_chunk_index", pa.int32(), nullable=False),
         pa.field("source_video", pa.large_string()),
         pa.field("clip_location", pa.large_string()),
-        pa.field("span_start_s", pa.float64()),
-        pa.field("span_end_s", pa.float64()),
-        pa.field("duration_s", pa.float64()),
+        pa.field("start_ns", pa.int64()),
+        pa.field("end_ns", pa.int64()),
+        pa.field("duration_ns", pa.int64()),
         pa.field("source_width", pa.int32()),
         pa.field("source_height", pa.int32()),
         pa.field("source_framerate", pa.float64()),
@@ -133,7 +136,8 @@ def clip_metadata_row_to_lance_row(
     clip_chunk_index: int,
 ) -> dict[str, Any]:
     """Normalize the legacy JSON metadata row into the Lance metadata contract."""
-    span_start_s, span_end_s = _span_bounds(row.get("duration_span"))
+    start_ns = _int_or_none(row.get("start_ns"))
+    end_ns = _int_or_none(row.get("end_ns"))
     embedding = _float_list_or_none(row.get("embedding"))
     return {
         "schema_version": CLIP_METADATA_LANCE_SCHEMA_VERSION,
@@ -142,9 +146,9 @@ def clip_metadata_row_to_lance_row(
         "clip_chunk_index": int(clip_chunk_index),
         "source_video": _string_or_none(row.get("source_video")),
         "clip_location": _string_or_none(row.get("clip_location")),
-        "span_start_s": span_start_s,
-        "span_end_s": span_end_s,
-        "duration_s": _duration(span_start_s, span_end_s),
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "duration_ns": _duration_ns(start_ns, end_ns),
         "source_width": _int_or_none(row.get("width_source")),
         "source_height": _int_or_none(row.get("height_source")),
         "source_framerate": _float_or_none(row.get("framerate_source")),
@@ -185,16 +189,10 @@ def _required_string(row: Mapping[str, Any], key: str) -> str:
     return str(value)
 
 
-def _span_bounds(value: object) -> tuple[float | None, float | None]:
-    if not isinstance(value, Sequence) or isinstance(value, (bytes, str)) or len(value) < _SPAN_BOUND_COUNT:
-        return None, None
-    return _float_or_none(value[0]), _float_or_none(value[1])
-
-
-def _duration(start_s: float | None, end_s: float | None) -> float | None:
-    if start_s is None or end_s is None:
+def _duration_ns(start_ns: int | None, end_ns: int | None) -> int | None:
+    if start_ns is None or end_ns is None:
         return None
-    return end_s - start_s
+    return end_ns - start_ns
 
 
 def _motion_score(value: object) -> dict[str, float | None] | None:
@@ -214,8 +212,8 @@ def _windows(value: object) -> list[dict[str, Any]]:
 
 def _window(window: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        "start_frame": _int_or_none(window.get("start_frame")),
-        "end_frame": _int_or_none(window.get("end_frame")),
+        "start_ns": _int_or_none(window.get("start_ns")),
+        "end_ns": _int_or_none(window.get("end_ns")),
         "caption_status": _string_or_none(window.get("caption_status")),
         "caption_failure_reason": _string_or_none(window.get("caption_failure_reason")),
         "captions": _model_text_map(window, "_caption"),
@@ -236,8 +234,8 @@ def _filtered_windows(value: object) -> list[dict[str, Any]]:
 
 def _filtered_window(window: Mapping[str, Any]) -> dict[str, Any]:
     return {
-        "start_frame": _int_or_none(window.get("start_frame")),
-        "end_frame": _int_or_none(window.get("end_frame")),
+        "start_ns": _int_or_none(window.get("start_ns")),
+        "end_ns": _int_or_none(window.get("end_ns")),
         "rejection_reasons": _string_or_none(window.get("qwen_rejection_reasons")),
         "errors": _string_map(window.get("errors")),
     }

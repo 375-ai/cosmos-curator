@@ -226,6 +226,11 @@ def _stage_with_main_clip(tmp_path: Path) -> tuple[ClipWriterStage, SplitPipeTas
         filter_windows=[filtered_window],
     )
     clip.intern_video_2_embedding = np.array([0.1, 0.2], dtype=np.float32)
+    # Decoded PTS the extraction stage would carry forward: 31 frames spanning
+    # 0..2.0s in ns (pts_ns[30] == 2e9) and source-timeline clip bounds for span (0.0, 2.0).
+    clip.pts_ns = np.linspace(0, 2_000_000_000, 31, dtype=np.int64)
+    clip.start_ns = 0
+    clip.end_ns = 2_000_000_000
 
     video = _build_video(video_path, clip)
     task = SplitPipeTask(session_id="test-session", video=video)
@@ -322,12 +327,12 @@ def test_process_data_writes_expected_local_outputs(tmp_path: Path) -> None:
     assert clip_metadata["span_uuid"] == str(clip.uuid)
     assert clip_metadata["clip_location"].endswith(f"clips/{clip.uuid}.mp4")
     assert clip_metadata["filtered_windows"] == [
-        {"start_frame": 0, "end_frame": 30, "qwen_rejection_reasons": "too blurry"}
+        {"start_ns": 0, "end_ns": 2_000_000_000, "qwen_rejection_reasons": "too blurry"}
     ]
     assert clip_metadata["windows"] == [
         {
-            "start_frame": 0,
-            "end_frame": 30,
+            "start_ns": 0,
+            "end_ns": 2_000_000_000,
             "caption_status": "success",
             "caption_failure_reason": None,
             "flag_length_outlier": None,
@@ -399,8 +404,8 @@ def test_process_data_writes_filter_window_errors(tmp_path: Path) -> None:
     clip_metadata = _read_json(clip_meta_path)
     assert clip_metadata["filtered_windows"] == [
         {
-            "start_frame": 0,
-            "end_frame": 30,
+            "start_ns": 0,
+            "end_ns": 2_000_000_000,
             "qwen_rejection_reasons": "too blurry",
             "errors": {"qwen": "malformed_model_output"},
         }
@@ -537,6 +542,10 @@ def test_chunked_metadata_writes_group_jsonl(tmp_path: Path) -> None:
         encoded_data=bytes_to_numpy(b"data"),
         windows=[window],
     )
+    # 16 frames spanning 0..1.5s in ns (pts_ns[15] == 1.5e9); window 0..15 spans the whole clip.
+    clip.pts_ns = np.linspace(0, 1_500_000_000, 16, dtype=np.int64)
+    clip.start_ns = 0
+    clip.end_ns = 1_500_000_000
 
     video = _build_video(video_path, clip)
     task = SplitPipeTask(session_id="test-session", video=video)
@@ -558,8 +567,8 @@ def test_chunked_metadata_writes_group_jsonl(tmp_path: Path) -> None:
     assert chunk_record["num_caption_windows"] == 1
     assert chunk_record["windows"] == [
         {
-            "start_frame": 0,
-            "end_frame": 15,
+            "start_ns": 0,
+            "end_ns": 1_500_000_000,
             "caption_status": "success",
             "caption_failure_reason": None,
             "flag_length_outlier": None,
@@ -677,6 +686,10 @@ def test_lance_metadata_schema_normalizes_dynamic_model_fields(tmp_path: Path) -
     clip.has_artificial_text = True
     clip.errors["extract_metadata"] = "warning"
     clip.intern_video_2_embedding = np.array([0.1, 0.2, 0.3], dtype=np.float32)
+    # 11 frames spanning 0..1.0s in ns (pts_ns[10] == 1e9); window 0..10 -> clip-relative (0, 1e9).
+    clip.pts_ns = np.linspace(0, 1_000_000_000, 11, dtype=np.int64)
+    clip.start_ns = 1_250_000_000
+    clip.end_ns = 2_750_000_000
     video_meta = VideoMetadata(height=720, width=1280, framerate=24.0, num_frames=30, duration=1.25, video_codec="h264")
 
     metadata_row = stage._make_clip_metadata(clip, video_meta)
@@ -689,9 +702,9 @@ def test_lance_metadata_schema_normalizes_dynamic_model_fields(tmp_path: Path) -
     assert table.schema.equals(CLIP_METADATA_LANCE_SCHEMA, check_metadata=True)
     row = table.to_pylist()[0]
     assert row["clip_uuid"] == str(clip.uuid)
-    assert row["span_start_s"] == pytest.approx(1.25)
-    assert row["span_end_s"] == pytest.approx(2.75)
-    assert row["duration_s"] == pytest.approx(1.5)
+    assert row["start_ns"] == 1_250_000_000
+    assert row["end_ns"] == 2_750_000_000
+    assert row["duration_ns"] == 1_500_000_000
     assert row["source_width"] == 1280
     assert row["source_height"] == 720
     assert row["clip_width"] == 1920
@@ -715,8 +728,8 @@ def test_lance_metadata_schema_normalizes_dynamic_model_fields(tmp_path: Path) -
     assert lance_window["flag_repetition"] is True
     assert row["filtered_windows"] == [
         {
-            "start_frame": 0,
-            "end_frame": 10,
+            "start_ns": 0,
+            "end_ns": 1_000_000_000,
             "rejection_reasons": "too blurry",
             "errors": [("qwen", "malformed")],
         }

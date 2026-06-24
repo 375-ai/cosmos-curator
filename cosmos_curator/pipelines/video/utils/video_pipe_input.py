@@ -497,7 +497,8 @@ def _lance_metadata_row_to_legacy_metadata(row: dict[str, Any]) -> dict[str, Any
     metadata: dict[str, Any] = {
         "span_uuid": row["clip_uuid"],
         "source_video": row.get("source_video"),
-        "duration_span": [row.get("span_start_s"), row.get("span_end_s")],
+        "start_ns": row.get("start_ns"),
+        "end_ns": row.get("end_ns"),
         "width_source": row.get("source_width"),
         "height_source": row.get("source_height"),
         "framerate_source": row.get("source_framerate"),
@@ -541,8 +542,8 @@ def _copy_optional_lance_field(
 
 def _lance_window_to_legacy(window: dict[str, Any]) -> dict[str, Any]:
     legacy = {
-        "start_frame": window.get("start_frame"),
-        "end_frame": window.get("end_frame"),
+        "start_ns": window.get("start_ns"),
+        "end_ns": window.get("end_ns"),
         "caption_status": window.get("caption_status"),
         "caption_failure_reason": window.get("caption_failure_reason"),
         "flag_length_outlier": window.get("flag_length_outlier"),
@@ -563,8 +564,8 @@ def _lance_window_to_legacy(window: dict[str, Any]) -> dict[str, Any]:
 
 def _lance_filtered_window_to_legacy(window: dict[str, Any]) -> dict[str, Any]:
     legacy = {
-        "start_frame": window.get("start_frame"),
-        "end_frame": window.get("end_frame"),
+        "start_ns": window.get("start_ns"),
+        "end_ns": window.get("end_ns"),
         "qwen_rejection_reasons": window.get("rejection_reasons"),
         "errors": _lance_map_to_dict(window.get("errors")),
     }

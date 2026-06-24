@@ -36,7 +36,8 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     Video,
     assert_time_alignment,
 )
-from cosmos_curator.pipelines.video.utils.decoder_utils import DEFAULT_TRANSCODE_BITRATE_M
+from cosmos_curator.pipelines.video.utils.decoder_utils import DEFAULT_TRANSCODE_BITRATE_M, get_video_timestamps
+from cosmos_curator.pipelines.video.utils.ns_timing import NS_PER_SECOND, seconds_to_ns
 
 
 def slice_video_clips(
@@ -265,6 +266,7 @@ class ClipTranscodingStage(CuratorStage):
                     clips=batch,
                     input_video=str(video.input_video),
                     source_fps=video.metadata.framerate,
+                    source_timestamps=video.timestamps,
                 )
 
     @nvtx.annotate("ClipTranscodingStage")  # type: ignore[untyped-decorator]
@@ -315,7 +317,7 @@ class ClipTranscodingStage(CuratorStage):
         return CuratorStageResource(cpus=self._num_cpus_per_worker)
 
     @nvtx.annotate("ClipLoadingStage:_extract_clips")  # type: ignore[untyped-decorator]
-    def _extract_clips(  # noqa: C901, PLR0912, PLR0913
+    def _extract_clips(  # noqa: C901, PLR0912, PLR0913, PLR0915
         self,
         working_dir: pathlib.Path,
         video_filename: str,
@@ -325,6 +327,7 @@ class ClipTranscodingStage(CuratorStage):
         clips: list[Clip],
         input_video: str,
         source_fps: float | None = None,
+        source_timestamps: npt.NDArray[np.float32] | None = None,
     ) -> None:
         # construct ffmpeg command
         command = [
@@ -428,7 +431,8 @@ class ClipTranscodingStage(CuratorStage):
 
         # read clips back into memory
         for clip in clips:
-            clip.encoded_data = bytes_to_numpy((working_dir / f"{clip.uuid}.mp4").read_bytes())  # type: ignore[assignment]
+            clip_bytes = (working_dir / f"{clip.uuid}.mp4").read_bytes()
+            clip.encoded_data = bytes_to_numpy(clip_bytes)  # type: ignore[assignment]
             try:
                 clip.extract_metadata()
             except Exception as e:  # noqa: BLE001
@@ -436,9 +440,57 @@ class ClipTranscodingStage(CuratorStage):
                 clip.errors["extract_metadata"] = str(e)
                 clip.encoded_data.drop()
                 continue
+            # Carry decoded PTS forward (Q3) so the metadata writer does not re-decode:
+            # clip.pts_ns are the clip's own per-frame PTS in nanoseconds (for clip-relative
+            # window ns); start_ns/end_ns are the clip's bounds on the source timeline.
+            # PTS are decoded as float32 seconds today; the exact-ns extractor is a follow-up.
+            try:
+                clip_pts_s = get_video_timestamps(clip_bytes)
+                clip.pts_ns = np.round(clip_pts_s.astype(np.float64) * NS_PER_SECOND).astype(np.int64)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Failed to decode clip PTS for {clip.uuid=}: {e}")
+                clip.pts_ns = None
+            clip.start_ns, clip.end_ns = _clip_source_ns_bounds(source_timestamps, clip.span)
             # TODO(LazyData): re-enable when batch-mode ObjectRef ownership is
             # resolved.  In batch mode, pool.stop() kills actor -> OwnerDiedError.
             # clip.encoded_data.store()  # noqa: ERA001
+
+
+def _clip_source_ns_bounds(
+    source_timestamps: npt.NDArray[np.float32] | None,
+    span: tuple[float, float],
+) -> tuple[int | None, int | None]:
+    """Map a clip's source-seconds span to source-timeline nanosecond bounds via PTS.
+
+    Uses the source video's per-frame PTS so the clip bounds are the decoded PTS of
+    the first source frame at/after the clip start and the last source frame at/before
+    the clip end. Returns ``(None, None)`` when source PTS is unavailable.
+
+    Spans are 0-based: ``_populate_clips_fixed_stride`` forces ``start_s = 0.0``, so
+    ``span`` values are offsets from the video start, not absolute PTS. Source PTS may
+    begin at a non-zero base (e.g. remuxed containers), so the span is shifted by the
+    first PTS into the PTS coordinate system before lookup. When PTS start at 0 (the
+    common case) this is a no-op.
+
+    Args:
+        source_timestamps: Source video per-frame PTS in seconds, monotonically increasing.
+        span: ``(start_s, end_s)`` clip bounds, 0-based relative to the video start.
+
+    Returns:
+        ``(start_ns, end_ns)`` integer nanoseconds, or ``(None, None)``.
+
+    """
+    if source_timestamps is None or len(source_timestamps) == 0:
+        return None, None
+    base_s = float(source_timestamps[0])
+    last_index = len(source_timestamps) - 1
+    start_index = min(int(np.searchsorted(source_timestamps, span[0] + base_s, side="left")), last_index)
+    end_index = int(np.searchsorted(source_timestamps, span[1] + base_s, side="right")) - 1
+    end_index = min(max(end_index, start_index), last_index)
+    return (
+        seconds_to_ns(float(source_timestamps[start_index])),
+        seconds_to_ns(float(source_timestamps[end_index])),
+    )
 
 
 def _validate_video_timestamps(video_timestamps: list[npt.NDArray[np.float32]]) -> None:

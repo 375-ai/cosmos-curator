@@ -73,6 +73,18 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     VideoMetadata,
     Window,
 )
+from cosmos_curator.pipelines.video.utils.ns_timing import frame_pts_bounds_ns
+
+
+def _window_ns_bounds(clip: Clip, window: Window) -> tuple[int | None, int | None]:
+    """Map a window's frame range to clip-relative nanoseconds via the clip's PTS.
+
+    Returns ``(None, None)`` when the clip has no decoded timestamps (e.g. an
+    errored clip), in which case the ns bounds are persisted as null.
+    """
+    if clip.pts_ns is None or len(clip.pts_ns) == 0:
+        return None, None
+    return frame_pts_bounds_ns(clip.pts_ns, window.start_frame, window.end_frame, relative_to_first=True)
 
 
 class ClipWriterStage(CuratorStage):
@@ -817,7 +829,8 @@ class ClipWriterStage(CuratorStage):
         data: dict[str, Any] = {
             "span_uuid": str(clip.uuid),
             "source_video": str(clip.source_video),
-            "duration_span": list(clip.span),
+            "start_ns": clip.start_ns,
+            "end_ns": clip.end_ns,
             "width_source": video_metadata.width,
             "height_source": video_metadata.height,
             "framerate_source": video_metadata.framerate,
@@ -862,9 +875,10 @@ class ClipWriterStage(CuratorStage):
         data["windows"] = []
         data["filtered_windows"] = []
         for window in clip.filter_windows:
+            filter_start_ns, filter_end_ns = _window_ns_bounds(clip, window)
             curr_filter_window: dict[str, Any] = {
-                "start_frame": window.start_frame,
-                "end_frame": window.end_frame,
+                "start_ns": filter_start_ns,
+                "end_ns": filter_end_ns,
             }
             if "qwen_rejection_reasons" in window.caption:
                 curr_filter_window["qwen_rejection_reasons"] = window.caption["qwen_rejection_reasons"]
@@ -875,9 +889,10 @@ class ClipWriterStage(CuratorStage):
         total_output_tokens = 0
         num_caption_windows = 0
         for window in clip.windows:
+            window_start_ns, window_end_ns = _window_ns_bounds(clip, window)
             curr_window: dict[str, Any] = {
-                "start_frame": window.start_frame,
-                "end_frame": window.end_frame,
+                "start_ns": window_start_ns,
+                "end_ns": window_end_ns,
                 "caption_status": window.caption_status,
                 "caption_failure_reason": window.caption_failure_reason,
             }

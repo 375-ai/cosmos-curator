@@ -45,6 +45,17 @@ from cosmos_curator.pipelines.video.utils.data_model import (
 )
 
 
+class TestClipGetMajorSize:
+    """Tests for Clip.get_major_size accounting."""
+
+    def test_includes_pts_ns(self) -> None:
+        """pts_ns array bytes are counted toward the clip's major size."""
+        clip = Clip(uuid=uuid.uuid4(), source_video="v.mp4", span=(0.0, 1.0))
+        base = clip.get_major_size()
+        clip.pts_ns = np.arange(100, dtype=np.int64)
+        assert clip.get_major_size() == base + clip.pts_ns.nbytes
+
+
 class TestGetObjectSize:
     """Test _get_object_size function."""
 
