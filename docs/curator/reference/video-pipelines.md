@@ -112,7 +112,7 @@ At the clip level:
 
 Each `windows[]` row includes:
 
-- `start_frame`, `end_frame`: frame range for the caption window
+- `start_ns`, `end_ns`: clip-relative nanosecond bounds for the caption window
 - `caption_status`: normalized outcome (`success`, `truncated`, `blocked`,
   `error`, `skipped`, or `null`)
 - `caption_failure_reason`: `exception`, `timeout`, or `null`; set only when

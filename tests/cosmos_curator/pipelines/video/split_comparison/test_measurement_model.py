@@ -148,14 +148,14 @@ def test_window_and_model_dimensions() -> None:
     row = make_measurement(
         video_key="v",
         clip_id="c",
-        window_id="128_256",
+        window_id="128000000_256000000",
         model="qwen",
         measurement_type="caption_similarity",
         output_a_present=True,
         output_b_present=True,
         value=0.97,
     )
-    assert row["window_id"] == "128_256"
+    assert row["window_id"] == "128000000_256000000"
     assert row["model"] == "qwen"
     pa.Table.from_pylist([row], schema=MEASUREMENT_SCHEMA)
 

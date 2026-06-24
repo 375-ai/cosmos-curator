@@ -47,7 +47,7 @@ class Measurement(TypedDict):
 
     video_key: str
     clip_id: str
-    window_id: str | None  # null for clip-level rows; "{start_frame}_{end_frame}" otherwise
+    window_id: str | None  # null for clip-level rows; "{start_ns}_{end_ns}" otherwise
     model: str | None  # null for non-model measurements; caption/token model otherwise
     measurement_type: str
     value: float | None  # null unless both sides present and neither corrupt

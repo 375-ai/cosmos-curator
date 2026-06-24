@@ -120,6 +120,6 @@ def test_model_qualified_accessor_uses_model_name() -> None:
 def test_membership_accessor_marks_present_when_window_exists() -> None:
     """The window_present accessor returns a constant marker whenever the window dict exists."""
     acc = SPECS_BY_TYPE["window_present"].accessor
-    marker = acc({"start_frame": 0}, None, "")
+    marker = acc({"start_ns": 0}, None, "")
     assert marker is not ABSENT
-    assert acc({"start_frame": 10}, None, "") == marker
+    assert acc({"start_ns": 10}, None, "") == marker

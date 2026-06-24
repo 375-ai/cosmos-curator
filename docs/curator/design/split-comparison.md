@@ -63,7 +63,7 @@ MEASUREMENT_SCHEMA: pa.Schema = pa.schema(
     [
         ("video_key", pa.string()),
         ("clip_id", pa.string()),
-        ("window_id", pa.int64()),     # null for clip-level rows; window start_frame otherwise
+        ("window_id", pa.string()),    # null for clip-level rows; "{start_ns}_{end_ns}" otherwise
         ("model", pa.string()),        # null for non-model measurements; caption/token model otherwise
         ("measurement_type", pa.string()),
         ("value", pa.float64()),       # null unless both sides present and neither corrupt
@@ -112,8 +112,8 @@ dict happens to hold, so:
   tiny tolerance rather than equality).
 - the catalog is a closed, stable vocabulary; the `model` column carries the
   caption/token model (not baked into the type name), and `window_id` carries
-  per-window identity as `"{start_frame}_{end_frame}"` — so a window whose end
-  frame drifts between the two sides no longer aligns and instead surfaces as
+  per-window identity as `"{start_ns}_{end_ns}"` — so a window whose bounds
+  drift between the two sides no longer aligns and instead surfaces as
   window-set divergence. A `window_present` membership row per window key records
   that divergence even when a window produced no caption.
 

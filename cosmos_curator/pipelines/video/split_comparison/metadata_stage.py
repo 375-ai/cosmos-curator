@@ -589,8 +589,8 @@ def _collect_caption_jobs(
         text_b = _caption_text(w_b)
         if w_a is not None and w_b is not None and text_a == text_b:
             continue
-        start, end = key
-        window = {"start_frame": start, "end_frame": end}
+        start_ns, end_ns = key
+        window = {"start_ns": start_ns, "end_ns": end_ns}
         jobs.append(
             CaptionJob(
                 clip_id=clip_id,
@@ -604,6 +604,7 @@ def _collect_caption_jobs(
 
 
 def _caption_windows(metadata: Mapping[str, Any]) -> dict[tuple[int, int], Mapping[str, Any]]:
+    """Return persisted caption windows keyed by clip-relative nanosecond bounds."""
     windows = metadata.get("windows")
     if not isinstance(windows, list):
         return {}
@@ -611,8 +612,8 @@ def _caption_windows(metadata: Mapping[str, Any]) -> dict[tuple[int, int], Mappi
     for window in windows:
         if not isinstance(window, Mapping):
             continue
-        start = window.get("start_frame")
-        end = window.get("end_frame")
+        start = window.get("start_ns")
+        end = window.get("end_ns")
         if isinstance(start, int) and isinstance(end, int):
             result[(start, end)] = window
     return result
@@ -649,8 +650,8 @@ def _emit_caption_issues(
             clip=job.clip_id,
             field="caption",
             details={
-                "start_frame": job.window["start_frame"],
-                "end_frame": job.window["end_frame"],
+                "start_ns": job.window["start_ns"],
+                "end_ns": job.window["end_ns"],
                 "similarity": float(sim),
                 "threshold": policy.min_similarity,
                 "a": job.text_a,

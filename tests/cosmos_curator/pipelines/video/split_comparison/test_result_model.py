@@ -36,7 +36,7 @@ def test_make_issue_produces_row_that_fits_issue_schema() -> None:
         clip="clip-a",
         output=None,
         field="caption",
-        details={"start_frame": 0, "similarity": 0.71},
+        details={"start_ns": 0, "similarity": 0.71},
     )
     table = pa.Table.from_pylist([row], schema=ISSUE_SCHEMA)
 
@@ -44,7 +44,7 @@ def test_make_issue_produces_row_that_fits_issue_schema() -> None:
     assert table["code"][0].as_py() == "caption_similarity_below_threshold"
     assert table["field"][0].as_py() == "caption"
     parsed = json.loads(table["details"][0].as_py())
-    assert parsed == {"start_frame": 0, "similarity": 0.71}
+    assert parsed == {"start_ns": 0, "similarity": 0.71}
 
 
 def test_make_issue_leaves_unset_fields_null_with_no_details() -> None:

@@ -51,8 +51,8 @@ class Scope(Enum):
     """Where a measured field lives, which sets how its measurement rows are keyed."""
 
     CLIP = auto()  # clip-level field; window_id is null
-    WINDOW = auto()  # per caption window; window_id = "{start_frame}_{end_frame}"
-    FILTERED_WINDOW = auto()  # per filtered (rejected) window; window_id = "{start_frame}_{end_frame}"
+    WINDOW = auto()  # per caption window; window_id = "{start_ns}_{end_ns}"
+    FILTERED_WINDOW = auto()  # per filtered (rejected) window; window_id = "{start_ns}_{end_ns}"
 
 
 class _Sentinel(Enum):

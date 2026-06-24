@@ -319,7 +319,7 @@ def test_motion_score_iterates_nested_fields_with_per_field_wiring() -> None:
 
 def _meta_with_caption_windows(*windows: tuple[int, int, str]) -> dict[str, Any]:
     return {
-        "windows": [{"start_frame": start, "end_frame": end, "qwen_caption": text} for start, end, text in windows],
+        "windows": [{"start_ns": start, "end_ns": end, "qwen_caption": text} for start, end, text in windows],
     }
 
 
@@ -356,8 +356,8 @@ def test_captions_emits_one_issue_per_below_threshold_window() -> None:
 
     assert len(issues) == 1
     details = _details(issues[0])
-    assert details["start_frame"] == 0
-    assert details["end_frame"] == 30
+    assert details["start_ns"] == 0
+    assert details["end_ns"] == 30
     assert details["threshold"] == 0.85
     assert details["similarity"] == pytest.approx(0.2, abs=1e-5)
     assert details["a"] == "a dog"
@@ -464,12 +464,12 @@ def test_metadata_stage_runs_all_three_compares_when_both_sides_present(monkeypa
     meta_a = {
         "aesthetic_score": 0.5,
         "motion_score": {"global_mean": 1.0, "per_patch_min_256": 0.2},
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a dog"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a dog"}],
     }
     meta_b = {
         "aesthetic_score": 0.65,  # outside tolerance
         "motion_score": {"global_mean": 0.8, "per_patch_min_256": 0.2},  # global_mean off
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a cat"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a cat"}],
     }
     _stub_storage(
         monkeypatch,
@@ -501,12 +501,12 @@ def test_metadata_stage_skips_caption_work_when_compare_captions_false(monkeypat
     meta_a = {
         "aesthetic_score": 0.5,
         "motion_score": {"global_mean": 1.0, "per_patch_min_256": 0.2},
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a dog"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a dog"}],
     }
     meta_b = {
         "aesthetic_score": 0.65,  # outside tolerance -> aesthetic issue still fires
         "motion_score": {"global_mean": 1.0, "per_patch_min_256": 0.2},
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a cat"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a cat"}],
     }
     _stub_storage(
         monkeypatch,
@@ -589,9 +589,17 @@ def test_collect_caption_jobs_skips_identical_windows() -> None:
     assert len(jobs) == 1
     assert jobs[0].clip_id == "clip-x"
     assert jobs[0].video_key == "video.mp4"
-    assert jobs[0].window == {"start_frame": 30, "end_frame": 60}
+    assert jobs[0].window == {"start_ns": 30, "end_ns": 60}
     assert jobs[0].text_a == "a cat"
     assert jobs[0].text_b == "two cats"
+
+
+def test_collect_caption_jobs_ignores_windows_without_ns_bounds() -> None:
+    """Persisted caption metadata must include clip-relative nanosecond bounds."""
+    meta_a = {"windows": [{"qwen_caption": "a dog"}]}
+    meta_b = {"windows": [{"qwen_caption": "a cat"}]}
+
+    assert _collect_caption_jobs("clip-x", "video.mp4", meta_a, meta_b) == []
 
 
 def test_emit_caption_issues_batches_across_clips() -> None:
@@ -617,14 +625,14 @@ def test_emit_caption_issues_batches_across_clips() -> None:
         CaptionJob(
             clip_id="clip-1",
             video_key="video-a.mp4",
-            window={"start_frame": 0, "end_frame": 30},
+            window={"start_ns": 0, "end_ns": 30},
             text_a="x",
             text_b="y",
         ),
         CaptionJob(
             clip_id="clip-2",
             video_key="video-b.mp4",
-            window={"start_frame": 30, "end_frame": 60},
+            window={"start_ns": 30, "end_ns": 60},
             text_a="p",
             text_b="q",
         ),
@@ -643,19 +651,19 @@ def test_process_batch_emits_caption_issues_for_each_diverging_clip_in_batch(
     """A multi-clip batch surfaces a caption issue for every clip whose captions diverge."""
     meta_a_clip1 = {
         "aesthetic_score": 0.5,
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a dog"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a dog"}],
     }
     meta_b_clip1 = {
         "aesthetic_score": 0.5,
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a cat"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a cat"}],
     }
     meta_a_clip2 = {
         "aesthetic_score": 0.5,
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a house"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a house"}],
     }
     meta_b_clip2 = {
         "aesthetic_score": 0.5,
-        "windows": [{"start_frame": 0, "end_frame": 30, "qwen_caption": "a car"}],
+        "windows": [{"start_ns": 0, "end_ns": 30, "qwen_caption": "a car"}],
     }
     _stub_storage(
         monkeypatch,
