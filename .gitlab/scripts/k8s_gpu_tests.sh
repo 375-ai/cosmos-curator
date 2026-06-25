@@ -10,6 +10,10 @@ source "$(dirname "$0")/common.sh"
 echo "=== K8s GPU Pipeline Test ==="
 echo "Running mini split pipeline with GPU model to verify full stack"
 
+# Resolve the repo root from this script's location so the pre-canned config
+# JSONs always match the commit under test (not whatever is baked into the image).
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
 cd /opt/cosmos-curator
 
 # Verify GPU is available
@@ -26,18 +30,8 @@ setup_ngc_model_download
 # Set output path for this test
 K8S_OUTPUT_PATH="${S3_OUTPUT_PATH}/k8s-gpu-test"
 
-echo "Input: ${S3_INPUT_VIDEO_PATH}"
-echo "Output: ${K8S_OUTPUT_PATH}"
-
 # Run split pipeline with GPU stages (transnetv2 + embeddings + captions)
-# shellcheck disable=SC2046
-pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
-  --input-video-path "${S3_INPUT_VIDEO_PATH}" \
-  --output-clip-path "${K8S_OUTPUT_PATH}" \
-  --limit 1 \
-  --splitting-algorithm transnetv2 \
-  $(get_reduced_cpu_pipeline_args) \
-  --embedding-algorithm cosmos-embed1-224p \
-  --captioning-algorithm cosmos_r1
+# via the config-driven run_pipeline entry point.
+run_pipeline_from_config "${REPO_ROOT}/examples/ci/split_basic.json" "${K8S_OUTPUT_PATH}"
 
 echo "✓ K8s GPU pipeline test completed successfully"

@@ -33,6 +33,7 @@ _SPLIT_INVOKE_TEMPLATES = (
     _REPO_ROOT / "examples/nvcf/function/invoke_video_split_full.json",
     _REPO_ROOT / "examples/workflow/template_invoke_video_split.json",
 )
+_CI_SPLIT_CONFIGS = sorted((_REPO_ROOT / "examples/ci").glob("*.json"))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -190,6 +191,28 @@ def test_deprecated_vllm_preprocess_args_raise_migration_error(legacy_args: list
 
     with pytest.raises(ValueError, match="--vllm-preprocess-mode"):
         _assemble_stages(args)
+
+
+def test_ci_split_config_fixtures_exist() -> None:
+    """The pre-canned CI split config library should be present and discoverable."""
+    assert _CI_SPLIT_CONFIGS, "no examples/ci/*.json scenario configs found"
+
+
+@pytest.mark.parametrize("config_path", _CI_SPLIT_CONFIGS, ids=lambda p: p.name)
+def test_ci_split_configs_only_use_known_args(config_path: Path) -> None:
+    """Pre-canned CI split configs must not carry typoed/unknown arg keys.
+
+    Config mode (``run_pipeline <config.json>``) fills missing args with their
+    defaults and silently ignores unrecognized keys, so a typo would otherwise
+    sail through CI while quietly exercising the default instead of the intended
+    value. Guard against that by checking every key against the split parser.
+    """
+    config = json.loads(config_path.read_text())
+    assert config.get("pipeline") == "split", config_path.as_posix()
+
+    valid_dests = set(vars(_parser().parse_args([])))
+    unknown = sorted(set(config["args"]) - valid_dests)
+    assert not unknown, f"{config_path.name}: unknown split args {unknown}"
 
 
 def test_split_invoke_templates_use_supported_vllm_preprocess_mode() -> None:

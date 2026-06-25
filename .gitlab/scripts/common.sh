@@ -154,6 +154,76 @@ get_reduced_cpu_pipeline_args() {
     echo "--transnetv2-frame-decode-cpus-per-worker 1 --transcode-cpus-per-worker 1 --clip-extraction-cpus-per-worker 1"
 }
 
+# Run the video pipeline from a pre-canned osmo-schema config JSON (the
+# {"pipeline": ..., "args": {...}} format consumed by run_pipeline's config
+# mode). The committed configs stay close to pipeline defaults: the runtime
+# input/output paths and the CI-only reduced per-worker CPU counts (an 8-core
+# GPU-node constraint) are injected here rather than baked into the shipped JSON.
+#
+# Args:
+#   config_path: Path to the scenario config JSON.
+#   output_path: S3 (or local) output path for the run.
+run_pipeline_from_config() {
+    local config_path="$1"
+    local output_path="$2"
+
+    if [ ! -f "${config_path}" ]; then
+        echo "ERROR: pipeline config not found: ${config_path}" >&2
+        return 1
+    fi
+    if [ -z "${S3_INPUT_VIDEO_PATH:-}" ]; then
+        echo "ERROR: S3_INPUT_VIDEO_PATH is unset or empty" >&2
+        return 1
+    fi
+    if [ -z "${output_path}" ]; then
+        echo "ERROR: output path (argument 2) is empty" >&2
+        return 1
+    fi
+
+    local filled_config
+    filled_config="$(mktemp --suffix=.json)"
+    # Remove the temp config when the function returns (success or set -e abort).
+    trap 'rm -f "${filled_config}"' RETURN
+
+    # Override the input/output paths with the pixi-managed Python (the same
+    # interpreter that runs the pipeline) rather than jq, which is not present
+    # in the slim image.
+    CONFIG_SRC="${config_path}" \
+    CONFIG_DST="${filled_config}" \
+    CONFIG_INPUT_VIDEO_PATH="${S3_INPUT_VIDEO_PATH}" \
+    CONFIG_OUTPUT_CLIP_PATH="${output_path}" \
+    pixi run --as-is python - <<'PY'
+import json
+import os
+
+with open(os.environ["CONFIG_SRC"]) as fh:
+    config = json.load(fh)
+
+args = config.setdefault("args", {})
+args["input_video_path"] = os.environ["CONFIG_INPUT_VIDEO_PATH"]
+args["output_clip_path"] = os.environ["CONFIG_OUTPUT_CLIP_PATH"]
+
+# CI GPU nodes have 8 cores; cap the CPU-heavy stages so workers fit. Mirrors
+# get_reduced_cpu_pipeline_args (still used on the CLI by k8s_helm_test).
+for cpu_arg in (
+    "transnetv2_frame_decode_cpus_per_worker",
+    "transcode_cpus_per_worker",
+    "clip_extraction_cpus_per_worker",
+):
+    args[cpu_arg] = 1
+
+with open(os.environ["CONFIG_DST"], "w") as fh:
+    json.dump(config, fh, indent=2)
+PY
+
+    echo "=== Running pipeline from config: ${config_path} ==="
+    echo "Input:  ${S3_INPUT_VIDEO_PATH}"
+    echo "Output: ${output_path}"
+    cat "${filled_config}"
+
+    pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline "${filled_config}"
+}
+
 _SLURM_LOG_TAIL_PID=""
 
 stop_slurm_log_tail() {
