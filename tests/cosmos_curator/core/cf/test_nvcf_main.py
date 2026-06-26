@@ -380,81 +380,6 @@ class TestRayJobOperations:
                         assert success is True
 
 
-class TestAssetHelpers:
-    """Test asset helper functions."""
-
-    def test_get_asset_paths(self, tmp_path: Path) -> None:
-        """Test get_asset_paths extracts paths correctly."""
-        asset_dir = tmp_path / "assets"
-        asset_dir.mkdir()
-        for asset in ("asset1", "asset2", "asset3"):
-            (asset_dir / asset).write_text("dummy")
-
-        mock_request = MagicMock()
-        mock_request.headers.get.side_effect = lambda key, default=None: {
-            "NVCF-ASSET-DIR": str(asset_dir),
-            "NVCF-FUNCTION-ASSET-IDS": "asset1,asset2,asset3",
-        }.get(key, default)
-
-        paths = nvcf_main.get_asset_paths(mock_request)
-
-        assert len(paths) == EXPECTED_ASSETS
-        assert str(asset_dir / "asset1") in paths
-        assert str(asset_dir / "asset2") in paths
-        assert str(asset_dir / "asset3") in paths
-
-    def test_get_asset_paths_empty(self) -> None:
-        """Test get_asset_paths returns empty list when no assets."""
-        mock_request = MagicMock()
-        mock_request.headers.get.side_effect = lambda _key, default=None: default
-
-        paths = nvcf_main.get_asset_paths(mock_request)
-
-        assert len(paths) == 0
-
-    def test_input_assets_present(self) -> None:
-        """Test input_assets_present returns True when assets exist."""
-        mock_request = MagicMock()
-
-        with patch("cosmos_curator.core.cf.nvcf_main.get_asset_paths") as mock_paths:
-            mock_paths.return_value = ["/tmp/asset1"]  # noqa: S108
-            assert nvcf_main.input_assets_present(mock_request) is True
-
-            mock_paths.return_value = []
-            assert nvcf_main.input_assets_present(mock_request) is False
-
-    def test_get_asset_output_path(self, tmp_path: Path) -> None:
-        """Test get_asset_output_path returns correct path."""
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-
-        mock_request = MagicMock()
-        mock_request.headers.get.return_value = str(output_dir)
-
-        path = nvcf_main.get_asset_output_path(mock_request)
-
-        assert path == str(output_dir)
-
-    def test_get_asset_output_path_fallback(self) -> None:
-        """Test get_asset_output_path creates fallback directory."""
-        mock_request = MagicMock()
-        mock_request.headers.get.return_value = None
-
-        path = nvcf_main.get_asset_output_path(mock_request)
-
-        assert path is not None
-        assert "nvcf_output" in path
-
-    def test_get_asset_input_dir(self) -> None:
-        """Test get_asset_input_dir returns correct directory."""
-        mock_request = MagicMock()
-        mock_request.headers.get.return_value = "/tmp/input"  # noqa: S108
-
-        input_dir = nvcf_main.get_asset_input_dir(mock_request)
-
-        assert input_dir == "/tmp/input"  # noqa: S108
-
-
 class TestPipelineProgress:
     """Test pipeline progress functions."""
 
@@ -964,8 +889,7 @@ class TestFastAPIEndpoints:
             patch.dict(nvcf_main.using_nvcf_status, {"get_req_sts": False}),
             patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
             patch("cosmos_curator.core.cf.nvcf_main._setup_request", return_value=(fake_thread, fake_stop_event)),
-            patch("cosmos_curator.core.cf.nvcf_main.get_asset_output_path", return_value=str(tmp_path / "out")),
-            patch("cosmos_curator.core.cf.nvcf_main.input_assets_present", return_value=False),
+            patch("cosmos_curator.core.cf.nvcf_main.get_nvcf_output_path", return_value=str(tmp_path / "out")),
             patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline", side_effect=fake_execute_pipeline),
             patch("cosmos_curator.core.cf.nvcf_main.nvcf_run_annotate", side_effect=fake_annotate),
             patch("cosmos_curator.core.cf.nvcf_main.gather_and_upload_outputs"),

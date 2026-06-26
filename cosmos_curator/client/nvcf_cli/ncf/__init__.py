@@ -16,11 +16,9 @@
 """Initialize the NCF package."""
 
 __all__ = [
-    "AssetManager",
     "ConfigManager",
     "ImageManager",
     "ModelManager",
-    "nvcf_create_function",
     "nvcf_create_function",
     "nvcf_delete_function",
     "nvcf_deploy_function",
@@ -29,7 +27,6 @@ __all__ = [
     "nvcf_import_function",
     "nvcf_invoke_batch",
     "nvcf_invoke_function",
-    "nvcf_list_clusters",
     "nvcf_list_function_detail",
     "nvcf_list_functions",
     "nvcf_s3cred_function",

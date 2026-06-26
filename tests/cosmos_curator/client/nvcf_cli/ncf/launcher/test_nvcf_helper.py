@@ -113,111 +113,8 @@ def test_id_version(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
     assert nvcf_helper.id_version("test_id", "test_version") == (True, "test_id", "test_version")
 
 
-def test_nvcf_helper_list_clusters_success(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-    """Test that nvcf_helper_list_clusters returns the expected table on success.
-
-    Args:
-        monkeypatch: The monkeypatch object.
-        tmp_path: The temporary path object.
-
-    Returns:
-        None
-
-    """
-    # Mock the response data
-    mock_response_data = {
-        "status": 200,
-        "clusterGroups": [
-            {
-                "name": "test-backend",
-                "gpus": [
-                    {"name": "H100", "instanceTypes": [{"name": "instance-1"}, {"name": "instance-2"}]},
-                    {"name": "H100", "instanceTypes": [{"name": "instance-3"}]},
-                ],
-                "clusters": [{"name": "cluster-1"}, {"name": "cluster-2"}],
-            },
-            {
-                "name": "test-backend-2",
-                "gpus": [{"name": "H100", "instanceTypes": [{"name": "instance-4"}]}],
-                "clusters": [{"name": "cluster-3"}],
-            },
-        ],
-    }
-
-    # Mock the response
-    mock_response = NVCFResponse(mock_response_data)
-
-    mock_ncg_client = MagicMock()
-    mock_ncg_client.get.return_value = mock_response
-
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
-    nvcf_helper.ncg_api_hdl = mock_ncg_client
-
-    # Get the results
-    result = nvcf_helper.nvcf_helper_list_clusters()
-
-    # Asserts for testing the result
-    assert result is not None
-    assert isinstance(result, Table)
-    assert result.title == "Cluster Groups"
-
-    columns = [col.header for col in result.columns]
-    assert "Backend Name" in columns
-    assert "GPU-Types Inst-Types" in columns
-    assert "Clusters" in columns
-
-    mock_ncg_client.get.assert_called_once_with("/v2/nvcf/clusterGroups")
-
-    output_str = StringIO()
-    console = Console(file=output_str, width=400, record=True)
-    console.print(result)
-
-    # Asserts for testing content of table
-    assert "test-backend" in output_str.getvalue()
-    assert "test-backend-2" in output_str.getvalue()
-    assert "H100" in output_str.getvalue()
-    assert "instance-1" in output_str.getvalue()
-    assert "instance-2" in output_str.getvalue()
-    assert "instance-3" in output_str.getvalue()
-    assert "instance-4" in output_str.getvalue()
-    assert "cluster-1" in output_str.getvalue()
-    assert "cluster-3" in output_str.getvalue()
-
-
-def test_nvcf_helper_list_clusters_failure(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-    """Test that nvcf_helper_list_clusters returns None on failure.
-
-    Args:
-        monkeypatch: The monkeypatch object.
-        tmp_path: The temporary path object.
-
-    Returns:
-        None
-
-    """
-    mock_ncg_client = MagicMock()
-    mock_ncg_client.get.return_value = None
-
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
-    nvcf_helper.ncg_api_hdl = mock_ncg_client
-    with pytest.raises(RuntimeError):
-        nvcf_helper.nvcf_helper_list_clusters()
-
-    mock_response_data = {
-        "status": 500,
-    }
-    mock_response = NVCFResponse(mock_response_data)
-    mock_ncg_client.get.return_value = mock_response
-    nvcf_helper.ncg_api_hdl = mock_ncg_client
-
-    with pytest.raises(RuntimeError):
-        nvcf_helper.nvcf_helper_list_clusters()
-
-
 def test_nvcf_helper_list_functions_success(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-    """Test that nvcf_helper_list_clusters returns the expected table on success.
+    """Test that list functions returns the expected table on success.
 
     Args:
         monkeypatch: The monkeypatch object.
@@ -984,7 +881,6 @@ def test_nvcf_helper_invoke_function_failures(
             version=None,
             data_file=None,
             prompt_file=None,
-            asset_id=None,
             s3_config=None,
         )
 
@@ -1042,7 +938,6 @@ def test_nvcf_helper_invoke_function_success(monkeypatch: MonkeyPatch, tmp_path:
         version=None,
         data_file=str(tmp_file),
         prompt_file=str(tmp_prompt_file),
-        asset_id=None,
         s3_config=None,
     )
 
@@ -1076,7 +971,6 @@ def test_nvcf_helper_invoke_function_success(monkeypatch: MonkeyPatch, tmp_path:
         version=None,
         data_file=str(tmp_file),
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
 
@@ -1181,7 +1075,6 @@ def test_nvcf_helper_invoke_function_can_use_pexec(monkeypatch: MonkeyPatch, tmp
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
 
@@ -1189,7 +1082,6 @@ def test_nvcf_helper_invoke_function_can_use_pexec(monkeypatch: MonkeyPatch, tmp
     mock_nvcf_client.post.assert_called_once_with(
         "/v2/nvcf/pexec/functions/test-id/versions/test-version",
         data={},
-        extra_head=None,
         timeout=15,
         addl_headers=True,
         enable_504=True,
@@ -1213,7 +1105,6 @@ def test_nvcf_helper_pexec_invocation_requires_request_headers(monkeypatch: Monk
             version="test-version",
             data_file=None,
             prompt_file=None,
-            asset_id=None,
             s3_config=None,
         )
 
@@ -1236,7 +1127,6 @@ def test_nvcf_helper_direct_invocation_allows_synchronous_success_without_tracki
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
 
@@ -1263,7 +1153,6 @@ def test_nvcf_helper_direct_invocation_uses_async_tracking_fields_from_body(
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
 
@@ -1289,7 +1178,6 @@ def test_nvcf_helper_direct_invocation_rejects_async_status_without_request_id(
             version="test-version",
             data_file=None,
             prompt_file=None,
-            asset_id=None,
             s3_config=None,
         )
 
@@ -1314,7 +1202,6 @@ def test_nvcf_helper_auto_invocation_falls_back_to_direct_status(monkeypatch: Mo
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
     assert result["reqid"] == "test-reqid"
@@ -1339,6 +1226,70 @@ def test_nvcf_helper_auto_invocation_falls_back_to_direct_status(monkeypatch: Mo
     mock_nvcf_client.get.assert_not_called()
 
 
+def test_nvcf_helper_auto_invocation_falls_back_to_direct_after_pexec_500(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test default auto invocation falls back when pexec returns 500."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        NVCFResponse({"status": 500, "issue": {"detail": "Inference connection error"}}),
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}),
+    ]
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        s3_config=None,
+    )
+
+    assert result["reqid"] == "test-reqid"
+    assert mock_nvcf_client.post.call_args_list[0].args[0] == "/v2/nvcf/pexec/functions/test-id/versions/test-version"
+    assert (
+        mock_nvcf_client.post.call_args_list[1].args[0]
+        == "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline"
+    )
+
+
+def test_nvcf_helper_auto_invocation_falls_back_to_direct_after_pexec_server_error(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """Test default auto invocation falls back when pexec raises a server error."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        RuntimeError(['{"reqid": "test-pexec-reqid"}', "Inference connection error while making inference request"]),
+        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}),
+    ]
+
+    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
+    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
+
+    result = nvcf_helper.nvcf_helper_invoke_function(
+        funcid="test-id",
+        ddir=str(tmp_path),
+        version="test-version",
+        data_file=None,
+        prompt_file=None,
+        s3_config=None,
+    )
+
+    assert result["reqid"] == "test-reqid"
+    assert mock_nvcf_client.post.call_args_list[0].args[0] == "/v2/nvcf/pexec/functions/test-id/versions/test-version"
+    assert (
+        mock_nvcf_client.post.call_args_list[1].args[0]
+        == "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline"
+    )
+
+
 def test_nvcf_helper_auto_invocation_does_not_fallback_after_pexec_timeout(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1358,7 +1309,6 @@ def test_nvcf_helper_auto_invocation_does_not_fallback_after_pexec_timeout(
             version="test-version",
             data_file=None,
             prompt_file=None,
-            asset_id=None,
             s3_config=None,
         )
 
@@ -1385,7 +1335,6 @@ def test_nvcf_helper_auto_status_preserves_non_legacy_direct_status(monkeypatch:
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
     assert result["status"] == "in-progress"
@@ -1427,7 +1376,6 @@ def test_nvcf_helper_auto_legacy_status_from_pexec_invoke_does_not_fallback_afte
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
     )
     assert result["status"] == "in-progress"
@@ -1498,51 +1446,6 @@ def test_nvcf_helper_auto_status_without_invoke_provenance_does_not_fallback_aft
     assert "test-reqid" not in nvcf_helper._direct_fallback_reqids
 
 
-def test_nvcf_helper_auto_asset_probe_timeout_does_not_fallback_to_direct(
-    monkeypatch: MonkeyPatch, tmp_path: Path
-) -> None:
-    """Test post-fulfilled asset probe timeout is not treated as direct fallback."""
-    mock_nvcf_client = MagicMock()
-    mock_nvcf_client.post.side_effect = [
-        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "0", "status": "in-progress"}}),
-        NVCFResponse({"status": 200, "headers": {"reqid": "test-reqid", "pct": "100.0", "status": "fulfilled"}}),
-    ]
-    mock_nvcf_client.get.return_value = NVCFResponse({"status": 504, "timeout": True})
-
-    monkeypatch.delenv("NVCF_INVOCATION_MODE", raising=False)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    nvcf_helper = NvcfHelper(url="", nvcf_url="", key="", org="", team="", timeout=15)
-    nvcf_helper.nvcf_api_hdl = mock_nvcf_client
-
-    result = nvcf_helper.nvcf_helper_invoke_function(
-        funcid="test-id",
-        ddir=str(tmp_path),
-        version="test-version",
-        data_file=None,
-        prompt_file=None,
-        asset_id=None,
-        s3_config=None,
-    )
-    assert result["status"] == "in-progress"
-
-    nvcf_helper.nvcf_helper_get_request_status_with_wait(
-        reqid="test-reqid", ddir=str(tmp_path), funcid="test-id", version="test-version"
-    )
-
-    assert mock_nvcf_client.post.call_count == 2
-    mock_nvcf_client.post.assert_any_call(
-        "https://test-id.invocation.api.nvcf.nvidia.com/v1/run_pipeline",
-        extra_head={"CURATOR-NVCF-REQID": "test-reqid", "CURATOR-STATUS-CHECK": "true"},
-        addl_headers=True,
-        full_url=True,
-    )
-    mock_nvcf_client.get.assert_called_once_with(
-        "/v2/nvcf/pexec/status/test-reqid", timeout=15, addl_headers=True, enable_504=True
-    )
-    assert "test-reqid" not in nvcf_helper._direct_fallback_reqids
-    assert "test-reqid" in nvcf_helper._pexec_invocation_reqids
-
-
 def test_nvcf_helper_invoke_wait_does_not_poll_after_direct_invocation(
     monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1570,7 +1473,6 @@ def test_nvcf_helper_invoke_wait_does_not_poll_after_direct_invocation(
         version="test-version",
         data_file=None,
         prompt_file=None,
-        asset_id=None,
         s3_config=None,
         legacy_cf=False,
         wait=True,

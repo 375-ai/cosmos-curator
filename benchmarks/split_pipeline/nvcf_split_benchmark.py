@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -148,6 +149,7 @@ def _run_benchmark_attempt(  # noqa: PLR0913
     tmpdir_path: Path,
     transport_params: dict[str, Any],
     limit: int,
+    post_active_settle_seconds: int,
 ) -> str:
     """Run one benchmark attempt and return summary path when counts are valid."""
     attempt_summary_path = f"{attempt_output_prefix}/summary.json"
@@ -159,7 +161,11 @@ def _run_benchmark_attempt(  # noqa: PLR0913
     logger.info(f"Attempt {attempt}/{max_attempts} with output: {attempt_output_prefix}")
     try:
         with nvcf_function.deploy(backend, gpu, instance_type, deploy_config, num_nodes, max_concurrency):
+            if post_active_settle_seconds > 0:
+                logger.info(f"Waiting {post_active_settle_seconds}s after deployment reached ACTIVE before invoke")
+                time.sleep(post_active_settle_seconds)
             nvcf_function.invoke(invoke_config, s3_config_str, out_dir=tmpdir_path, retry_cnt=1)
+            logger.info(f"Invoke completed for attempt {attempt}/{max_attempts}; deployment cleanup will run next")
     except NvcfFunctionAlreadyDeployedError as e:
         msg = "Function is already deployed, this should not happen, previous benchmark may be running."
         raise RuntimeError(msg) from e
@@ -167,6 +173,7 @@ def _run_benchmark_attempt(  # noqa: PLR0913
         msg = f"Attempt {attempt}/{max_attempts} failed: {e!s}"
         raise RetryableBenchmarkAttemptError(msg) from e
 
+    logger.info(f"Validating summary for attempt {attempt}/{max_attempts}: {attempt_summary_path}")
     if not _summary_counts_are_valid(attempt_summary_path, transport_params, limit):
         msg = (
             f"Attempt {attempt}/{max_attempts} produced invalid summary counts at {attempt_summary_path}. "
@@ -193,6 +200,7 @@ def _run_benchmark(  # noqa: PLR0913
     tmpdir_path: Path,
     transport_params: dict[str, Any],
     limit: int,
+    post_active_settle_seconds: int,
 ) -> str:
     """Run the benchmark with retries and return a validated summary path."""
     retryer = tenacity.Retrying(
@@ -225,6 +233,7 @@ def _run_benchmark(  # noqa: PLR0913
                     tmpdir_path=tmpdir_path,
                     transport_params=transport_params,
                     limit=limit,
+                    post_active_settle_seconds=post_active_settle_seconds,
                 )
                 logger.info(f"Using validated summary at {summary_path}")
                 return summary_path
@@ -337,6 +346,7 @@ def nvcf_split_benchmark(  # noqa: PLR0913
     kratos_metrics_endpoint: str,
     metrics_path: str | None,
     max_attempts: int,
+    post_active_settle_seconds: int,
     *,
     clip_re_chunk_size: int,
     qwen_use_fp8_weights: bool,
@@ -444,6 +454,7 @@ aws_region = {s3_secrets.aws_region}
             tmpdir_path=tmpdir_path,
             transport_params=transport_params,
             limit=limit,
+            post_active_settle_seconds=post_active_settle_seconds,
         )
 
         kratos_secrets: KratosSecrets | None = None
@@ -623,6 +634,13 @@ def _parse_args() -> argparse.Namespace:
         default=2,
         help="Maximum number of benchmark attempts with unique output paths.",
     )
+    parser.add_argument(
+        "--post-active-settle-seconds",
+        type=int,
+        required=False,
+        default=30,
+        help="Seconds to wait after deployment reaches ACTIVE before invoking.",
+    )
     args = parser.parse_args()
     if args.image:
         if args.image_repository or args.image_tag:
@@ -654,6 +672,9 @@ def main() -> None:
     args.vllm_use_inflight_batching = bool(args.vllm_use_inflight_batching)
     if args.max_attempts < 1:
         msg = "max-attempts must be at least 1."
+        raise ValueError(msg)
+    if args.post_active_settle_seconds < 0:
+        msg = "post-active-settle-seconds must be non-negative."
         raise ValueError(msg)
 
     if args.metrics_path:
@@ -698,6 +719,7 @@ def main() -> None:
         kratos_metrics_endpoint=args.kratos_metrics_endpoint,
         metrics_path=args.metrics_path,
         max_attempts=args.max_attempts,
+        post_active_settle_seconds=args.post_active_settle_seconds,
         report_metrics_to_kratos=args.report_metrics_to_kratos,
         clip_re_chunk_size=args.clip_re_chunk_size,
         qwen_use_fp8_weights=args.qwen_use_fp8_weights,

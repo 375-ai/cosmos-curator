@@ -323,46 +323,6 @@ def test_invoke_function_no_id_version(mock_cc: MagicMock, tmp_path: Path) -> No
 
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
-def test_invoke_function_bad_assetid(mock_cc: MagicMock, tmp_path: Path) -> None:
-    """Test that invoke-function fails with a bad assetid.
-
-    Args:
-        mock_cc: A mock to return a fake helper.
-        tmp_path: A temporary path.
-
-    """
-    # Mock NvfcHelper
-    mock_instance = MagicMock()
-    mock_func = MagicMock(return_value=mock_instance)
-    mock_cc.return_value = {"function": {"help": "A fake function", "type": mock_func}}
-
-    fname = tmp_path / "fake.json"
-    fname.touch()
-
-    mock_instance.id_version.return_value = (True, 1234, 5678)
-    # A mock uuid
-    my_uuid = uuid.uuid4()
-
-    args = [
-        "nvcf",
-        "function",
-        "invoke-function",
-        "--data-file",
-        str(fname),
-        "--assetid",
-        str(my_uuid),
-        "--assetfile",
-        str(fname),
-    ]
-
-    result = runner.invoke(cosmos_curator, args)
-    mock_instance.logger.error.assert_called_with(
-        "Could not invoke function: assetid and assetfile are mutually exclusive"
-    )
-    assert result.exit_code == 1
-
-
-@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
 def test_invoke_function_test_wait(mock_cc: MagicMock, tmp_path: Path) -> None:
     """Test that invoke-function call correct function with wait.
 
@@ -432,12 +392,6 @@ def test_invoke_function_validation_failures(mock_cc: MagicMock, tmp_path: Path)
 
     fname.touch()
 
-    mock_instance.id_version.return_value = (True, 1234, 5678)
-    args = ["nvcf", "function", "invoke-function", "--data-file", str(fname), "--assetid", "badassetid"]
-
-    result = runner.invoke(cosmos_curator, args)
-    assert result.exit_code != 0
-
     # negatitive number
     args = [
         "nvcf",
@@ -452,31 +406,32 @@ def test_invoke_function_validation_failures(mock_cc: MagicMock, tmp_path: Path)
     assert result.exit_code != 0
 
 
-@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
-def test_list_clusters(mock_cc: MagicMock) -> None:
-    """Test that list-clusters can succeed.
-
-    Args:
-        mock_cc: A mock to return a fake helper.
-
-    """
-    # Mock NvfcHelper
-    mock_instance = MagicMock()
-    mock_func = MagicMock(return_value=mock_instance)
-    mock_cc.return_value = {"function": {"help": "A fake function", "type": mock_func}}
-
-    # Mock the required method
-    mock_instance.nvcf_helper_list_clusters.return_value = "mock clusters response"
-
+def test_list_clusters_command_removed() -> None:
+    """Test that deprecated cluster group listing is no longer exposed."""
     args = ["nvcf", "function", "list-clusters"]
 
     result = runner.invoke(cosmos_curator, args)
-    assert result.exit_code == 0
+    assert result.exit_code == 2
+    assert "No such command 'list-clusters'" in result.output
 
-    # Test with exception in helper method
-    mock_instance.nvcf_helper_list_clusters.side_effect = RuntimeError("mock exception")
+
+def test_asset_options_removed_from_invoke(tmp_path: Path) -> None:
+    """Test that deprecated asset invocation options are no longer exposed."""
+    fname = tmp_path / "fake.json"
+    fname.touch()
+    args = [
+        "nvcf",
+        "function",
+        "invoke-function",
+        "--data-file",
+        str(fname),
+        "--assetid",
+        str(uuid.uuid4()),
+    ]
+
     result = runner.invoke(cosmos_curator, args)
-    assert result.exit_code == 1
+    assert result.exit_code == 2
+    assert "--assetid" in result.output
 
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
@@ -807,6 +762,54 @@ def test_nvcf_undeploy_function(mock_cc: MagicMock) -> None:
     mock_instance = MagicMock()
     mock_func = MagicMock(return_value=mock_instance)
     mock_cc.return_value = {"function": {"help": "A fake function", "type": mock_func}}
+
+    # Mock the required methods
+    mock_instance.id_version.return_value = (True, _FAKE_UUID_ONE, _FAKE_UUID_TWO)
+    mock_instance.nvcf_helper_undeploy_function.return_value = ("test-function", "undeployed")
+
+    args = ["nvcf", "function", "undeploy-function", "--funcid", _FAKE_UUID_ONE, "--version", _FAKE_UUID_TWO]
+
+    result = runner.invoke(cosmos_curator, args)
+    assert result.exit_code == 0
+
+    # Test with exception in helper method
+    mock_instance.nvcf_helper_undeploy_function.side_effect = RuntimeError("mock exception")
+    result = runner.invoke(cosmos_curator, args)
+    assert result.exit_code == 1
+
+    # Test with failed id_version validation
+    mock_instance.id_version.return_value = (False, _FAKE_UUID_ONE, _FAKE_UUID_TWO)
+    result = runner.invoke(cosmos_curator, args)
+    assert result.exit_code == 1
+
+
+@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
+def test_import_and_undeploy_function(mock_cc: MagicMock) -> None:
+    """Test that import-function and undeploy-function can succeed.
+
+    Args:
+        mock_cc: A mock to return a fake helper.
+
+    """
+    # Mock NvfcHelper
+    mock_instance = MagicMock()
+    mock_func = MagicMock(return_value=mock_instance)
+    mock_cc.return_value = {"function": {"help": "A fake function", "type": mock_func}}
+
+    args = [
+        "nvcf",
+        "function",
+        "import-function",
+        "--funcid",
+        _FAKE_UUID_ONE,
+        "--version",
+        _FAKE_UUID_TWO,
+        "--name",
+        "test-function",
+    ]
+
+    result = runner.invoke(cosmos_curator, args)
+    assert result.exit_code == 0
 
     # Mock the required methods
     mock_instance.id_version.return_value = (True, _FAKE_UUID_ONE, _FAKE_UUID_TWO)

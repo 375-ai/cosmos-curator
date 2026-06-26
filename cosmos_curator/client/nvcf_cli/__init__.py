@@ -16,17 +16,15 @@
 """Initialize the NVIDIA Cloud Function launcher package.
 
 This package provides functionality for launching and managing NVIDIA Cloud Functions,
-including asset management, configuration, image handling, and model deployment.
+including configuration, image handling, and model deployment.
 """
 
-from .ncf.asset import asset_manager
 from .ncf.config import config_manager
 from .ncf.image import image_manager
 from .ncf.launcher import nvcf_driver
 from .ncf.model import model_manager
 
 __all__ = [
-    "asset_manager",
     "config_manager",
     "image_manager",
     "model_manager",

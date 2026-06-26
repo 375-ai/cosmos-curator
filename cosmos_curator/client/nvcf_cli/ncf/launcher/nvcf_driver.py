@@ -82,29 +82,6 @@ def _get_s3_config_str(s3_config_file: Path | None) -> str | None:
     return s3_config
 
 
-@nvcf.command(name="list-clusters", help="List available clusters")
-def nvcf_list_clusters(
-    ctx: Context,
-) -> None:
-    """List all available NVCF clusters.
-
-    Args:
-        ctx: The Typer context object.
-
-    Returns:
-        None.
-
-    """
-    nvcf_hdl = ctx.obj["nvcfHdl"]
-    try:
-        resp = nvcf_hdl.nvcf_helper_list_clusters()
-        nvcf_hdl.console.print(resp)
-    except Exception as e:
-        error_msg = f"Could not list clusters: {e!s}"
-        nvcf_hdl.logger.error(error_msg)  # noqa: TRY400
-        raise typer.Exit(code=1) from e
-
-
 @nvcf.command(name="list-functions", help="List available functions")
 def nvcf_list_functions(
     ctx: Context,
@@ -630,10 +607,7 @@ def nvcf_invoke_function(  # noqa: PLR0913
     ),
     legacy_cf: Annotated[bool, Option] = Option(
         default=False,
-        help=(
-            "Pass this flag for legacy cloud functions.\n\n"
-            "[yellow]When assetid/assetfile is passed, this is forced to True[/yellow]"
-        ),
+        help="Pass this flag for legacy cloud functions.",
         rich_help_panel="Invoke",
     ),
     funcid: Annotated[
@@ -650,27 +624,6 @@ def nvcf_invoke_function(  # noqa: PLR0913
             help="VersionId of the function",
             rich_help_panel="Invoke",
             callback=validate_uuid,
-        ),
-    ] = None,
-    assetid: Annotated[
-        str | None,
-        Option(
-            help="Optional comma delimited AssetID list to pass to the function",
-            rich_help_panel="Invoke",
-            callback=validate_uuid,
-        ),
-    ] = None,
-    assetfile: Annotated[
-        Path | None,
-        Option(
-            help="Optional file name containing list of AssetIDs to pass to the function, one per line",
-            rich_help_panel="Invoke",
-            exists=True,
-            file_okay=True,
-            dir_okay=False,
-            writable=False,
-            readable=True,
-            resolve_path=True,
         ),
     ] = None,
     s3_config_file: Annotated[
@@ -724,8 +677,6 @@ def nvcf_invoke_function(  # noqa: PLR0913
         prompt_file: Text file with prompt to append.
         funcid: Function ID to invoke.
         version: Function version ID.
-        assetid: Comma-delimited list of asset IDs.
-        assetfile: File containing asset IDs.
         s3_config_file: Path to S3 configuration.
         wait: Whether to wait for completion.
         retry_cnt: Number of retry attempts.
@@ -744,20 +695,6 @@ def nvcf_invoke_function(  # noqa: PLR0913
             error_msg = "id and version are required"
             _raise_runtime_err(error_msg)
 
-        if assetid is not None and assetfile is not None:
-            error_msg = "assetid and assetfile are mutually exclusive"
-            _raise_runtime_err(error_msg)
-
-        if assetid is not None:
-            legacy_cf = True
-            asset_id = assetid
-        elif assetfile is not None:
-            legacy_cf = True
-            with Path(assetfile).open() as f:
-                asset_id = f.read().strip()
-        else:
-            asset_id = None
-
         if wait:
             nvcf_hdl.nvcf_helper_invoke_wait_retry_function(
                 funcid=funcid,
@@ -765,7 +702,6 @@ def nvcf_invoke_function(  # noqa: PLR0913
                 version=version,
                 data_file=data_file,
                 prompt_file=prompt_file,
-                asset_id=asset_id,
                 s3_config=_get_s3_config_str(s3_config_file),
                 legacy_cf=legacy_cf,
                 wait=wait,
@@ -779,7 +715,6 @@ def nvcf_invoke_function(  # noqa: PLR0913
                 version=version,
                 data_file=data_file,
                 prompt_file=prompt_file,
-                asset_id=asset_id,
                 s3_config=_get_s3_config_str(s3_config_file),
             )
             nvcf_hdl.console.print(f"RequestId: {resp['reqid']}")

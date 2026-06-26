@@ -162,8 +162,7 @@ def nvcf_config_get_config(
 
 @nvcf_config.command(
     name="set",
-    help="""Set configurations including API key, organization ID or name, base NGC url, and base NVCF url.
-            For backend, invoke 'nvcf function list-clusters' to find available options""",
+    help="Set configurations including API key, organization ID or name, base NGC url, and base NVCF url.",
     no_args_is_help=False,
 )
 def nvcf_config_set_config(  # noqa: C901, PLR0913, PLR0912

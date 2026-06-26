@@ -720,29 +720,14 @@ def get_progress(request_id: str) -> JSONResponse:
         )
 
 
-def get_asset_paths(request: Request) -> list[str]:
-    """Get asset paths."""
-    asset_dir = request.headers.get("NVCF-ASSET-DIR")
-    asset_ids = request.headers.get("NVCF-FUNCTION-ASSET-IDS", "").split(",")
-    asset_paths: list[str] = []
+def get_nvcf_output_path(request: Request) -> str:
+    """Get the NVCF large output directory, or a local fallback.
 
-    if asset_dir and asset_ids:
-        for asset_id in asset_ids:
-            asset_path = pathlib.Path(asset_dir) / asset_id.strip()
-            if asset_path.exists():
-                asset_paths.append(str(asset_path))
-
-    logger.info(f"Asset paths: {asset_paths}")
-    return asset_paths
-
-
-def input_assets_present(request: Request) -> bool:
-    """Check if input assets are present."""
-    return len(get_asset_paths(request)) > 0
-
-
-def get_asset_output_path(request: Request) -> str | None:
-    """Get the output path for the assets."""
+    NVCF-LARGE-OUTPUT-DIR started as the path to a linked asset output
+    directory. Keep honoring it for compatibility: it is still used for status
+    files and may also be used by callers as a cache/work directory without
+    relying on asset linkage.
+    """
     output_dir = request.headers.get("NVCF-LARGE-OUTPUT-DIR")
 
     if output_dir is None or not pathlib.Path(output_dir).exists():
@@ -751,14 +736,6 @@ def get_asset_output_path(request: Request) -> str | None:
         o_dir.mkdir(parents=True, exist_ok=True)
         output_dir = str(o_dir)
     return output_dir
-
-
-def get_asset_input_dir(request: Request) -> str | None:
-    """Get the input directory for the assets."""
-    asset_dir = request.headers.get("NVCF-ASSET-DIR")
-    if asset_dir is None:
-        return None
-    return asset_dir
 
 
 # Curator endpoint to run the video pipeline script
@@ -775,7 +752,7 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
     should_cleanup = True
 
     try:
-        nvcf_output_dir = get_asset_output_path(request)
+        nvcf_output_dir = get_nvcf_output_path(request)
         manager = Manager()
 
         # mypy is confused about the type
@@ -849,14 +826,8 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             pipeline_func: Callable[[argparse.Namespace], None] | None = None
 
             if pipeline_type == "split":
-                # handle possible assets. Do not override presigned URL paths.
-                if not getattr(pipeline_args, "input_presigned_s3_url", None) and input_assets_present(request):
-                    pipeline_args.input_video_path = get_asset_input_dir(request)
-
-                if not getattr(pipeline_args, "output_presigned_s3_url", None) and input_assets_present(request):
-                    pipeline_args.output_clip_path = get_asset_output_path(request)
                 if not getattr(pipeline_args, "output_clip_path", None):
-                    pipeline_args.output_clip_path = get_asset_output_path(request)
+                    pipeline_args.output_clip_path = get_nvcf_output_path(request)
 
                 # Validate that we have either a direct path or a presigned URL for both input and output
                 missing_input_path = not getattr(pipeline_args, "input_video_path", None)
@@ -879,11 +850,8 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
             elif pipeline_type == "shard":
                 pipeline_func = nvcf_run_shard
             elif pipeline_type == "annotate":
-                has_input_assets = input_assets_present(request)
-                if has_input_assets and not getattr(pipeline_args, "input_image_path", None):
-                    pipeline_args.input_image_path = get_asset_input_dir(request)
                 if not getattr(pipeline_args, "output_path", None):
-                    pipeline_args.output_path = get_asset_output_path(request)
+                    pipeline_args.output_path = get_nvcf_output_path(request)
 
                 if not getattr(pipeline_args, "input_image_path", None):
                     _value_error("Invalid Pipeline args: input_image_path must be provided")

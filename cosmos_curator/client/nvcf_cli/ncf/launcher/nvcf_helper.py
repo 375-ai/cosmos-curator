@@ -37,6 +37,7 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
@@ -52,7 +53,7 @@ _EXCEPTION_MESSAGE: str = "unexpected empty response"
 _INVOCATION_API_HOST = "invocation.api.nvcf.nvidia.com"
 _RUN_PIPELINE_PATH = "/v1/run_pipeline"
 _NVCF_INVOCATION_MODE = "NVCF_INVOCATION_MODE"
-_PEXEC_INVOCATION_FALLBACK_STATUSES = frozenset({404, 405, 410})
+_PEXEC_INVOCATION_FALLBACK_STATUSES = frozenset({404, 405, 410, 500})
 
 
 class InvocationMode(StrEnum):
@@ -219,6 +220,25 @@ class NvcfHelper(NvcfBase):
         elif mode != InvocationMode.DIRECT:
             self._pexec_invocation_reqids.add(reqid)
 
+    def _invoke_auto_with_direct_fallback(
+        self,
+        invoke_pexec: Callable[[], NVCFResponse | None],
+        invoke_direct: Callable[[], NVCFResponse | None],
+    ) -> tuple[NVCFResponse | None, bool]:
+        """Invoke through pexec in auto mode, falling back to direct when pexec is unavailable."""
+        try:
+            resp = invoke_pexec()
+        except RuntimeError as e:
+            self.logger.warning("Pexec invocation failed; falling back to direct invocation: %s", e)
+            return invoke_direct(), True
+
+        if _can_fallback_invocation_to_direct(resp):
+            status = "empty response" if resp is None else f"status {resp.status}"
+            self.logger.warning("Pexec invocation returned %s; falling back to direct invocation", status)
+            return invoke_direct(), True
+
+        return resp, False
+
     def load_ids(self) -> dict[str, Any]:
         """Load function identifiers from the stored file.
 
@@ -278,55 +298,6 @@ class NvcfHelper(NvcfBase):
         if funcid is None or version is None:
             return False, funcid, version
         return True, funcid, version
-
-    def nvcf_helper_list_clusters(self) -> Table:
-        """List all available NVCF cluster groups.
-
-        Returns:
-            Table: A rich table containing information about all cluster groups,
-                  including backend names, GPU types, instance types, and clusters.
-
-        Raises:
-            RuntimeError: If the API request fails or returns an error.
-
-        """
-        resp = self.ncg_api_hdl.get("/v2/nvcf/clusterGroups")
-
-        if resp is None:
-            raise RuntimeError(_EXCEPTION_MESSAGE)
-        if resp.is_error:
-            _raise_runtime_err(resp.get_error("clusters"))
-
-        groups_data = resp.get("clusterGroups", [])
-        groups = Table(title="Cluster Groups")
-        groups.add_column("Backend Name")
-        groups.add_column("GPU-Types Inst-Types")
-        groups.add_column("Clusters")
-        for ele in groups_data:
-            name = ele.get("name")
-            gl = ele.get("gpus")
-            gpus = Table(show_header=False, box=None, show_edge=False)
-
-            gpus.add_column()
-            for gle in gl:
-                gpu_name = gle.get("name")
-                instance_types = gle.get("instanceTypes")
-                instances = Table(show_header=False, show_edge=False)
-                for ile in instance_types:
-                    ins_name = ile.get("name")
-                    instances.add_row(ins_name)
-                gpus.add_row(gpu_name, instances, end_section=True)
-
-            cl = ele.get("clusters")
-            clusters = Table(show_header=False, show_edge=False)
-            clusters.add_column()
-            for cle in cl:
-                cluster_name = cle.get("name")
-                clusters.add_row(cluster_name)
-
-            groups.add_row(name, gpus, clusters, end_section=True)
-
-        return groups
 
     def nvcf_helper_list_functions(self) -> Table:
         """List all available NVCF functions.
@@ -849,7 +820,6 @@ class NvcfHelper(NvcfBase):
         version: str | None = None,
         data_file: str | None = None,
         prompt_file: str | None = None,
-        asset_id: str | None = None,
         s3_config: str | None = None,
         legacy_cf: bool = True,
         wait: bool = True,
@@ -870,8 +840,6 @@ class NvcfHelper(NvcfBase):
                                            Defaults to None.
             prompt_file (str | None, optional): Path to a file containing a prompt text.
                                              Defaults to None.
-            asset_id (str | None, optional): Asset ID to use for the invocation.
-                                          Defaults to None.
             s3_config (str | None, optional): S3 configuration to use. Defaults to None.
             legacy_cf (bool, optional): Whether to use the legacy client flow.
                                       Defaults to True.
@@ -898,7 +866,6 @@ class NvcfHelper(NvcfBase):
                     version=version,
                     data_file=data_file,
                     prompt_file=prompt_file,
-                    asset_id=asset_id,
                     s3_config=s3_config,
                     ddir=ddir,
                 )
@@ -992,7 +959,7 @@ class NvcfHelper(NvcfBase):
         if cnt <= 0:
             _raise_runtime_err(f"Giving up after retrying for {retry_cnt} times")
 
-    def nvcf_helper_invoke_function(  # noqa: C901, PLR0913, PLR0915
+    def nvcf_helper_invoke_function(  # noqa: C901, PLR0913
         self,
         *,
         funcid: str,
@@ -1000,7 +967,6 @@ class NvcfHelper(NvcfBase):
         version: str | None = None,
         data_file: str | None = None,
         prompt_file: str | None = None,
-        asset_id: str | None = None,
         s3_config: str | None = None,
     ) -> dict[str, Any]:
         """Invoke a function with the specified parameters.
@@ -1013,8 +979,6 @@ class NvcfHelper(NvcfBase):
                                            Defaults to None.
             prompt_file (str | None, optional): Path to a file containing a prompt text.
                                              Defaults to None.
-            asset_id (str | None, optional): Asset ID to use for the invocation.
-                                          Defaults to None.
             s3_config (str | None, optional): S3 configuration to use. Defaults to None.
 
         Returns:
@@ -1051,15 +1015,10 @@ class NvcfHelper(NvcfBase):
         if s3_config is not None and "args" in invoke_data and isinstance(invoke_data["args"], dict):
             invoke_data["args"]["s3_config"] = s3_config
 
-        eh = None
-        if asset_id is not None:
-            eh = {"NVCF-INPUT-ASSET-REFERENCES": asset_id}
         used_direct = False
 
         def invoke_direct() -> NVCFResponse | None:
             direct_headers = {"CURATOR-DIRECT-MODE": "true"}
-            if eh is not None:
-                direct_headers.update(eh)
             return self.nvcf_api_hdl.post(
                 _nvcf_direct_invocation_url(funcid),
                 data=invoke_data,
@@ -1076,7 +1035,6 @@ class NvcfHelper(NvcfBase):
             return self.nvcf_api_hdl.post(
                 endpoint,
                 data=invoke_data,
-                extra_head=eh,
                 timeout=self.timeout,
                 addl_headers=True,
                 enable_504=True,
@@ -1092,12 +1050,7 @@ class NvcfHelper(NvcfBase):
             # Temporary migration mode: prefer pexec so older deployed
             # functions keep working. Only fall back when pexec is clearly
             # unavailable; timeouts may mean the request was accepted.
-            resp = invoke_pexec()
-            if _can_fallback_invocation_to_direct(resp):
-                status = "empty response" if resp is None else f"status {resp.status}"
-                self.logger.warning("Pexec invocation returned %s; falling back to direct invocation", status)
-                used_direct = True
-                resp = invoke_direct()
+            resp, used_direct = self._invoke_auto_with_direct_fallback(invoke_pexec, invoke_direct)
 
         if resp is None:
             raise RuntimeError(_EXCEPTION_MESSAGE)
@@ -1383,17 +1336,6 @@ class NvcfHelper(NvcfBase):
 
                 status = resp.get("status")
                 if status in {"fulfilled", "done"}:
-                    # need one round of help from legacy side, but break away anyways
-                    # in case the request was asset, but for non-asset cases, this is
-                    # not needed. Failure to fetch the asset will not be marked error
-                    # set legacy_cf to None to indicate we only care for download
-                    if rqid is not None:
-                        try:
-                            resp = self.nvcf_helper_get_request_status(
-                                rqid, ddir=ddir, funcid=funcid, version=version, legacy_cf=None
-                            )
-                        except (RuntimeError, TimeoutError):
-                            self.logger.info("Not downloading any assets")
                     break
                 if status == "failed":
                     msg = f"RequestId: {reqid} has failed, check logs for details"

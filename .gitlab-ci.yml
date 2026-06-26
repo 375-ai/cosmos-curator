@@ -1289,6 +1289,10 @@ nvcf_split_benchmark:
     - *setup_curator_cli
   script:
     - .gitlab/scripts/nvcf_split_benchmark.sh
+  artifacts:
+    when: on_failure
+    paths:
+      - "trace.log"
 
 # GPU tests - runs actual mini pipeline with GPU
 k8s_gpu_tests:
