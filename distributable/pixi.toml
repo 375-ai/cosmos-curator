@@ -3,7 +3,7 @@
 [workspace]
 channels = ["rapidsai", "conda-forge"]
 name = "cosmos-curator-distributable"
-platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64", { name = "linux-64-cuda", platform = "linux-64", cuda = "13.0.2", glibc = "2.35" }, { name = "linux-aarch64-cuda", platform = "linux-aarch64", cuda = "13.0.2", glibc = "2.35" }]
 version = "1.0.0"
 
 [activation.env]
@@ -13,7 +13,7 @@ PYTHONNOUSERSITE = "1"
 python = ">=3.12.13,<3.13"
 pip = "*"
 
-[feature.core]
+[feature.linux]
 platforms = ["linux-64", "linux-aarch64"]
 
 [feature.core.dependencies]
@@ -73,11 +73,7 @@ gputest = "pytest -m env tests/cosmos_curator/pipelines tests/cosmos_curator/mod
 
 [feature.runtime]
 channels = ["conda-forge", "nvidia"]
-platforms = ["linux-64", "linux-aarch64"]
-
-[feature.runtime.system-requirements]
-cuda = "13.0.2"
-libc = { family = "glibc", version = "2.35" }
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 
 [feature.runtime.dependencies]
 cuda-libraries-dev = "*"
@@ -126,10 +122,7 @@ nvidia-nvtx = "*"
 
 [feature.cuml]
 channels = ["nvidia"]
-platforms = ["linux-64", "linux-aarch64"]
-
-[feature.cuml.system-requirements]
-cuda = "13.0.2"
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 
 [feature.cuml.dependencies]
 azure-identity = "*"
@@ -168,7 +161,6 @@ rotary-embedding-torch = "*"
 
 [feature.media]
 channels = ["conda-forge"]
-platforms = ["linux-64", "linux-aarch64"]
 
 [feature.media.pypi-dependencies]
 av = "==17.0.0"
@@ -215,8 +207,8 @@ transformers = ">=5.6.0,<6.0.0"
 [environments]
 cuml = ["core", "cuml", "tracing"]
 default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
-legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
-model-download = ["core", "tracing"]
-paddle-ocr = ["core", "media", "paddle-ocr", "tracing", "profiling"]
+legacy-transformers = ["linux", "core", "media", "legacy-transformers", "tracing", "profiling"]
+model-download = ["linux", "core", "tracing"]
+paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
 seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]
 sam3 = ["core", "runtime", "media", "sam3", "tracing", "profiling"]

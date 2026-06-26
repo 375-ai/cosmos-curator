@@ -65,10 +65,17 @@ def test_workspace_default_feature_is_cross_platform_minimal() -> None:
 
     assert pixi_config["workspace"]["channels"] == ["rapidsai", "conda-forge"]
     assert pixi_config["workspace"]["conda-pypi-map"] == {"conda-forge": "conda-pypi-map.json"}
-    assert pixi_config["workspace"]["platforms"] == ["linux-64", "linux-aarch64", "osx-arm64"]
+    assert pixi_config["workspace"]["platforms"] == [
+        "linux-64",
+        "linux-aarch64",
+        "osx-arm64",
+        {"name": "linux-64-cuda", "platform": "linux-64", "cuda": "13.0.2", "glibc": "2.35"},
+        {"name": "linux-aarch64-cuda", "platform": "linux-aarch64", "cuda": "13.0.2", "glibc": "2.35"},
+    ]
     assert pixi_config["dependencies"] == {"python": ">=3.12.13,<3.13", "pip": "*"}
     assert "pypi-dependencies" not in pixi_config
     assert "nvidia" not in pixi_config["workspace"]["channels"]
+    assert pixi_config["feature"]["linux"]["platforms"] == ["linux-64", "linux-aarch64"]
 
     conda_pypi_map = json.loads(_read_repo_file("conda-pypi-map.json"))
     assert conda_pypi_map == {
@@ -183,8 +190,8 @@ def test_runtime_features_are_separated_from_core() -> None:
         assert dependency_name not in core_pypi_dependencies
 
     assert runtime_feature["channels"] == ["conda-forge", "nvidia"]
-    assert runtime_feature["platforms"] == ["linux-64", "linux-aarch64"]
-    assert runtime_feature["system-requirements"]["cuda"] == "13.0.2"
+    assert runtime_feature["platforms"] == ["linux-64-cuda", "linux-aarch64-cuda"]
+    assert "system-requirements" not in runtime_feature
     for dependency_name in ("torch", "torchvision", "vllm", "cvcuda-cu13", "PyNvVideoCodec"):
         assert dependency_name in runtime_pypi_dependencies
     for dependency_name in ("transformers-cosmos3", "vllm-cosmos3"):
@@ -193,7 +200,7 @@ def test_runtime_features_are_separated_from_core() -> None:
         assert dependency_name not in runtime_pypi_dependencies
 
     assert media_feature["channels"] == ["conda-forge"]
-    assert media_feature["platforms"] == ["linux-64", "linux-aarch64"]
+    assert "platforms" not in media_feature
     assert media_dependencies["av"] == "==17.0.0"
     assert media_dependencies["ffmpeg"] == {"version": ">=8.1.1,<9", "build": "lgpl_*"}
     for dependency_name in ("libopencv", "opencv", "py-opencv"):
@@ -225,6 +232,7 @@ def test_legacy_transformers_environment_is_model_specific_runtime() -> None:
     assert "transformers-cosmos3" not in legacy_pypi_dependencies
     assert "vllm" not in legacy_pypi_dependencies
     assert pixi_config["environments"]["legacy-transformers"] == [
+        "linux",
         "core",
         "media",
         "legacy-transformers",
@@ -275,8 +283,8 @@ def test_media_policy_matches_root_and_distributable_locks() -> None:
     root_lock = _read_repo_file("pixi.lock")
     distributable_lock = _read_repo_file("distributable/pixi.lock")
 
-    assert "ffmpeg-8.1.1-lgpl_" in root_lock
-    assert "ffmpeg-8.1.1-gpl_" not in root_lock
+    assert "ffmpeg-8.1.2-lgpl_" in root_lock
+    assert "ffmpeg-8.1.2-gpl_" not in root_lock
     assert "opencv_python-" not in root_lock
     assert "av-17.0.0-cp" not in root_lock
 
@@ -294,6 +302,8 @@ def test_cuml_owns_rapids_channel() -> None:
     features = pixi_config["feature"]
     assert pixi_config["workspace"]["channels"][0] == "rapidsai"
     assert features["cuml"]["channels"] == ["nvidia"]
+    assert features["cuml"]["platforms"] == ["linux-64-cuda", "linux-aarch64-cuda"]
+    assert "system-requirements" not in features["cuml"]
     assert pixi_config["environments"]["cuml"] == ["core", "cuml", "tracing"]
     assert features["cuml"]["dependencies"]["cuml"] == "==26.02"
     assert "raft-dask" in features["cuml"]["dependencies"]
@@ -304,7 +314,7 @@ def test_model_download_environment_reuses_core() -> None:
     pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
 
     assert "model-download" not in pixi_config["feature"]
-    assert pixi_config["environments"]["model-download"] == ["core", "tracing"]
+    assert pixi_config["environments"]["model-download"] == ["linux", "core", "tracing"]
 
 
 def test_gputest_task_is_defined_on_core() -> None:
@@ -412,7 +422,6 @@ def test_slurm_end_to_end_uses_pixi_cluster_for_submit_cli() -> None:
     script = _script_lines(slurm_job["script"])
     after_script = _script_lines(slurm_job["after_script"])
     commands = "\n".join([*before_script, *script])
-    pixi_bootstrap_index = next(index for index, command in enumerate(before_script) if "pixi.sh/install.sh" in command)
     pixi_cache_index = next(
         index
         for index, command in enumerate(before_script)
@@ -422,16 +431,26 @@ def test_slurm_end_to_end_uses_pixi_cluster_for_submit_cli() -> None:
         index for index, command in enumerate(before_script) if "pixi install --frozen -e cluster" in command
     )
 
-    assert pixi_bootstrap_index < pixi_cache_index < pixi_setup_index
+    assert pixi_cache_index < pixi_setup_index
+    assert slurm_job["variables"]["CI_PIXI_BIN"] == "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/bin/pixi"
     assert slurm_job["variables"]["SLURM_E2E_PIXI_CACHE_DIR"] == (
         "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache"
     )
+    assert "CI_PIXI_BIN does not point to an executable Pixi binary" in commands
+    assert "pixi.sh/install.sh" not in commands
     assert "pixi install --frozen -e cluster" in commands
     assert ".gitlab/scripts/slurm_end_to_end.sh" in script
     assert 'rm -rf "${CI_PROJECT_DIR}/.pixi"' in after_script
     assert "pip install -e ." not in commands
     assert "source venv/bin/activate" not in commands
     assert "uv venv" not in commands
+
+    smoke_job = _read_ci_job("slurm_distributable_media_smoke")
+    smoke_commands = "\n".join(_script_lines(smoke_job["before_script"]))
+    assert smoke_job["variables"]["CI_PIXI_BIN"] == "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/bin/pixi"
+    assert "CI_PIXI_BIN does not point to an executable Pixi binary" in smoke_commands
+    assert "pixi.sh/install.sh" not in smoke_commands
+    assert "pixi install --frozen -e cluster" in smoke_commands
 
 
 def test_nvcf_split_benchmark_runs_as_package_module() -> None:

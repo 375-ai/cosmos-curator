@@ -2,7 +2,13 @@
 channels = ["rapidsai", "conda-forge"]
 conda-pypi-map = { conda-forge = "conda-pypi-map.json" }
 name = "cosmos-curator"
-platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+platforms = [
+    "linux-64",
+    "linux-aarch64",
+    "osx-arm64",
+    { name = "linux-64-cuda", platform = "linux-64", cuda = "13.0.2", glibc = "2.35" },
+    { name = "linux-aarch64-cuda", platform = "linux-aarch64", cuda = "13.0.2", glibc = "2.35" },
+]
 version = "1.0.0"
 
 [activation.env]
@@ -12,7 +18,7 @@ PYTHONNOUSERSITE = "1"  # isolate pixi environments from user/system site-packag
 python = ">=3.12.13,<3.13"
 pip = "*"
 
-[feature.core]
+[feature.linux]
 platforms = ["linux-64", "linux-aarch64"]
 
 [feature.core.dependencies]
@@ -137,13 +143,9 @@ types-tqdm = "*"
 mypy = "mypy"
 pytest = "pytest"
 
-[feature.runtime.system-requirements]
-cuda = "13.0.2" # match the version of the nvidia/cuda docker base image
-libc = { family = "glibc", version = "2.35" } # vllm cu130 wheels require manylinux_2_35
-
 [feature.runtime]
 channels = ["conda-forge", "nvidia"]
-platforms = ["linux-64", "linux-aarch64"]
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 
 [feature.runtime.dependencies]
 cuda-libraries-dev = "*"
@@ -196,10 +198,7 @@ nvidia-nvtx = "*"
 
 [feature.cuml]
 channels = ["nvidia"]
-platforms = ["linux-64", "linux-aarch64"]
-
-[feature.cuml.system-requirements]
-cuda = "13.0.2" # match the version of the nvidia/cuda docker base image
+platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 
 [feature.cuml.dependencies]
 azure-identity = "*"
@@ -242,7 +241,6 @@ rotary-embedding-torch = "*"
 
 [feature.media]
 channels = ["conda-forge"]
-platforms = ["linux-64", "linux-aarch64"]
 
 [feature.media.dependencies]
 av = "==17.0.0" # PyAV; pinned because 17.0.1 deadlocks in CodecContext.__dealloc__ during multi-threaded decode when a Python log callback is installed (TODO: unpin once PyAV releases a fix).
@@ -306,8 +304,8 @@ cluster = ["tools", "cluster"]
 cuml = ["core", "cuml", "tracing"]
 default = ["core", "runtime", "media", "transformers", "tracing", "profiling"]
 dev = ["tools", "cluster", "core", "media", "transformers", "tracing", "profiling", "dev"]
-legacy-transformers = ["core", "media", "legacy-transformers", "tracing", "profiling"]
-model-download = ["core", "tracing"]
-paddle-ocr = ["core", "media", "paddle-ocr", "tracing", "profiling"]
+legacy-transformers = ["linux", "core", "media", "legacy-transformers", "tracing", "profiling"]
+model-download = ["linux", "core", "tracing"]
+paddle-ocr = ["linux", "core", "media", "paddle-ocr", "tracing", "profiling"]
 seedvr = ["core", "runtime", "media", "transformers", "seedvr", "tracing", "profiling"]
 sam3 = ["core", "runtime", "media", "sam3", "tracing", "profiling"]

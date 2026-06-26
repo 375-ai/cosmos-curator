@@ -40,7 +40,7 @@ variables:
   CURATOR_SLIM_IMAGE: ${CI_REGISTRY_IMAGE}/curator-slim
   CURATOR_DISTRIBUTABLE_IMAGE: ${CI_REGISTRY_IMAGE}/curator-distributable
   CI_BUILDER_IMAGE_REPO: ${CI_REGISTRY_IMAGE}/ci-builder
-  CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE_REPO}:slim-dev
+  CI_BUILDER_IMAGE: ${CI_BUILDER_IMAGE_REPO}:latest
   BUILDX_BUILDER_NAME: ci-cosmos-builder
 
   # Pytest configuration
@@ -414,19 +414,8 @@ stages:
     docker login -u gitlab-ci-token -p ${CI_JOB_TOKEN} "${CI_REGISTRY}"
     echo "$PERF_REGISTRY_KEY" | docker login nvcr.io/${PERF_NGC_NVCF_ORG_ID} --username '$oauthtoken' --password-stdin
 
-  # Install Pixi when a custom runner does not provide the shared /usr/local/bin
-  # binary. Shell and ARM runners already have Pixi preinstalled there.
-  install_pixi_if_missing: &install_pixi_if_missing |
-    export PATH="/usr/local/bin:${HOME}/.pixi/bin:${PATH}"
-    if ! command -v pixi >/dev/null 2>&1; then
-      command -v curl
-      curl -fsSL https://pixi.sh/install.sh | PIXI_HOME="${HOME}/.pixi" PIXI_NO_PATH_UPDATE=1 sh
-    fi
-    command -v pixi
-
   # Install and activate the Pixi dev environment on shell runners.
   setup_pixi_dev: &setup_pixi_dev |
-    export PATH="/usr/local/bin:${HOME}/.pixi/bin:${PATH}"
     command -v pixi
     export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
     export PYTHONNOUSERSITE=1
@@ -438,8 +427,14 @@ stages:
 
   # Install and activate the Pixi cluster environment on shell runners.
   setup_pixi_cluster: &setup_pixi_cluster |
-    export PATH="/usr/local/bin:${HOME}/.pixi/bin:${PATH}"
+    : "${CI_PIXI_BIN:?CI_PIXI_BIN must point to an executable Pixi binary}"
+    if [ ! -x "${CI_PIXI_BIN}" ]; then
+      echo "ERROR: CI_PIXI_BIN does not point to an executable Pixi binary: ${CI_PIXI_BIN}" >&2
+      exit 1
+    fi
+    export PATH="$(dirname "${CI_PIXI_BIN}"):${PATH}"
     command -v pixi
+    pixi --version
     export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
     export PYTHONNOUSERSITE=1
     git config --global --add safe.directory "${CI_PROJECT_DIR:-$(pwd)}"
@@ -519,7 +514,8 @@ resolve_version:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && ($RUN_PROMOTE_TO_PROD == "True" || $RUN_BENCHMARK == "True")'
     - when: never
   script:
-    - *install_pixi_if_missing
+    - command -v pixi
+    - pixi --version
     - export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
     - export PYTHONNOUSERSITE=1
     - export CONDA_OVERRIDE_CUDA="${CONDA_OVERRIDE_CUDA:-13.0.2}"
@@ -985,12 +981,12 @@ slurm_end_to_end:
     - ${SLURM_RUNNER_TAG}
   variables:
     CI_BUILDS_DIR: ${NEMO_CI_PATH}/.config/${CI_JOB_ID}
+    CI_PIXI_BIN: "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/bin/pixi"
     ENROOT_CONFIG_PATH: "${CI_BUILDS_DIR}/.enroot"
     SLURM_E2E_S3_PROFILE_NAME: "default"
     SLURM_E2E_PIXI_CACHE_DIR: "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/cache"
   before_script:
     - source .gitlab/vault/vault-auth.sh
-    - *install_pixi_if_missing
     - export PIXI_CACHE_DIR="${SLURM_E2E_PIXI_CACHE_DIR}"
     - *setup_pixi_cluster
   script:
@@ -1025,11 +1021,11 @@ slurm_distributable_media_smoke:
     - ${SLURM_RUNNER_TAG}
   variables:
     CI_BUILDS_DIR: ${NEMO_CI_PATH}/.config/${CI_JOB_ID}
+    CI_PIXI_BIN: "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/pixi/bin/pixi"
     ENROOT_CONFIG_PATH: "${CI_BUILDS_DIR}/.enroot"
     DISTRIBUTABLE_FFMPEG_PREFIX: "/lustre/fsw/coreai_dlalgo_ci/nemo_video_curator/ffmpeg/.pixi/envs/default"
   before_script:
     - source .gitlab/vault/vault-auth.sh
-    - *install_pixi_if_missing
     - *setup_pixi_cluster
   script:
     - .gitlab/scripts/slurm_distributable_media_smoke.sh
