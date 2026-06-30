@@ -448,6 +448,20 @@ stages:
     export PATH="/opt/cosmos-curator/.pixi/envs/dev/bin:/usr/local/bin:${PATH}"
     eval "$(pixi shell-hook --manifest-path /opt/cosmos-curator/pixi.toml -e dev -s bash)"
 
+  # Activate the prebuilt Pixi dev env from the ci-builder image, but first
+  # reconcile it with the checked-out pixi.toml/pixi.lock so dependency bumps
+  # (e.g. cosmos-xenna) are picked up WITHOUT rebuilding the image.
+  setup_ci_builder_env_synced: &setup_ci_builder_env_synced |
+    export PYTHONNOUSERSITE=1
+    export CONDA_OVERRIDE_CUDA="${CONDA_OVERRIDE_CUDA:-13.0.2}"
+    export PATH="/opt/cosmos-curator/.pixi/envs/dev/bin:/usr/local/bin:${PATH}"
+    cp "${CI_PROJECT_DIR}"/{pixi.toml,pixi.lock,conda-pypi-map.json} /opt/cosmos-curator/
+    # Scope the version default to the pixi install invocation only (do NOT export
+    # it) so jobs that later run setup_curator/setup_curator_cli still fail fast
+    # via their ":?" guard when resolve_version did not supply the real version.
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR="${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:-0.0.0}" pixi install --frozen -e dev --manifest-path /opt/cosmos-curator/pixi.toml
+    eval "$(pixi shell-hook --manifest-path /opt/cosmos-curator/pixi.toml -e dev -s bash)"
+
   # Install the checked-out curator package. When the build_xenna_wheels matrix job
   # has produced a wheel (i.e. on MR pipelines with the 'use-local-xenna-build'
   # label), pip-install the host-arch wheel over the pixi-resolved
@@ -480,7 +494,7 @@ ruff:
   rules: *pre_merge_rules
   needs: []
   script:
-    - *setup_ci_builder_env
+    - *setup_ci_builder_env_synced
     - ruff format --check
     - ruff check
 
@@ -494,7 +508,7 @@ distributable_pixi_check:
   rules: *pre_merge_rules
   needs: []
   script:
-    - *setup_ci_builder_env
+    - *setup_ci_builder_env_synced
     - python tools/update_distributable_pixi.py --check
 
 resolve_version:
@@ -586,7 +600,7 @@ mypy:
       optional: true
       artifacts: true
   script:
-    - *setup_ci_builder_env
+    - *setup_ci_builder_env_synced
     - *setup_curator
     - mypy --pretty
   retry:
@@ -640,7 +654,7 @@ client_wheel_smoke:
     GIT_SUBMODULE_STRATEGY: none
   rules: *pre_post_merge_rules
   script:
-    - *setup_ci_builder_env
+    - *setup_ci_builder_env_synced
     - *setup_curator_cli
     - python -m build -w
     - |
