@@ -15,6 +15,7 @@
 """Runner interface for executing pipelines with different backends."""
 
 import abc
+import argparse
 from typing import TypeVar
 
 import attrs
@@ -27,6 +28,8 @@ from cosmos_xenna.pipelines.private.pipelines import run_pipeline as xenna_run_p
 from cosmos_xenna.pipelines.private.specs import (
     PipelineConfig,
     PipelineSpec,
+    SaturationAwareConfig,
+    SchedulerKind,
     StreamingSpecificSpec,
 )
 from cosmos_xenna.utils.verbosity import VerbosityLevel
@@ -121,6 +124,44 @@ class XennaRunner(RunnerInterface):
         spec = attrs.evolve(cls._default_streaming_spec(), **overrides)  # type: ignore[arg-type]
         return cls(streaming_spec=spec)
 
+    @classmethod
+    def with_saturation_aware(
+        cls,
+        *,
+        config: SaturationAwareConfig | None = None,
+        **streaming_overrides: object,
+    ) -> "XennaRunner":
+        """Build a runner that opts in to the saturation-aware streaming scheduler.
+
+        Args:
+            config: Saturation-aware config. ``None`` uses the
+                ``SaturationAwareConfig`` defaults.
+            **streaming_overrides: Additional ``StreamingSpecificSpec`` field
+                overrides forwarded to :meth:`with_streaming_overrides`.
+
+        Returns:
+            A new :class:`XennaRunner` whose ``streaming_spec`` carries
+            ``scheduler=SchedulerKind.SATURATION_AWARE``.
+
+        """
+        return cls.with_streaming_overrides(
+            scheduler=SchedulerKind.SATURATION_AWARE,
+            saturation_aware=config if config is not None else SaturationAwareConfig(),
+            **streaming_overrides,
+        )
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace | None) -> "XennaRunner":
+        """Build a runner from ``args.xenna_streaming_scheduler``.
+
+        ``None`` args or any non-``SATURATION_AWARE`` value falls back to
+        the default ``FRAGMENTATION_BASED`` scheduler.
+        """
+        scheduler_name = getattr(args, "xenna_streaming_scheduler", "FRAGMENTATION_BASED")
+        if scheduler_name == SchedulerKind.SATURATION_AWARE.name:
+            return cls.with_saturation_aware()
+        return cls()
+
     def run(
         self,
         input_tasks: list[T],
@@ -157,9 +198,9 @@ class XennaRunner(RunnerInterface):
             enable_work_stealing=False,
             return_last_stage_outputs=True,
             actor_pool_verbosity_level=VerbosityLevel.NONE,
-            monitoring_verbosity_level=VerbosityLevel.NONE
-            if is_running_on_the_cloud() and not is_running_on_slurm()
-            else VerbosityLevel.INFO,
+            monitoring_verbosity_level=(
+                VerbosityLevel.NONE if is_running_on_the_cloud() and not is_running_on_slurm() else VerbosityLevel.INFO
+            ),
             mode_specific=self._streaming_spec,
         )
 

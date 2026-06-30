@@ -309,7 +309,7 @@ def run_pipeline[T: PipelineTask](  # noqa: PLR0913
 
     """
     if runner is None:
-        runner = XennaRunner()
+        runner = XennaRunner.from_args(args)
 
     # Build a list of StageSpecs and fill in default config values.
     stage_specs = _build_pipeline_stage_specs(stages, stage_save_config, args)

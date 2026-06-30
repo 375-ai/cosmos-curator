@@ -207,6 +207,7 @@ def add_settings_cli_arguments[T: attrs.AttrsInstance](
 
 
 _EXECUTION_MODES = frozenset(("AUTO", "BATCH", "STREAMING"))
+_STREAMING_SCHEDULERS = frozenset(("FRAGMENTATION_BASED", "SATURATION_AWARE"))
 
 # Dest names registered by :func:`add_profiling_args` only (subset of this class).
 PROFILING_CLI_FIELDS: frozenset[str] = frozenset(
@@ -247,6 +248,19 @@ class CommonPipelineSettings:
             ),
             default="AUTO",
             choices=_EXECUTION_MODES,
+        ),
+    )
+    xenna_streaming_scheduler: str = attrs.field(
+        validator=validators.in_(_STREAMING_SCHEDULERS),
+        metadata=cli(
+            help=(
+                "Xenna streaming-mode autoscaler implementation. "
+                "FRAGMENTATION_BASED (default) uses the Rust-backed FragmentationBasedAutoscaler; "
+                "SATURATION_AWARE uses the pure-Python saturation-aware scheduler. "
+                "Ignored in BATCH execution mode."
+            ),
+            default="FRAGMENTATION_BASED",
+            choices=_STREAMING_SCHEDULERS,
         ),
     )
     limit: int = attrs.field(

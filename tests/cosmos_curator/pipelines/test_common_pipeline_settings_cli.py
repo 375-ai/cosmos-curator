@@ -17,6 +17,7 @@
 import argparse
 
 import attrs
+import pytest
 
 from cosmos_curator.pipelines.common_pipeline_settings import (
     PROFILING_CLI_FIELDS,
@@ -144,3 +145,68 @@ def test_execution_mode_default_is_auto() -> None:
     parser = _common_parser()
     args = parser.parse_args([])
     assert args.execution_mode == "AUTO"
+
+
+def test_xenna_streaming_scheduler_flag_is_kebab_case() -> None:
+    """The auto-derived flag follows the field-name -> kebab-case convention."""
+    parser = _common_parser()
+    action = _action_for_dest(parser, "xenna_streaming_scheduler")
+    assert action is not None
+    assert "--xenna-streaming-scheduler" in action.option_strings
+
+
+def test_xenna_streaming_scheduler_has_argparse_choices() -> None:
+    """The flag exposes both scheduler kinds as argparse choices."""
+    parser = _common_parser()
+    action = _action_for_dest(parser, "xenna_streaming_scheduler")
+    assert action is not None
+    assert action.choices is not None
+    assert set(action.choices) == {"FRAGMENTATION_BASED", "SATURATION_AWARE"}
+
+
+def test_xenna_streaming_scheduler_default_is_fragmentation_based() -> None:
+    """No flag -> FRAGMENTATION_BASED so behaviour is unchanged for existing operators."""
+    parser = _common_parser()
+    args = parser.parse_args([])
+    assert args.xenna_streaming_scheduler == "FRAGMENTATION_BASED"
+
+
+def test_xenna_streaming_scheduler_saturation_aware_value_round_trips() -> None:
+    """Operator-supplied SATURATION_AWARE round-trips through ``from_namespace``."""
+    parser = _common_parser()
+    args = parser.parse_args(["--xenna-streaming-scheduler", "SATURATION_AWARE"])
+    assert args.xenna_streaming_scheduler == "SATURATION_AWARE"
+
+    settings = CommonPipelineSettings.from_namespace(args)
+    assert settings.xenna_streaming_scheduler == "SATURATION_AWARE"
+
+
+def test_xenna_streaming_scheduler_rejects_unknown_value_at_parse_time() -> None:
+    """Argparse choices reject unknown values before the validator is reached."""
+    parser = _common_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--xenna-streaming-scheduler", "not-a-scheduler"])
+
+
+def test_xenna_streaming_scheduler_validator_rejects_unknown_value() -> None:
+    """The attrs ``validators.in_`` rejects unknown values when constructed directly."""
+    with pytest.raises(ValueError, match="xenna_streaming_scheduler"):
+        CommonPipelineSettings(
+            input_s3_profile_name="default",
+            output_s3_profile_name="default",
+            execution_mode="AUTO",
+            xenna_streaming_scheduler="not-a-scheduler",
+            limit=0,
+            verbose=False,
+            model_weights_path="weights",
+            perf_profile=True,
+            profile_tracing=False,
+            profile_tracing_sampling=0.01,
+            profile_tracing_otlp_endpoint="",
+            profile_cpu=False,
+            profile_memory=False,
+            profile_gpu=False,
+            profile_cpu_exclude="_root",
+            profile_memory_exclude="_root",
+            profile_gpu_exclude="_root",
+        )
