@@ -19,12 +19,21 @@ test filtering for running tests only in their respective conda environments.
 """
 
 import os
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
 
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
 from cosmos_curator.core.utils.environment import PIXI_ENVIRONMENT_NAME_VAR_NAME
+from tests.cosmos_curator.pipelines.provider_stub_utils import (
+    GeminiStub,
+    OpenAIStubServer,
+    make_gemini_stub,
+)
+from tests.cosmos_curator.pipelines.provider_stub_utils import (
+    openai_stub_server as _openai_stub_server_cm,
+)
 from tests.utils.sequential_runner import SequentialRunner
 
 
@@ -133,3 +142,30 @@ def sequential_runner() -> RunnerInterface:
 
     """
     return SequentialRunner()
+
+
+@pytest.fixture
+def openai_stub_server() -> Iterator[OpenAIStubServer]:
+    """Yield a localhost OpenAI-compatible HTTP stub server.
+
+    Shared foundation for OpenAI provider e2e tests (video + image): point an
+    endpoint's config ``base_url`` at ``server.base_url`` to drive the real
+    ``openai`` SDK end-to-end against canned chat-completion, responses,
+    embedding and models-list payloads, then assert on ``server.requests``.
+    See :mod:`tests.cosmos_curator.pipelines.provider_stub_utils`.
+    """
+    with _openai_stub_server_cm() as server:
+        yield server
+
+
+@pytest.fixture
+def gemini_stub() -> Callable[..., GeminiStub]:
+    """Return a factory that builds a fake ``genai.Client`` for Gemini tests.
+
+    Gemini has no ``base_url`` knob, so (unlike the OpenAI HTTP stub) it is
+    stubbed with an ``AsyncMock``/``SimpleNamespace`` fake client rather than a
+    real server. Call the factory to configure the canned response text /
+    candidates / usage metadata. See
+    :func:`tests.cosmos_curator.pipelines.provider_stub_utils.make_gemini_stub`.
+    """
+    return make_gemini_stub
