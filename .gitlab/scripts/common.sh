@@ -209,6 +209,7 @@ for cpu_arg in (
     "transnetv2_frame_decode_cpus_per_worker",
     "transcode_cpus_per_worker",
     "clip_extraction_cpus_per_worker",
+    "vllm_prepare_num_cpus_per_worker",
 ):
     args[cpu_arg] = 1
 

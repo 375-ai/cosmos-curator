@@ -1353,15 +1353,21 @@ k8s_gpu_tests:
 #                            basic/k8s_helm_test do not cover)
 #   - split_transnetv2_full: comprehensive run (motion + VLM + aesthetic +
 #                            previews + cosmos-predict dataset)
+#   - split_openai:          fixed-stride splitting + OpenAI-compatible captions
 # Opt-in via slurm_nvcf_e2e_rules (run-e2e-tests label / manual on MRs).
 k8s_gpu_extended:
   extends: k8s_gpu_tests
   rules: *slurm_nvcf_e2e_rules
+  tags:
+    - ${RUNNER_TAG}
   parallel:
     matrix:
-      - SCENARIO:
-          - split_fixed_stride
-          - split_transnetv2_full
+      - SCENARIO: split_fixed_stride
+        RUNNER_TAG: k8s-gpu
+      - SCENARIO: split_transnetv2_full
+        RUNNER_TAG: k8s-gpu
+      - SCENARIO: split_openai
+        RUNNER_TAG: k8s-cpu
   script:
     - .gitlab/scripts/k8s_gpu_extended.sh
 

@@ -1,0 +1,8 @@
+{{ if eq (env "SCENARIO") "split_openai" }}
+{{ with secretPath (printf "%s/%s" (env "VAULT_CICD_SECRETS_PATH") (env "OPENAI_CAPTION_ENDPOINT_HOST")) }}
+openai:
+  caption:
+    api_key: "{{ .Data.data.key }}"
+    base_url: "{{ .Data.data.base_url }}"
+{{ end }}
+{{ end }}

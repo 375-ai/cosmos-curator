@@ -1,0 +1,12 @@
+{
+    "pipeline": "split",
+    "args": {
+        "input_video_path": "FILL_IN",
+        "output_clip_path": "FILL_IN",
+        "limit": 1,
+        "generate_embeddings": false,
+        "splitting_algorithm": "fixed-stride",
+        "captioning_algorithm": "openai",
+        "openai_model_name": "nvidia/nvidia/nemotron-nano-12b-v2-vl"
+    }
+}
