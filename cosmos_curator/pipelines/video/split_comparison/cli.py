@@ -12,16 +12,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Command-line entry point for split-comparison.
+r"""Combined measure + eval entry point.
 
-Two surfaces, both config-driven:
+Default: measure both outputs (loads + diffs + one GPU embedding pass), persist
+the measurement tables, and evaluate them in the same process -- no read-back,
+so eval rides the measurements while they are still hot in memory.
 
-  python -m cosmos_curator.pipelines.video.split_comparison.cli --config audit.json     # load + run
-  python -m cosmos_curator.pipelines.video.split_comparison.cli --print-default-config  # emit default JSON
+``--skip-measure``: re-evaluate an existing measurements root with (possibly
+new) thresholds. The measurement tables are read once and run through the same
+eval; no GPU, no source IO. Outputs and caption scope (``--no-captions``) are
+recovered from the manifest when not re-supplied.
 
-Every tuning knob, both comparison targets, and the report destination live
-inside :class:`SplitComparisonConfig`. The CLI is intentionally minimal --
-add flags back only when ad-hoc override genuinely beats editing the config.
+``--skip-eval``: measure only -- persist the measurement tables + manifest and
+write no issues. Re-evaluate later with ``--skip-measure``.
+
+  # measure + eval
+  python -m cosmos_curator.pipelines.video.split_comparison.cli \\
+      --output-a s3://.../run_a --output-b s3://.../run_b \\
+      --measurements-path s3://.../measurements/a_vs_b
+
+  # re-eval only, stricter caption threshold, kept under its own name
+  python -m cosmos_curator.pipelines.video.split_comparison.cli \\
+      --measurements-path s3://.../measurements/a_vs_b \\
+      --skip-measure --min-caption-similarity 0.9 --eval-name strict
 """
 
 import argparse
@@ -30,125 +43,267 @@ import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
-import ray.data
 from loguru import logger
 from pydantic import ValidationError
 
-from cosmos_curator.pipelines.video.split_comparison.config import (
-    SplitComparisonConfig,
-    example_default_config,
-)
-from cosmos_curator.pipelines.video.split_comparison.driver import compare_split_outputs
-from cosmos_curator.pipelines.video.split_comparison.report_io import write_report
-from cosmos_curator.pipelines.video.split_comparison.result_model import Report
-
-_MAX_STDOUT_ISSUES = 5
+from cosmos_curator.pipelines.video.split_comparison import store, summary
+from cosmos_curator.pipelines.video.split_comparison.config import DEFAULT_PROFILE_NAME, SplitComparisonConfig
+from cosmos_curator.pipelines.video.split_comparison.eval import evaluate
+from cosmos_curator.pipelines.video.split_comparison.load import DEFAULT_LANCE_VERSION
+from cosmos_curator.pipelines.video.split_comparison.measure.core import Measurements
+from cosmos_curator.pipelines.video.split_comparison.result_model import Issue
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Parse args, run the comparison (or print default config), return an exit code."""
+    """Run measure and/or eval per the skip flags; write outputs; return an exit code."""
     args = _build_parser().parse_args(argv)
-
-    if args.print_default_config:
-        sys.stdout.write(example_default_config().model_dump_json(indent=2) + "\n")
-        return 0
-
+    if args.skip_measure and args.skip_eval:
+        sys.stderr.write("--skip-measure and --skip-eval together leave nothing to do\n")
+        return 2
     try:
-        config = _load_config(args.config)
-    except (OSError, json.JSONDecodeError, ValidationError) as err:
-        sys.stderr.write(f"Failed to load config from {args.config}: {err}\n")
+        config = _resolve_config(args)
+    except (OSError, json.JSONDecodeError, ValidationError, ValueError) as err:
+        sys.stderr.write(f"Failed to build config: {err}\n")
         return 2
 
-    _enable_ray_data_progress_ui()
-
     started = time.perf_counter()
-    report = compare_split_outputs(config=config)
-    path = write_report(report, config.report_path, report_format=config.report_format)
-    elapsed = time.perf_counter() - started
+    if args.skip_measure:
+        logger.info("Skipping measure; reading measurements from {}", args.measurements_path)
+        measurements = store.read_measurements(args.measurements_path, profile_name=config.profile_name)
+    else:
+        try:
+            measurements = _measure_and_persist(config, args)
+        except ValueError as err:
+            # A bad --num-gpus override or a GPU-less host surfaces as a ValueError from
+            # resolve_num_gpus(); report it cleanly as exit 2 (bad setup) rather than letting
+            # it escape as a traceback that exits 1 -- which would collide with "issues found".
+            sys.stderr.write(f"Measure failed: {err}\n")
+            return 2
 
-    sys.stdout.write(_format_stdout_summary(report, path, elapsed_sec=elapsed))
-    return 0 if report.passed else 1
+    if args.skip_eval:
+        # Measure-only: measurements + manifest are persisted; no eval outputs.
+        elapsed = time.perf_counter() - started
+        sys.stdout.write(_format_measure_summary(measurements, args, elapsed_sec=elapsed))
+        return 0
+
+    compared_summaries = not args.no_summary and _summaries_available(args, config)
+    summary_issues: list[Issue] = []
+    if compared_summaries:
+        summary_issues = summary.summary_issues(
+            args.measurements_path, profile_name=config.profile_name, policy=config.summary
+        )
+    result = evaluate(measurements, config=config, summary_issues=summary_issues)
+    provenance = {
+        "output_a": config.output_a,
+        "output_b": config.output_b,
+        "skip_measure": args.skip_measure,
+        "summary_compared": compared_summaries,
+        "device": None if args.skip_measure else "cuda",
+        "fp16": None if args.skip_measure else args.fp16,
+        "lance_version": args.lance_version,
+    }
+    payload = store.write_eval(
+        result,
+        args.measurements_path,
+        eval_name=args.eval_name,
+        profile_name=config.profile_name,
+        provenance=provenance,
+    )
+    elapsed = time.perf_counter() - started
+    sys.stdout.write(_format_summary(payload, args, elapsed_sec=elapsed))
+    # Non-zero exit when any issue fired, so this composes in scripts like the v1 CLI.
+    return 0 if payload.get("total_issues", 0) == 0 else 1
+
+
+def _measure_and_persist(config: SplitComparisonConfig, args: argparse.Namespace) -> Measurements:
+    # Lazy import so the re-eval path (--skip-measure) never loads Ray.
+    from cosmos_curator.pipelines.video.split_comparison.measure.ray import run as run_measure  # noqa: PLC0415
+
+    measurements = run_measure(
+        config,
+        lance_version=args.lance_version,
+        num_gpus=args.num_gpus,
+        show_progress=args.progress,
+        fp16=args.fp16,
+    )
+    store.write_measurements(
+        measurements,
+        args.measurements_path,
+        config=config,
+        device="cuda",
+        fp16=args.fp16,
+        lance_version=args.lance_version,
+        summaries_snapshotted=not args.no_summary,
+    )
+    if not args.no_summary:
+        # Snapshot both summary.json into the measurements root so summary eval (now
+        # or on later re-eval) stays self-contained.
+        status = store.snapshot_summaries(config, args.measurements_path)
+        logger.info("Snapshotted summaries: {}", status)
+    return measurements
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cosmos-curator split-compare",
-        description="Compare two split-pipeline output trees and write a structured report.",
+        description="Measure two split outputs and evaluate the measurements (Ray multi-GPU by default).",
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--config",
-        type=Path,
-        metavar="PATH",
-        help="Path to a JSON file conforming to SplitComparisonConfig. The audit spec lives here.",
+    parser.add_argument("--config", type=Path, metavar="PATH", help="JSON file conforming to SplitComparisonConfig.")
+    parser.add_argument("--output-a", help="Output root A (required to measure; recovered from manifest on re-eval).")
+    parser.add_argument("--output-b", help="Output root B (required to measure; recovered from manifest on re-eval).")
+    parser.add_argument("--measurements-path", required=True, help="Measurements root (read and/or written here).")
+    parser.add_argument("--profile", default=None, help="Storage profile for reads/writes (default: 'default').")
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        help="Number of GPU actors for the measure fan-out (default: Ray's detected GPU count).",
     )
-    group.add_argument(
-        "--print-default-config",
+    parser.add_argument(
+        "--fp16",
         action="store_true",
-        help=(
-            "Emit the default config (with placeholder output paths) as indented JSON to stdout. "
-            "Pipe to a file, replace REPLACE_WITH_OUTPUT_A_PATH / REPLACE_WITH_OUTPUT_B_PATH, "
-            "edit knobs, then run with --config."
-        ),
+        help="Run the caption model in half precision on GPU (~2x faster forward; shifts similarities slightly). "
+        "No-op off-GPU.",
     )
+    parser.add_argument("--lance-version", default=DEFAULT_LANCE_VERSION, help="Source Lance dataset version subdir.")
+    parser.add_argument("--no-captions", action="store_true", help="Skip caption measurement/eval (metadata only).")
+    parser.add_argument("--min-caption-similarity", type=float, help="Override caption similarity threshold (0..1).")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="Caption embedding batch (GPU encode chunk); also the block-count target -- smaller means "
+        "more blocks and better load balancing (default 128).",
+    )
+    parser.add_argument(
+        "--summary-token-rel-tol",
+        type=float,
+        help="Override summary token-count relative tolerance (0..1); suppresses benign token-total drift.",
+    )
+    parser.add_argument("--skip-measure", action="store_true", help="Re-eval an existing measurements root only.")
+    parser.add_argument("--skip-eval", action="store_true", help="Measure only; persist measurements, write no issues.")
+    parser.add_argument("--no-summary", action="store_true", help="Skip summary.json snapshot + comparison.")
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show Ray Data's rich progress bars during the measure fan-out.",
+    )
+    parser.add_argument("--eval-name", help="Write eval outputs under eval/<name>/ instead of the root.")
     return parser
 
 
-def _load_config(path: Path) -> SplitComparisonConfig:
-    """Load + validate a config from a JSON file. Raises on read or validation errors."""
-    return SplitComparisonConfig.model_validate_json(path.read_text())
+def _resolve_config(args: argparse.Namespace) -> SplitComparisonConfig:
+    """Build and validate the config from ``--config`` (a full spec file) or from flags.
+
+    ``--config`` is the complete comparison spec; it is mutually exclusive with the
+    config-shaping flags (targets, profile, and policy overrides) -- combining them is
+    rejected rather than silently dropping the flag. In flags mode the inputs are
+    assembled into a dict and validated in one construction, so out-of-range values
+    (e.g. ``--batch-size 0``) raise ``ValidationError`` here rather than deep in the run.
+    On re-eval, measure-time facts the caller didn't re-supply are recovered from the
+    manifest: outputs (via :func:`_resolve_outputs`) and caption scope (via
+    :func:`_resolve_compare_captions`).
+    """
+    shaping = {
+        "--output-a": args.output_a is not None,
+        "--output-b": args.output_b is not None,
+        "--profile": args.profile is not None,
+        "--no-captions": args.no_captions,
+        "--min-caption-similarity": args.min_caption_similarity is not None,
+        "--batch-size": args.batch_size is not None,
+        "--summary-token-rel-tol": args.summary_token_rel_tol is not None,
+    }
+    if args.config is not None:
+        conflicting = [flag for flag, given in shaping.items() if given]
+        if conflicting:
+            joined = ", ".join(conflicting)
+            msg = f"--config is the full spec; it cannot be combined with {joined} (edit the config file instead)"
+            raise ValueError(msg)
+        return SplitComparisonConfig.model_validate(json.loads(args.config.read_text()))
+
+    profile_name = args.profile or DEFAULT_PROFILE_NAME
+    output_a, output_b = _resolve_outputs(args, profile_name)
+    data: dict[str, Any] = {"output_a": output_a, "output_b": output_b, "profile_name": profile_name}
+    data["compare_captions"] = _resolve_compare_captions(args, profile_name)
+    if args.min_caption_similarity is not None:
+        data.setdefault("caption", {})["min_similarity"] = args.min_caption_similarity
+    if args.batch_size is not None:
+        data.setdefault("caption", {})["encode_batch_size"] = args.batch_size
+    if args.summary_token_rel_tol is not None:
+        data.setdefault("summary", {})["token_count_rel_tolerance"] = args.summary_token_rel_tol
+    return SplitComparisonConfig.model_validate(data)
 
 
-def _enable_ray_data_progress_ui() -> None:
-    """Enable Ray Data's tqdm/rich progress UI (CLI default)."""
-    ray.data.DataContext.get_current().enable_rich_progress_bars = True
-    ray.data.DataContext.get_current().use_ray_tqdm = False
+def _resolve_outputs(args: argparse.Namespace, profile_name: str) -> tuple[str, str]:
+    """Resolve (output_a, output_b): from flags, or the manifest when re-evaluating."""
+    output_a, output_b = args.output_a, args.output_b
+    if args.skip_measure and not (output_a and output_b):
+        manifest = store.read_manifest(args.measurements_path, profile_name=profile_name)
+        output_a = output_a or manifest.get("output_a")
+        output_b = output_b or manifest.get("output_b")
+    if not (output_a and output_b):
+        msg = "both --output-a and --output-b are required (unless re-evaluating a manifest that records them)"
+        raise ValueError(msg)
+    return output_a, output_b
 
 
-def _format_stdout_summary(report: Report, path: str, *, elapsed_sec: float) -> str:
-    verdict = "PASSED" if report.passed else "FAILED"
-    lines: list[str] = [
-        f"{verdict} split output comparison",
-        f"stages run: {sorted(report.stages_run)}",
-        f"issues: {report.issues.num_rows}",
+def _resolve_compare_captions(args: argparse.Namespace, profile_name: str) -> bool:
+    """Resolve compare_captions: ``--no-captions`` forces it off; else recover from the manifest.
+
+    A root measured ``--no-captions`` holds no caption/window data, so a ``--skip-measure``
+    re-eval must not turn caption comparison back on just because the flag wasn't repeated --
+    the manifest is authoritative, mirroring how outputs (:func:`_resolve_outputs`) and summary
+    scope (:func:`_summaries_available`) are recovered. Passing ``--no-captions`` still narrows a
+    captioned root to metadata-only. Defaults to ``True`` for a fresh measure and for legacy
+    manifests without the field (prior behavior).
+    """
+    if args.no_captions:
+        return False
+    if args.skip_measure:
+        manifest = store.read_manifest(args.measurements_path, profile_name=profile_name)
+        return bool(manifest.get("compare_captions", True))
+    return True
+
+
+def _summaries_available(args: argparse.Namespace, config: SplitComparisonConfig) -> bool:
+    """Whether summary snapshots exist in the measurements root to compare.
+
+    A fresh measure controls snapshotting in-process (gated by ``--no-summary``); on
+    re-eval (``--skip-measure``) the answer comes from the manifest the measure wrote,
+    so a root measured ``--no-summary`` isn't compared against absent snapshots.
+    Defaults to ``True`` for legacy manifests without the flag (prior behavior).
+    """
+    if not args.skip_measure:
+        return True
+    manifest = store.read_manifest(args.measurements_path, profile_name=config.profile_name)
+    return bool(manifest.get("summaries_snapshotted", True))
+
+
+def _format_measure_summary(measurements: Measurements, args: argparse.Namespace, *, elapsed_sec: float) -> str:
+    lines = [
+        "split comparison (measure-only) complete",
+        f"  stats: {measurements.stats}",
+        f"  runtime: {elapsed_sec:.2f}s",
+        f"  measurements: {args.measurements_path}",
     ]
-    if not report.passed and report.issues.num_rows > 0:
-        head = report.issues.slice(0, _MAX_STDOUT_ISSUES).to_pylist()
-        lines.extend(f"- {_format_issue_line(row)}" for row in head)
-        remaining = report.issues.num_rows - len(head)
-        if remaining > 0:
-            lines.append(f"- ... {remaining} more issues omitted from stdout")
-    lines.append(f"comparison runtime: {elapsed_sec:.2f}s")
-    lines.append(f"report: {path}")
     return "\n".join(lines) + "\n"
 
 
-def _format_issue_line(row: dict[str, object]) -> str:
-    code = row.get("code", "?")
-    parts = [f"{code}: {row.get('message', '')}"]
-    suffix: list[str] = []
-    for key in ("feature", "video", "clip", "field", "output"):
-        value = row.get(key)
-        if value:
-            suffix.append(f"{key}={value}")
-    details = row.get("details")
-    if isinstance(details, str):
-        try:
-            parsed = json.loads(details)
-        except json.JSONDecodeError:
-            parsed = None
-        if isinstance(parsed, dict) and parsed.get("error_type"):
-            suffix.append(f"error_type={parsed['error_type']}")
-    if suffix:
-        parts.append(f"({', '.join(suffix)})")
-    return " ".join(parts)
+def _format_summary(payload: dict[str, object], args: argparse.Namespace, *, elapsed_sec: float) -> str:
+    mode = "re-eval" if args.skip_measure else "measure+eval"
+    out_dir = store.eval_output_dir(args.measurements_path, args.eval_name)
+    lines = [
+        f"split comparison ({mode}) complete",
+        f"  clips: total={payload.get('total_clips')} passed={payload.get('clips_passed')} "
+        f"failed={payload.get('clips_failed')}",
+        f"  issues: {payload.get('total_issues')} by_code={payload.get('issues_by_code')}",
+        f"  runtime: {elapsed_sec:.2f}s",
+        f"  eval outputs: {out_dir}",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":
-    # Mute any loguru records emitted under a "ray.*" logger name. Ray itself
-    # uses stdlib ``logging`` and prints to stdout/stderr directly; that output
-    # is not affected by this call -- silencing it would need stdlib-logging
-    # config or stream redirection.
     logger.disable("ray")
     sys.exit(main())

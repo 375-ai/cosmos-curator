@@ -12,16 +12,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the Issue / Report types and Arrow schema round-trips."""
+"""Tests for the Issue type, make_issue, and the Arrow issue-schema round-trip."""
 
 import json
+from typing import get_args
 
 import pyarrow as pa
 
 from cosmos_curator.pipelines.video.split_comparison.result_model import (
     ISSUE_SCHEMA,
-    Report,
-    empty_issues,
+    IssueCode,
     make_issue,
 )
 
@@ -47,6 +47,24 @@ def test_make_issue_produces_row_that_fits_issue_schema() -> None:
     assert parsed == {"start_ns": 0, "similarity": 0.71}
 
 
+def test_clip_field_mismatch_is_a_valid_issue_code() -> None:
+    """clip_field_mismatch is registered in IssueCode and round-trips through the schema."""
+    assert "clip_field_mismatch" in get_args(IssueCode)
+    row = make_issue(
+        code="clip_field_mismatch",
+        message="Clip field 'valid' differs between outputs",
+        feature="metadata_structure",
+        clip="clip-a",
+        field="valid",
+        details={"a": True, "b": False},
+    )
+    table = pa.Table.from_pylist([row], schema=ISSUE_SCHEMA)
+
+    assert table["code"][0].as_py() == "clip_field_mismatch"
+    assert table["field"][0].as_py() == "valid"
+    assert json.loads(table["details"][0].as_py()) == {"a": True, "b": False}
+
+
 def test_make_issue_leaves_unset_fields_null_with_no_details() -> None:
     """Optional kwargs default to None; details stays null when no dict is provided."""
     row = make_issue(code="summary_field_mismatch", message="num_input_videos differs")
@@ -63,47 +81,3 @@ def test_make_issue_serializes_details_with_sorted_keys() -> None:
     row_b = make_issue(code="aesthetic_score_mismatch", message="x", details={"b": 2, "a": 1})
 
     assert row_a["details"] == row_b["details"]
-
-
-def test_empty_issues_carries_the_schema() -> None:
-    """A zero-row issue table still advertises ISSUE_SCHEMA so concat_tables stays happy."""
-    table = empty_issues()
-
-    assert table.num_rows == 0
-    assert table.schema == ISSUE_SCHEMA
-
-
-def test_concat_issue_tables_preserves_schema() -> None:
-    """Concatenating empty + populated tables produces a uniform issue table."""
-    populated = pa.Table.from_pylist(
-        [make_issue(code="summary_field_mismatch", message="x")],
-        schema=ISSUE_SCHEMA,
-    )
-    combined = pa.concat_tables([empty_issues(), populated, empty_issues()])
-
-    assert combined.num_rows == 1
-    assert combined.schema == ISSUE_SCHEMA
-
-
-def test_report_passed_flag_is_independent_of_issue_count() -> None:
-    """Report carries its own passed flag rather than recomputing; callers control truth."""
-    issues = pa.Table.from_pylist(
-        [make_issue(code="summary_field_mismatch", message="x")],
-        schema=ISSUE_SCHEMA,
-    )
-    report = Report(issues=issues, passed=False, stages_run=frozenset({"summary"}))
-
-    assert not report.passed
-    assert report.stages_run == frozenset({"summary"})
-
-
-def test_report_with_empty_issues_can_be_marked_passed() -> None:
-    """A clean run -- empty issues, all enabled stages ran -- reads as passed=True."""
-    report = Report(
-        issues=empty_issues(),
-        passed=True,
-        stages_run=frozenset({"summary", "metadata", "video_index"}),
-    )
-
-    assert report.passed
-    assert report.issues.num_rows == 0

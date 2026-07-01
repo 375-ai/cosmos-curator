@@ -22,8 +22,6 @@ from cosmos_curator.pipelines.video.split_comparison.config import (
     ScoreTolerance,
     SplitComparisonConfig,
     SummaryPolicy,
-    VideoIndexPolicy,
-    example_default_config,
 )
 
 
@@ -40,45 +38,23 @@ def test_default_config_constructs_with_expected_policy_defaults() -> None:
     config = _config()
 
     assert config.profile_name == "default"
-    assert config.compare_video_index is True
     assert config.compare_captions is True
     assert config.caption.model_id == "BAAI/bge-small-en-v1.5"
     assert config.caption.min_similarity == 0.85
+    assert config.caption.encode_batch_size == 128
     assert config.aesthetic.abs_tolerance == ScoreTolerance().abs_tolerance
-    assert config.video_index.int_tolerance == 0
-    assert config.video_index.float_rtol == 1e-5
-
-
-def test_default_config_metadata_workers_is_at_least_one() -> None:
-    """metadata_workers default scales with CPU count but never falls below 1."""
-    assert _config().metadata_workers >= 1
-
-
-def test_default_report_path_and_format() -> None:
-    """Persistence default: a single local JSON report."""
-    config = _config()
-    assert config.report_path == "report.json"
-    assert config.report_format == "json"
-
-
-def test_video_index_default_metadata_fields_are_a_tuple() -> None:
-    """compare_metadata_fields is a tuple so frozen-deep is real."""
-    policy = VideoIndexPolicy()
-    assert isinstance(policy.compare_metadata_fields, tuple)
-    assert "codec_name" in policy.compare_metadata_fields
-    assert "width" in policy.compare_metadata_fields
 
 
 def test_config_overrides_propagate_to_nested_policies() -> None:
     """Custom nested policies replace defaults without affecting other fields."""
     config = _config(
         caption=CaptionPolicy(model_id="intfloat/e5-small-v2", min_similarity=0.9),
-        compare_video_index=False,
+        compare_captions=False,
     )
 
     assert config.caption.model_id == "intfloat/e5-small-v2"
     assert config.caption.min_similarity == 0.9
-    assert config.compare_video_index is False
+    assert config.compare_captions is False
     assert config.aesthetic.abs_tolerance == ScoreTolerance().abs_tolerance
 
 
@@ -105,13 +81,13 @@ def test_caption_policy_is_frozen() -> None:
 def test_strict_mode_rejects_string_for_int_field() -> None:
     """strict=True: "5" must NOT silently coerce to 5 (would mask config-file typos)."""
     with pytest.raises(ValidationError):
-        _config(metadata_workers="5")  # type: ignore[arg-type]
+        CaptionPolicy(encode_batch_size="128")  # type: ignore[arg-type]
 
 
 def test_strict_mode_rejects_string_for_bool_field() -> None:
     """strict=True: "true" must NOT silently coerce to True."""
     with pytest.raises(ValidationError):
-        _config(compare_video_index="true")  # type: ignore[arg-type]
+        _config(compare_captions="true")  # type: ignore[arg-type]
 
 
 # --- extra="forbid" (unknown fields rejected) ---------------------------------------
@@ -120,7 +96,7 @@ def test_strict_mode_rejects_string_for_bool_field() -> None:
 def test_unknown_field_rejected() -> None:
     """A typo in a field name fails at construction instead of being silently ignored."""
     with pytest.raises(ValidationError):
-        _config(metadta_workers=8)  # type: ignore[call-arg] -- intentional typo
+        _config(profil_name="x")  # type: ignore[call-arg] -- intentional typo
 
 
 def test_unknown_field_in_nested_model_rejected() -> None:
@@ -129,7 +105,7 @@ def test_unknown_field_in_nested_model_rejected() -> None:
         ScoreTolerance(abs_tolarence=0.5)  # type: ignore[call-arg] -- intentional typo
 
 
-# --- validators (ge=, le=, min_length=, gt=) ----------------------------------------
+# --- validators (ge=, le=, min_length=) ---------------------------------------------
 
 
 def test_negative_tolerance_rejected() -> None:
@@ -146,51 +122,10 @@ def test_min_similarity_outside_zero_to_one_rejected() -> None:
         CaptionPolicy(min_similarity=-0.1)
 
 
-def test_zero_metadata_workers_rejected() -> None:
-    """metadata_workers must be ge=1; zero would mean "no actors" which fails Stage 1."""
+def test_zero_encode_batch_size_rejected() -> None:
+    """encode_batch_size must be ge=1; zero is not a usable batch."""
     with pytest.raises(ValidationError):
-        _config(metadata_workers=0)
-
-
-def test_zero_metadata_cpus_per_worker_rejected() -> None:
-    """metadata_cpus_per_worker must be gt=0; 0 makes no sense to Ray."""
-    with pytest.raises(ValidationError):
-        _config(metadata_cpus_per_worker=0.0)
-
-
-def test_metadata_cpus_per_worker_accepts_fractional_values() -> None:
-    """Fractional CPU reservations (e.g. 0.25) are valid -- this is the I/O-pack pattern."""
-    config = _config(metadata_cpus_per_worker=0.25)
-    assert config.metadata_cpus_per_worker == 0.25
-
-
-def test_zero_metadata_batch_size_rejected() -> None:
-    """metadata_batch_size must be ge=1; zero would make the per-stage block math divide by zero."""
-    with pytest.raises(ValidationError):
-        _config(metadata_batch_size=0)
-
-
-def test_zero_video_index_batch_size_rejected() -> None:
-    """video_index_batch_size must be ge=1; zero would make the per-stage block math divide by zero."""
-    with pytest.raises(ValidationError):
-        _config(video_index_batch_size=0)
-
-
-def test_zero_clip_limit_rejected() -> None:
-    """clip_limit must be ge=1 when set; 0 would mean "compare nothing" -- omit instead."""
-    with pytest.raises(ValidationError):
-        _config(clip_limit=0)
-
-
-def test_negative_clip_limit_rejected() -> None:
-    """Negative clip_limit is rejected at validation time."""
-    with pytest.raises(ValidationError):
-        _config(clip_limit=-1)
-
-
-def test_clip_limit_none_means_no_filter() -> None:
-    """Omitted clip_limit leaves the field at None (no cap)."""
-    assert _config().clip_limit is None
+        CaptionPolicy(encode_batch_size=0)
 
 
 def test_empty_string_for_required_min_length_field_rejected() -> None:
@@ -211,30 +146,6 @@ def test_missing_output_a_rejected() -> None:
         SplitComparisonConfig(output_b="/b")  # type: ignore[call-arg]
 
 
-def test_empty_report_path_rejected() -> None:
-    """report_path must be non-empty (min_length=1)."""
-    with pytest.raises(ValidationError):
-        _config(report_path="")
-
-
-def test_unknown_report_format_rejected() -> None:
-    """report_format only accepts the writer-known values; anything else fails validation."""
-    with pytest.raises(ValidationError):
-        _config(report_format="parquet")
-
-
-def test_report_format_lance_accepted() -> None:
-    """'lance' is a valid format selection."""
-    config = _config(report_format="lance")
-    assert config.report_format == "lance"
-
-
-def test_report_path_accepts_cloud_url_with_any_extension() -> None:
-    """report_path is used verbatim -- cloud URLs (and extensionless paths) are fine; format is explicit."""
-    config = _config(report_path="s3://bucket/audit", report_format="lance")
-    assert config.report_path == "s3://bucket/audit"
-
-
 # --- JSON round-trip ----------------------------------------------------------------
 
 
@@ -242,7 +153,6 @@ def test_default_config_round_trips_through_json() -> None:
     """Dump to JSON, load back, equal -- the model.validate_json contract."""
     original = _config(
         compare_captions=False,
-        clip_limit=42,
         aesthetic=ScoreTolerance(abs_tolerance=0.01, rel_tolerance=0.02),
         summary=SummaryPolicy(token_count_abs_tolerance=5.0),
     )
@@ -251,14 +161,3 @@ def test_default_config_round_trips_through_json() -> None:
     reloaded = SplitComparisonConfig.model_validate_json(payload)
 
     assert reloaded == original
-
-
-def test_example_default_config_is_valid_and_serializable() -> None:
-    """example_default_config() (for --print-default-config) constructs and dumps cleanly."""
-    config = example_default_config()
-    payload = config.model_dump_json(indent=2)
-    # The placeholder strings appear in the output so users see what to replace.
-    assert "REPLACE_WITH_OUTPUT_A_PATH" in payload
-    assert "REPLACE_WITH_OUTPUT_B_PATH" in payload
-    # Round-trip works because the placeholders are non-empty strings.
-    assert SplitComparisonConfig.model_validate_json(payload) == config

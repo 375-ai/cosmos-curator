@@ -12,12 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Caption embedding helpers shared by the measure stage and the (transitional) metadata stage.
+"""Caption embedding helpers for the measure phase.
 
 Loading the sentence-transformers model and the batched cosine-similarity
-computation live here so both the v3 ``measure_stage`` and the v2
-``metadata_stage`` use one implementation. See
-``docs/curator/design/split-comparison.md`` ("Caption model").
+computation live here, used by the Ray measure driver (``measure.core`` builds
+the divergent-pair jobs, ``measure.ray`` loads the model on each GPU actor).
 """
 
 from typing import TYPE_CHECKING
@@ -59,6 +58,7 @@ def cosine_similarity_batch(
     texts_b: list[str],
     *,
     batch_size: int,
+    show_progress_bar: bool = False,
 ) -> NDArray[np.float32]:
     """Embed both lists in one ``encode()`` call; return paired cosine similarities, shape (N,).
 
@@ -70,7 +70,9 @@ def cosine_similarity_batch(
 
     ``sentence_transformers`` chunks the input internally at ``batch_size``; the
     Python-level call overhead is paid once. Embeddings are normalized, so the
-    cosine similarity reduces to a dot product.
+    cosine similarity reduces to a dot product. ``show_progress_bar`` forwards to
+    ``encode`` to surface a tqdm bar over those internal chunks; off by default so
+    library callers stay quiet.
 
     Duplicate caption strings recur across windows and clips within a batch (both
     sides are often near-identical runs); each distinct string is encoded once and
@@ -94,7 +96,7 @@ def cosine_similarity_batch(
             batch_size=batch_size,
             normalize_embeddings=True,
             convert_to_numpy=True,
-            show_progress_bar=False,
+            show_progress_bar=show_progress_bar,
         )
     )
     embeddings = encoded[[unique_index[text] for text in combined]]

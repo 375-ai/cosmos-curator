@@ -12,282 +12,241 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for the split-comparison CLI: `--config` + `--print-default-config`."""
+"""Tests for the CLI's config resolution: overrides are applied and validated."""
 
+import argparse
 import json
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
+from pydantic import ValidationError
 
-from cosmos_curator.pipelines.video.split_comparison import cli as cli_module
-from cosmos_curator.pipelines.video.split_comparison.cli import main
+from cosmos_curator.pipelines.video.split_comparison import store
+from cosmos_curator.pipelines.video.split_comparison.cli import _build_parser, _resolve_config, main
 from cosmos_curator.pipelines.video.split_comparison.config import SplitComparisonConfig
-from cosmos_curator.pipelines.video.split_comparison.result_model import (
-    ISSUE_SCHEMA,
-    Report,
-    empty_issues,
-    make_issue,
+from cosmos_curator.pipelines.video.split_comparison.measure import ray as raymod
+from cosmos_curator.pipelines.video.split_comparison.measure.core import Measurements
+from cosmos_curator.pipelines.video.split_comparison.measure.schema import (
+    CLIP_MEASUREMENT_SCHEMA,
+    WINDOW_MEASUREMENT_SCHEMA,
 )
 
-
-def _write_config(path: Path, **overrides: object) -> Path:
-    """Drop a config JSON file at ``path`` with placeholder targets + per-test overrides."""
-    config = SplitComparisonConfig(output_a="/a", output_b="/b", **overrides)  # type: ignore[arg-type]
-    path.write_text(config.model_dump_json(), encoding="utf-8")
-    return path
+_BASE = ["--output-a", "/a", "--output-b", "/b", "--measurements-path", "measurements/ab"]
 
 
-def _stub_compare(monkeypatch: pytest.MonkeyPatch, *, report: Report) -> dict[str, object]:
-    """Replace compare_split_outputs with a stub that records the config it was called with."""
-    captured: dict[str, object] = {}
-
-    def fake(*, config: object) -> Report:
-        captured["config"] = config
-        return report
-
-    monkeypatch.setattr(cli_module, "compare_split_outputs", fake)
-    return captured
+def _parse(extra: list[str]) -> argparse.Namespace:
+    return _build_parser().parse_args([*_BASE, *extra])
 
 
-def _clean_report() -> Report:
-    return Report(
-        issues=empty_issues(),
-        passed=True,
-        stages_run=frozenset({"summary", "metadata", "video_index"}),
+def test_valid_caption_overrides_are_applied() -> None:
+    """In-range --min-caption-similarity / --batch-size flow into the resolved config."""
+    config = _resolve_config(_parse(["--min-caption-similarity", "0.9", "--batch-size", "256"]))
+    assert config.caption.min_similarity == 0.9
+    assert config.caption.encode_batch_size == 256
+
+
+def test_no_captions_flag_disables_caption_comparison() -> None:
+    """--no-captions sets compare_captions=False on the resolved config."""
+    assert _resolve_config(_parse(["--no-captions"])).compare_captions is False
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--batch-size", "0"],  # encode_batch_size ge=1
+        ["--min-caption-similarity", "5.0"],  # min_similarity le=1
+        ["--min-caption-similarity", "-0.1"],  # min_similarity ge=0
+        ["--summary-token-rel-tol", "-1.0"],  # token_count_rel_tolerance ge=0
+    ],
+)
+def test_out_of_range_override_raises_at_resolution(flag: list[str]) -> None:
+    """Out-of-range CLI overrides fail validation when the config is built, not deep in the run."""
+    with pytest.raises(ValidationError):
+        _resolve_config(_parse(flag))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--batch-size", "0"],
+        ["--min-caption-similarity", "5.0"],
+    ],
+)
+def test_main_exits_2_on_invalid_override(flag: list[str]) -> None:
+    """main() surfaces a bad override as a clean exit code 2 (caught before any measure/eval)."""
+    assert main([*_BASE, *flag]) == 2
+
+
+def test_main_exits_2_on_measure_valueerror(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A measure-phase ValueError (e.g. no GPUs / bad --num-gpus from resolve_num_gpus) exits 2, not 1.
+
+    An uncaught exception would exit 1 -- colliding with the "issues found" contract -- and dump a
+    traceback. main() must catch it, print a concise message, and return 2 (bad setup).
+    """
+
+    def no_gpu(*_a: object, **_k: object) -> object:
+        msg = "no GPUs detected by Ray; the measure requires at least one GPU"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(raymod, "run", no_gpu)
+    assert main(_BASE) == 2
+    err = capsys.readouterr().err
+    assert "no GPUs detected" in err
+    assert "Traceback" not in err
+
+
+def _write_measure_root(tmp_path: Path, *, with_summaries: bool) -> str:
+    """Persist a minimal measurements root (empty clip/window tables) and return its path.
+
+    ``with_summaries=False`` mirrors a ``--no-summary`` measure: measurement tables +
+    manifest are written, but no summary_a/summary_b snapshots.
+    """
+    root = str(tmp_path / "m")
+    config = SplitComparisonConfig(output_a="/a", output_b="/b")
+    measurements = Measurements(
+        clip_table=pa.Table.from_pylist([], schema=CLIP_MEASUREMENT_SCHEMA),
+        window_table=pa.Table.from_pylist([], schema=WINDOW_MEASUREMENT_SCHEMA),
+        stats={},
     )
+    store.write_measurements(
+        measurements,
+        root,
+        config=config,
+        device="cuda",
+        fp16=False,
+        lance_version="v0",
+        summaries_snapshotted=with_summaries,
+    )
+    return root
 
 
-def _failing_report() -> Report:
-    issues = pa.Table.from_pylist(
+def test_reeval_of_no_summary_root_skips_summary_comparison(tmp_path: Path) -> None:
+    """A root measured without summaries must not emit phantom summary_load_failed issues on re-eval.
+
+    With empty measurement tables the only possible issues are summary-load failures, so a clean
+    re-eval is exit 0; comparing absent snapshots would fire two summary_load_failed -> exit 1.
+    """
+    root = _write_measure_root(tmp_path, with_summaries=False)
+    rc = main(["--skip-measure", "--measurements-path", root, "--output-a", "/a", "--output-b", "/b"])
+    assert rc == 0
+
+
+def test_config_file_alone_resolves_to_its_spec(tmp_path: Path) -> None:
+    """A --config file with no shaping flags resolves to exactly the spec it describes."""
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"output_a": "/a", "output_b": "/b", "profile_name": "p"}))
+    args = _build_parser().parse_args(["--measurements-path", "measurements/ab", "--config", str(cfg)])
+    config = _resolve_config(args)
+    assert (config.output_a, config.output_b, config.profile_name) == ("/a", "/b", "p")
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        ["--output-a", "/x"],
+        ["--output-b", "/x"],
+        ["--profile", "p"],
+        ["--no-captions"],
+        ["--min-caption-similarity", "0.9"],
+        ["--batch-size", "256"],
+        ["--summary-token-rel-tol", "0.1"],
+    ],
+)
+def test_config_is_mutually_exclusive_with_shaping_flags(tmp_path: Path, flag: list[str]) -> None:
+    """--config is the full spec; combining it with a config-shaping flag exits 2, not a silent drop."""
+    cfg = tmp_path / "c.json"
+    cfg.write_text(json.dumps({"output_a": "/a", "output_b": "/b"}))
+    rc = main(["--measurements-path", str(tmp_path / "m"), "--config", str(cfg), *flag])
+    assert rc == 2
+
+
+def test_reeval_no_captions_skips_caption_eval(tmp_path: Path) -> None:
+    """--no-captions on re-eval skips caption-window eval even on a captioned root.
+
+    The window table holds one sub-threshold caption row, so with captions on it fires a
+    caption_similarity_below_threshold issue (exit 1); --no-captions must skip it (exit 0).
+    """
+    root = str(tmp_path / "m")
+    config = SplitComparisonConfig(output_a="/a", output_b="/b")
+    window = pa.Table.from_pylist(
         [
-            make_issue(
-                code="aesthetic_score_mismatch",
-                message="aesthetic differs",
-                feature="aesthetic_score",
-                video="video.mp4",
-                clip="clip-a",
-                details={"a": 0.5, "b": 0.6},
-            ),
-        ],
-        schema=ISSUE_SCHEMA,
-    )
-    return Report(
-        issues=issues,
-        passed=False,
-        stages_run=frozenset({"summary", "metadata", "video_index"}),
-    )
-
-
-# --- --print-default-config --------------------------------------------------------
-
-
-def test_print_default_config_emits_valid_json(capsys: pytest.CaptureFixture[str]) -> None:
-    """--print-default-config writes indented JSON to stdout and exits 0."""
-    exit_code = main(["--print-default-config"])
-
-    assert exit_code == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["output_a"] == "REPLACE_WITH_OUTPUT_A_PATH"
-    assert payload["output_b"] == "REPLACE_WITH_OUTPUT_B_PATH"
-    assert payload["compare_video_index"] is True
-    assert payload["caption"]["model_id"] == "BAAI/bge-small-en-v1.5"
-
-
-def test_print_default_config_output_round_trips_through_pydantic(capsys: pytest.CaptureFixture[str]) -> None:
-    """Output of --print-default-config validates back to an SplitComparisonConfig."""
-    main(["--print-default-config"])
-    payload = capsys.readouterr().out
-
-    reloaded = SplitComparisonConfig.model_validate_json(payload)
-    assert reloaded.output_a == "REPLACE_WITH_OUTPUT_A_PATH"
-
-
-# --- --config: happy path ----------------------------------------------------------
-
-
-def test_cli_returns_zero_and_writes_json_report_on_passed_run(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A clean comparison: exit 0, JSON report on disk, PASSED message on stdout."""
-    captured = _stub_compare(monkeypatch, report=_clean_report())
-    config_path = _write_config(tmp_path / "config.json", report_path=str(tmp_path / "audit.json"))
-
-    exit_code = main(["--config", str(config_path)])
-
-    assert exit_code == 0
-    assert captured["config"].output_a == "/a"  # type: ignore[union-attr]
-    stdout = capsys.readouterr().out
-    assert "PASSED split output comparison" in stdout
-    assert "issues: 0" in stdout
-    payload = json.loads((tmp_path / "audit.json").read_text(encoding="utf-8"))
-    assert payload["passed"] is True
-    assert payload["summary"]["stages_run"] == ["metadata", "summary", "video_index"]
-
-
-def test_cli_returns_one_and_emits_first_issues_on_failed_run(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A failing comparison: exit 1, FAILED + head of issues on stdout."""
-    _stub_compare(monkeypatch, report=_failing_report())
-    config_path = _write_config(tmp_path / "config.json", report_path=str(tmp_path / "audit.json"))
-
-    exit_code = main(["--config", str(config_path)])
-
-    assert exit_code == 1
-    stdout = capsys.readouterr().out
-    assert "FAILED split output comparison" in stdout
-    assert "aesthetic_score_mismatch: aesthetic differs" in stdout
-    assert "video=video.mp4" in stdout
-
-
-def test_cli_writes_lance_report_when_config_selects_lance_format(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """report_format='lance' routes the single report to the Lance writer."""
-    _stub_compare(monkeypatch, report=_clean_report())
-    lance_target = str(tmp_path / "audit.lance")
-    config_path = _write_config(
-        tmp_path / "config.json",
-        report_path=lance_target,
-        report_format="lance",
-    )
-
-    exit_code = main(["--config", str(config_path)])
-
-    assert exit_code == 0
-    assert (tmp_path / "audit.lance").is_dir()
-    stdout = capsys.readouterr().out
-    assert f"report: {lance_target}" in stdout
-
-
-def test_cli_propagates_overrides_from_config_into_compare_call(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Config overrides land on the SplitComparisonConfig passed to compare_split_outputs."""
-    captured = _stub_compare(monkeypatch, report=_clean_report())
-    config_path = _write_config(
-        tmp_path / "config.json",
-        report_path=str(tmp_path / "audit.json"),
-        compare_video_index=False,
-        compare_captions=False,
-        clip_limit=25,
-        video_key="video-a.mp4",
-        metadata_workers=64,
-        metadata_cpus_per_worker=0.25,
-        metadata_batch_size=8,
-        video_index_batch_size=4,
-    )
-
-    main(["--config", str(config_path)])
-
-    config = captured["config"]
-    assert config.compare_video_index is False  # type: ignore[union-attr]
-    assert config.compare_captions is False  # type: ignore[union-attr]
-    assert config.clip_limit == 25  # type: ignore[union-attr]
-    assert config.video_key == "video-a.mp4"  # type: ignore[union-attr]
-    assert config.metadata_workers == 64  # type: ignore[union-attr]
-    assert config.metadata_cpus_per_worker == 0.25  # type: ignore[union-attr]
-    assert config.metadata_batch_size == 8  # type: ignore[union-attr]
-    assert config.video_index_batch_size == 4  # type: ignore[union-attr]
-
-
-# --- --config: error paths ---------------------------------------------------------
-
-
-def test_cli_returns_two_when_config_file_missing(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Missing config file -> exit 2 with stderr explanation; compare_split_outputs never runs."""
-    _stub_compare(monkeypatch, report=_clean_report())
-
-    exit_code = main(["--config", str(tmp_path / "does-not-exist.json")])
-
-    assert exit_code == 2
-    assert "Failed to load config" in capsys.readouterr().err
-
-
-def test_cli_returns_two_on_malformed_json(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Malformed JSON -> exit 2 with stderr explanation."""
-    _stub_compare(monkeypatch, report=_clean_report())
-    path = tmp_path / "config.json"
-    path.write_text("{ not valid json", encoding="utf-8")
-
-    exit_code = main(["--config", str(path)])
-
-    assert exit_code == 2
-    assert "Failed to load config" in capsys.readouterr().err
-
-
-def test_cli_returns_two_on_validation_error(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A config with an invalid value (negative tolerance) is rejected at load."""
-    _stub_compare(monkeypatch, report=_clean_report())
-    path = tmp_path / "config.json"
-    # Hand-write JSON since we can't construct an invalid SplitComparisonConfig at this layer.
-    path.write_text(
-        json.dumps(
             {
-                "output_a": "/a",
-                "output_b": "/b",
-                "aesthetic": {"abs_tolerance": -1.0, "rel_tolerance": 1e-6},
-            },
+                "clip_uuid": "c1",
+                "video_uuid": "v",
+                "start_ns": 0,
+                "end_ns": 1,
+                "model": "qwen",
+                "kind": "caption",
+                "present_a": True,
+                "present_b": True,
+                "identical": False,
+                "similarity": 0.5,
+                "len_a": 1,
+                "len_b": 1,
+            }
+        ],
+        schema=WINDOW_MEASUREMENT_SCHEMA,
+    )
+    store.write_measurements(
+        Measurements(
+            clip_table=pa.Table.from_pylist([], schema=CLIP_MEASUREMENT_SCHEMA),
+            window_table=window,
+            stats={},
         ),
-        encoding="utf-8",
+        root,
+        config=config,
+        device="cuda",
+        fp16=False,
+        lance_version="v0",
+        summaries_snapshotted=False,
     )
-
-    exit_code = main(["--config", str(path)])
-
-    assert exit_code == 2
-    assert "Failed to load config" in capsys.readouterr().err
+    base = ["--skip-measure", "--measurements-path", root, "--output-a", "/a", "--output-b", "/b"]
+    assert main(base) == 1  # captions on: 0.5 < 0.85 fires caption_similarity_below_threshold
+    assert main([*base, "--no-captions"]) == 0  # metadata-only: caption eval skipped
 
 
-def test_cli_returns_two_on_unknown_field_in_config(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """extra='forbid' in the config model surfaces a typo'd field as a load error."""
-    _stub_compare(monkeypatch, report=_clean_report())
-    path = tmp_path / "config.json"
-    path.write_text(
-        json.dumps({"output_a": "/a", "output_b": "/b", "metadta_workers": 8}),
-        encoding="utf-8",
+def test_reeval_recovers_no_captions_scope_from_manifest(tmp_path: Path) -> None:
+    """A root measured --no-captions stays metadata-only on re-eval without repeating the flag.
+
+    The manifest records compare_captions=False, so re-eval recovers it (like outputs) rather
+    than defaulting captions back on: the sub-threshold window row must not fire an issue (exit 0).
+    """
+    root = str(tmp_path / "m")
+    config = SplitComparisonConfig(output_a="/a", output_b="/b", compare_captions=False)
+    window = pa.Table.from_pylist(
+        [
+            {
+                "clip_uuid": "c1",
+                "video_uuid": "v",
+                "start_ns": 0,
+                "end_ns": 1,
+                "model": "qwen",
+                "kind": "caption",
+                "present_a": True,
+                "present_b": True,
+                "identical": False,
+                "similarity": 0.5,
+                "len_a": 1,
+                "len_b": 1,
+            }
+        ],
+        schema=WINDOW_MEASUREMENT_SCHEMA,
     )
-
-    exit_code = main(["--config", str(path)])
-
-    assert exit_code == 2
-    assert "Failed to load config" in capsys.readouterr().err
-
-
-# --- argparse top-level ------------------------------------------------------------
-
-
-def test_cli_requires_one_of_the_two_flags() -> None:
-    """No flags at all -> argparse exits non-zero (mutually exclusive group is required)."""
-    with pytest.raises(SystemExit):
-        main([])
-
-
-def test_cli_rejects_both_flags_together(tmp_path: Path) -> None:
-    """--config and --print-default-config are mutually exclusive."""
-    config_path = _write_config(tmp_path / "config.json")
-    with pytest.raises(SystemExit):
-        main(["--config", str(config_path), "--print-default-config"])
+    store.write_measurements(
+        Measurements(
+            clip_table=pa.Table.from_pylist([], schema=CLIP_MEASUREMENT_SCHEMA),
+            window_table=window,
+            stats={},
+        ),
+        root,
+        config=config,
+        device="cuda",
+        fp16=False,
+        lance_version="v0",
+        summaries_snapshotted=False,
+    )
+    # No --no-captions on re-eval: recovered from the manifest, so caption eval stays skipped.
+    assert main(["--skip-measure", "--measurements-path", root, "--output-a", "/a", "--output-b", "/b"]) == 0

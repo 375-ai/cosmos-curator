@@ -38,7 +38,7 @@ This directory collects documentation for the curator pipeline layer. It is orga
 - [Ray Data Captioning Design](design/ray-data-captioning.md) - Qwen captioning through Ray Data LLM.
 - [Ray Data Migration Plan](design/ray-data-migration.md) - migration scope, target contract, and validation plan
   for the Ray Data video workflow.
-- [Split Output Comparison Design](design/split-output-comparison.md) - feature-comparator design for split output reports.
+- [Split Comparison — Module Architecture](design/split-comparison.md) - module DAG and architecture for the Lance-based split-output comparison.
 - [Sensor Library Design](design/sensor-library.md) - sensor data model and API direction.
 - [Efficient Sparse Video Decode](design/sensor-library-efficient-video-decode.md) - efficient decode strategy for sampled video.
 - [Orca Agentic Curation](design/orca.md) - agentic orchestration direction for large-scale curation.

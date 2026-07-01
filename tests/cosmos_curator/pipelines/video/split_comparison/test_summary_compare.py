@@ -15,19 +15,85 @@
 """Tests for summary_compare: A/B summary.json comparison emitting a pa.Table."""
 
 import json
+from collections.abc import Mapping
+from typing import Any
 
 import pyarrow as pa
 
 from cosmos_curator.pipelines.video.split_comparison.config import SummaryPolicy
 from cosmos_curator.pipelines.video.split_comparison.result_model import ISSUE_SCHEMA
 from cosmos_curator.pipelines.video.split_comparison.summary_compare import compare_summaries
-
-# Reuse the helpers from test_clip_discovery to avoid duplicating OutputSummary fixture construction.
-from tests.cosmos_curator.pipelines.video.split_comparison.test_clip_discovery import (
-    _processed_video,
-    _summary,
-    _unprocessed_video,
+from cosmos_curator.pipelines.video.split_comparison.summary_schema import (
+    OutputSummary,
+    ProcessedVideoSummary,
+    UnprocessedVideoSummary,
+    VideoSummary,
 )
+
+
+def _processed_video(
+    key: str,
+    *,
+    clips: tuple[str, ...] = (),
+    filtered_clips: tuple[str, ...] = (),
+) -> ProcessedVideoSummary:
+    return ProcessedVideoSummary(
+        source_video=f"/inputs/{key}",
+        video_uuid=f"uuid-{key}",
+        num_clip_chunks=1,
+        num_total_clips=len(clips) + len(filtered_clips),
+        num_clips_filtered_by_motion=0,
+        num_clips_filtered_by_aesthetic=0,
+        num_clips_filtered_by_qwen_classifier=0,
+        num_clips_filtered_by_qwen_semantic=0,
+        num_clips_filtered_by_artificial_text=0,
+        num_clips_passed=len(clips),
+        num_clips_transcoded=len(clips) + len(filtered_clips),
+        num_clips_with_embeddings=len(clips),
+        num_clips_with_caption=0,
+        num_caption_windows=0,
+        num_clips_with_webp=len(clips),
+        clips=clips,
+        filtered_clips=filtered_clips,
+    )
+
+
+def _unprocessed_video(key: str) -> UnprocessedVideoSummary:
+    return UnprocessedVideoSummary(processed=False, source_video=f"/inputs/{key}")
+
+
+def _summary(
+    videos: Mapping[str, VideoSummary],
+    **overrides: Any,  # noqa: ANN401 -- test fixture, fields are heterogeneous OutputSummary kwargs
+) -> OutputSummary:
+    """Build a minimal OutputSummary populating only the fields the comparison reads."""
+    base: dict[str, Any] = {
+        "videos": dict(videos),
+        "num_input_videos": len(videos),
+        "num_input_videos_selected": len(videos),
+        "num_processed_videos": sum(1 for v in videos.values() if v.processed),
+        "embedding_algorithm": "internvideo2",
+        "total_video_duration": 10.0,
+        "total_clip_duration": 8.0,
+        "max_clip_duration": 4.0,
+        "total_video_bytes": 12345,
+        "num_remuxed_videos": 0,
+        "total_num_clips_filtered_by_motion": 0,
+        "total_num_clips_filtered_by_aesthetic": 0,
+        "total_num_clips_filtered_by_qwen_classifier": 0,
+        "total_num_clips_filtered_by_qwen_semantic": 0,
+        "total_num_clips_filtered_by_artificial_text": 0,
+        "total_num_clips_passed": 0,
+        "total_num_clips_transcoded": 0,
+        "total_num_clips_with_embeddings": 0,
+        "total_num_clips_with_caption": 0,
+        "total_num_caption_windows": 0,
+        "total_num_clips_with_webp": 0,
+        "total_prompt_tokens": 0,
+        "total_output_tokens": 0,
+    }
+    base.update(overrides)
+    return OutputSummary(**base)
 
 
 def _codes(issues: pa.Table) -> list[str]:
