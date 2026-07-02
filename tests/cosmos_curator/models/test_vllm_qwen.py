@@ -38,6 +38,17 @@ if pixi_utils.is_running_in_env("default"):
     _MODEL_VARIANT = VllmQwen7B.model_variant()
 
 
+def _qwen3_like_apply_chat_template(
+    *_: object,
+    enable_thinking: bool = True,
+    **__: object,
+) -> torch.Tensor:
+    """Return distinct token IDs for open-thinking vs no-thinking Qwen3 prompts."""
+    if enable_thinking:
+        return torch.tensor([[99, 100]])
+    return torch.tensor([[10, 20, 30, 40]])
+
+
 @pytest.mark.env("default")
 def test_make_llm_input_qwen() -> None:
     """Test make_llm_input (video path)."""
@@ -149,18 +160,15 @@ def test_make_message_image() -> None:
 @pytest.mark.env("default")
 def test_make_prompt() -> None:
     """Test make_prompt function (video path)."""
-    # Mock the Transformers v5 tensor return shape.
-    mock_tensor = torch.tensor([[10, 20, 30, 40]])  # Shape: (1, 4)
-
     mock_processor = MagicMock()
-    mock_processor.apply_chat_template.return_value = mock_tensor
+    mock_processor.apply_chat_template.side_effect = _qwen3_like_apply_chat_template
 
     prompt = "Test prompt"
     frames = torch.rand(2, 3, 32, 32)
     metadata = {"fps": 2.0, "duration": 1.0}
     message = make_message(prompt)
     result = make_prompt(message, [(frames, metadata)], mock_processor)
-    assert result["prompt_token_ids"] == [10, 20, 30, 40]  # Should be the token IDs as list
+    assert result["prompt_token_ids"] == [10, 20, 30, 40]  # Should be the no-thinking token IDs as list
     assert len(result["multi_modal_data"]["video"]) == 1
     video_frames, video_metadata = result["multi_modal_data"]["video"][0]
     assert video_frames.shape == (2, 3, 32, 32)
@@ -304,9 +312,8 @@ def test_qwen_stage2_refine_preserves_mm_processor_kwargs() -> None:
 @pytest.mark.env("default")
 def test_make_prompt_image() -> None:
     """Test make_prompt with use_image=True (image pipeline path)."""
-    mock_tensor = torch.tensor([[10, 20, 30, 40]])
     mock_processor = MagicMock()
-    mock_processor.apply_chat_template.return_value = mock_tensor
+    mock_processor.apply_chat_template.side_effect = _qwen3_like_apply_chat_template
 
     prompt = "Describe the image"
     message = make_message(prompt, use_image=True)

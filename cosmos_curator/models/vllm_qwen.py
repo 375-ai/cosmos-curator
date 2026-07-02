@@ -168,6 +168,7 @@ def make_prompt(
     prompt_ids = processor.apply_chat_template(  # type: ignore[attr-defined]
         [message],
         add_generation_prompt=True,
+        enable_thinking=False,
         tokenize=True,
         return_tensors="pt",
     )[0].tolist()
