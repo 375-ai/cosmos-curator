@@ -148,7 +148,7 @@ channels = ["conda-forge", "nvidia"]
 platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 
 [feature.runtime.dependencies]
-cuda-libraries-dev = "*"
+cuda-libraries-dev = "==13.0.2"
 gpustat = "*"
 libgl = "*" # PaddleOCR/OpenCV image paths need libGL.so.1
 pycountry = "*"
@@ -156,6 +156,11 @@ pycountry = "*"
 [feature.runtime.pypi-dependencies]
 cbor2 = ">=5.9" # CVE remediation: cbor2 5.9+ (default env; fixes vs vulnerable 5.8.x)
 cvcuda-cu13 = "*" # not available on conda-forge
+# Keep CUDA Python tooling aligned with torch's cuda-toolkit==13.0.2.
+cuda-bindings = "==13.0.*"
+cuda-python = "==13.0.*"
+nvidia-cuda-cccl = "==13.0.*"
+nvidia-cuda-crt = "==13.0.*"
 PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmpeg vulns
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
@@ -204,6 +209,10 @@ platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 azure-identity = "*"
 azure-storage-blob = "*"
 cuml = "==26.02"
+# RAPIDS constrains CUDA broadly; keep its CUDA stack on the 13.0 line.
+cuda-bindings = "13.0.*"
+cuda-python = "13.0.*"
+cuda-version = "13.0.*"
 loguru = "*"
 numpy = ">2,<2.3" # OpenCV requires >=2; numba 0.61.x requires <2.3
 openssl = ">=3.6.2,<4.0a0" # cuml env: bin/openssl (e.g. CVE-2026-28386 fixed in 3.6.2+)
@@ -223,6 +232,8 @@ pylance = ">=0.39.0" # conda-forge package is too old
 transformers = ">=5.11.0,<6.0.0" # vLLM 0.23 + native Cosmos3 support require recent Transformers v5
 
 [feature.transformers.pypi-dependencies]
+# sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.
+cuda-bindings = "==13.0.*"
 sentence-transformers = "*" # caption-embedding loader used by split-comparison MetadataStage (BGE small-en-v1.5); installed via PyPI to avoid conda-forge's pytorch downgrade pulling torch back to 2.10.0 and clashing with our pinned torch==2.11.0
 
 # SeedVR2 super-resolution dependencies.
@@ -230,7 +241,7 @@ sentence-transformers = "*" # caption-embedding loader used by split-comparison 
 # transformers==4.38.2) but the inference code works fine with newer releases.
 # We use unpinned versions to avoid conflicts with other environments.
 [feature.seedvr.dependencies]
-cuda-libraries-dev = "*"
+cuda-libraries-dev = "==13.0.2"
 einops = "*"
 omegaconf = "*"
 
@@ -254,6 +265,8 @@ einops = "*"
 transformers = "==4.55.4" # legacy models (cosmos-embed1, internvideo2) require older transformers
 
 [feature.legacy-transformers.pypi-dependencies]
+# Legacy models pull torch directly; keep torch's CUDA bindings on the 13.0 line.
+cuda-bindings = "==13.0.*"
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
 torchvision = "==0.26.0"

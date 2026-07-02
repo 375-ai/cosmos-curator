@@ -436,11 +436,18 @@ stages:
     command -v pixi
     pixi --version
     export PIXI_CACHE_DIR="${PIXI_CACHE_DIR:-${CI_PROJECT_DIR}/.pixi/cache}"
+    # Keep mutable solver metadata job-local. The shared Lustre cache is still
+    # used for package/wheel artifacts, but repodata shards have hit stale
+    # ownership/mode issues across CI users.
+    export PIXI_CACHE_REPODATA_DIR="${PIXI_CACHE_REPODATA_DIR:-${CI_PROJECT_DIR}/.pixi/cache/repodata}"
+    export PIXI_CACHE_PYPI_MAPPING_DIR="${PIXI_CACHE_PYPI_MAPPING_DIR:-${CI_PROJECT_DIR}/.pixi/cache/conda-pypi-mapping}"
     export PYTHONNOUSERSITE=1
     git config --global --add safe.directory "${CI_PROJECT_DIR:-$(pwd)}"
     : "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COSMOS_CURATOR:?resolve_version did not provide the package version}"
     pixi install --frozen -e cluster
-    eval "$(pixi shell-hook -e cluster -s bash)"
+    mkdir -p "${CI_PROJECT_DIR}/.pixi"
+    pixi shell-hook -e cluster -s bash > "${CI_PROJECT_DIR}/.pixi/cluster-shell-hook.sh"
+    source "${CI_PROJECT_DIR}/.pixi/cluster-shell-hook.sh"
 
   # Activate the prebuilt Pixi dev environment from the ci-builder image.
   setup_ci_builder_env: &setup_ci_builder_env |

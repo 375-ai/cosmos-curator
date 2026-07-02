@@ -76,7 +76,7 @@ channels = ["conda-forge", "nvidia"]
 platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 
 [feature.runtime.dependencies]
-cuda-libraries-dev = "*"
+cuda-libraries-dev = "==13.0.2"
 gpustat = "*"
 libgl = "*"
 pycountry = "*"
@@ -84,6 +84,10 @@ pycountry = "*"
 [feature.runtime.pypi-dependencies]
 cbor2 = ">=5.9"
 cvcuda-cu13 = "*"
+cuda-bindings = "==13.0.*"
+cuda-python = "==13.0.*"
+nvidia-cuda-cccl = "==13.0.*"
+nvidia-cuda-crt = "==13.0.*"
 PyNvVideoCodec = ">=2.0.4,<2.1"
 timm = "*"
 torch = "==2.11.0"
@@ -128,6 +132,9 @@ platforms = ["linux-64-cuda", "linux-aarch64-cuda"]
 azure-identity = "*"
 azure-storage-blob = "*"
 cuml = "==26.02"
+cuda-bindings = "13.0.*"
+cuda-python = "13.0.*"
+cuda-version = "13.0.*"
 loguru = "*"
 numpy = ">2,<2.3"
 openssl = ">=3.6.2,<4.0a0"
@@ -147,10 +154,11 @@ pylance = ">=0.39.0"
 transformers = ">=5.11.0,<6.0.0"
 
 [feature.transformers.pypi-dependencies]
+cuda-bindings = "==13.0.*"
 sentence-transformers = "*"
 
 [feature.seedvr.dependencies]
-cuda-libraries-dev = "*"
+cuda-libraries-dev = "==13.0.2"
 einops = "*"
 omegaconf = "*"
 
@@ -171,6 +179,7 @@ einops = "*"
 transformers = "==4.55.4"
 
 [feature.legacy-transformers.pypi-dependencies]
+cuda-bindings = "==13.0.*"
 timm = "*"
 torch = "==2.11.0"
 torchvision = "==0.26.0"

@@ -271,7 +271,7 @@ def open_cloud_source(
         raise CloudCliError(msg)
 
     with smart_open.open(source, "rb", transport_params=transport_params) as stream:
-        yield cast("BinaryIO", stream)
+        yield stream
 
 
 def add_cloud_credential_args(parser: argparse.ArgumentParser) -> None:

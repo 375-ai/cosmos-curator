@@ -158,6 +158,9 @@ module = [
     "cudf.*",
     "cuml.*",
     "cupy.*",
+    # mcap 1.4.0's writer imports .__init__, which mypy maps as mcap.__init__ in addition to mcap.
+    # Remove this once upstream fixes that import.
+    "mcap.writer",
     "pylibraft.*",
     "raft_dask.*",
 ]
