@@ -20,7 +20,7 @@ that any styling change is picked up in both places.
 """
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -108,7 +108,7 @@ class Detection:
         x1, y1, x2, y2 = self.box_xyxy
         return (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-    def to_json_dict(self) -> dict[str, object]:
+    def to_json_dict(self, *, include_contours: bool = True) -> dict[str, object]:
         """Serializable view of the detection.
 
         Boolean masks are too large to ship per-frame, so we emit COCO-style
@@ -119,16 +119,144 @@ class Detection:
         ``contours_xy`` is ``list[list[int]]``: outer list is one entry per
         disconnected polygon (usually 1), inner list is flat
         ``[x0, y0, x1, y1, ...]`` pixel coordinates.
+
+        Args:
+            include_contours: When ``False`` (region=box), emit an empty
+                ``contours_xy`` and skip the (non-trivial) contour extraction —
+                downstream box-only consumers and exports don't need polygons.
+
         """
-        mask_u8 = self.mask.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours_xy = [c.flatten().tolist() for c in contours]
+        contours_xy: list[list[Any]] = []
+        if include_contours:
+            mask_u8 = self.mask.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_xy = [c.flatten().tolist() for c in contours]
         return {
             "prompt": self.prompt,
             "object_id": self.object_id,
             "box_xyxy": self.box_xyxy,
             "contours_xy": contours_xy,
         }
+
+
+def _contours_from_xy(contours_xy: list[list[int]]) -> list[npt.NDArray[np.int32]]:
+    """Rebuild OpenCV contour arrays from flat ``[x0, y0, x1, y1, ...]`` polygons.
+
+    Inverse of ``Detection.to_json_dict``'s ``contours_xy`` encoding, so the
+    annotate step can redraw the exact silhouettes ``objects.json`` recorded
+    without transporting the (large) boolean masks.
+    """
+    contours: list[npt.NDArray[np.int32]] = []
+    for flat in contours_xy:
+        # Need >=3 points (6 coords) for a polygon, and an even count so the
+        # flat list pairs cleanly into (x, y) before reshape(-1, 1, 2).
+        if len(flat) < 6 or len(flat) % 2 != 0:  # noqa: PLR2004
+            continue
+        pts = np.asarray(flat, dtype=np.int32).reshape(-1, 1, 2)
+        contours.append(pts)
+    return contours
+
+
+def draw_detections(  # noqa: PLR0913, PLR0912, C901 — each arg controls an orthogonal overlay aspect; modes branch but stay readable inline
+    frame: npt.NDArray[np.uint8],
+    detections: list[dict[str, Any]],
+    prompts: list[str],
+    trails: dict[int, list[tuple[int, int]]],
+    *,
+    mode: Literal["positive", "negative"] = "positive",
+    draw_trails: bool = False,
+    label_style: Literal["id", "name", "none"] = "id",
+    mask_opacity: int = 0,
+) -> npt.NDArray[np.uint8]:
+    """Draw tracked regions from JSON detection records onto ``frame``.
+
+    Unlike :func:`draw_frame` (which consumes boolean masks), this redraws from
+    the compact ``contours_xy`` polygons stored in ``objects.json``, so the
+    annotate step needs only the (transportable) track data.
+
+    Args:
+        frame: ``H x W x 3`` BGR uint8. Not mutated; a copy is returned.
+        detections: per-frame detection records, each
+            ``{"prompt", "object_id", "box_xyxy", "contours_xy"}``.
+        prompts: ordered prompt list, used to assign stable colours.
+        trails: ``object_id`` -> accumulated ``(cx, cy)`` centres; updated here.
+        mode: ``"positive"`` reveals/annotates inside the region (outline +
+            optional fill + label); ``"negative"`` obscures inside the region
+            (gaussian blur), for redaction.
+        draw_trails: if ``True``, draw polyline trails per object.
+        label_style: ``"id"`` -> ``#<object_id>``, ``"name"`` -> prompt string,
+            ``"none"`` -> no label. Ignored in ``negative`` mode.
+        mask_opacity: 0-100 opacity of the coloured fill in ``positive`` mode
+            (``0`` = outline only). Ignored in ``negative`` mode.
+
+    Returns:
+        Annotated BGR frame.
+
+    """
+    if mask_opacity < 0 or mask_opacity > 100:  # noqa: PLR2004
+        msg = f"mask_opacity must be in [0, 100], got {mask_opacity}"
+        raise ValueError(msg)
+
+    prompt_colour = {p: COLOURS[i % len(COLOURS)] for i, p in enumerate(prompts)}
+    out = frame.copy()
+    fill_alpha = mask_opacity / 100.0
+
+    for det in detections:
+        prompt = str(det.get("prompt", ""))
+        object_id = int(det.get("object_id", -1))
+        contours = _contours_from_xy(det.get("contours_xy", []))
+        colour = prompt_colour.get(prompt, (200, 200, 200))
+        box = [int(v) for v in det.get("box_xyxy", [0, 0, 0, 0])]
+
+        # Region mask: prefer the contour silhouette, fall back to the bbox
+        # rectangle when contours are absent (region=box track output).
+        region = np.zeros(out.shape[:2], dtype=np.uint8)
+        if contours:
+            cv2.drawContours(region, contours, -1, 255, thickness=cv2.FILLED)
+        else:
+            cv2.rectangle(region, (box[0], box[1]), (box[2], box[3]), 255, thickness=cv2.FILLED)
+        region_bool = region.astype(bool)
+
+        if mode == "negative":
+            blurred = cv2.GaussianBlur(out, (0, 0), sigmaX=12.0)
+            out[region_bool] = blurred[region_bool]
+            continue
+
+        if fill_alpha > 0.0:
+            overlay = out.copy()
+            overlay[region_bool] = colour
+            blended = cv2.addWeighted(overlay, fill_alpha, out, 1.0 - fill_alpha, 0.0)
+            out[region_bool] = blended[region_bool]
+
+        if contours:
+            cv2.drawContours(out, contours, -1, colour, thickness=MASK_CONTOUR_THICKNESS)
+        else:
+            cv2.rectangle(out, (box[0], box[1]), (box[2], box[3]), colour, thickness=MASK_CONTOUR_THICKNESS)
+
+        if label_style != "none":
+            label = f"#{object_id}" if label_style == "id" else prompt
+            if contours:
+                all_pts = np.vstack([c.reshape(-1, 2) for c in contours])
+                anchor_y = int(all_pts[:, 1].min())
+                anchor_x = int(np.median(all_pts[all_pts[:, 1] == anchor_y, 0]))
+            else:
+                anchor_x, anchor_y = box[0], box[1]
+            (tw, _th), _ = cv2.getTextSize(label, FONT, LABEL_SCALE, LABEL_THICKNESS)
+            text_origin = (max(0, anchor_x - tw // 2), max(_th + 2, anchor_y - 6))
+            cv2.putText(
+                out, label, text_origin, FONT, LABEL_SCALE, LABEL_OUTLINE_COLOUR, LABEL_OUTLINE_THICKNESS, cv2.LINE_AA
+            )
+            cv2.putText(out, label, text_origin, FONT, LABEL_SCALE, LABEL_TEXT_COLOUR, LABEL_THICKNESS, cv2.LINE_AA)
+
+        if draw_trails:
+            cx, cy = int((box[0] + box[2]) / 2), int((box[1] + box[3]) / 2)
+            trail = trails.setdefault(object_id, [])
+            trail.append((cx, cy))
+            if len(trail) >= TRAIL_MIN_POINTS:
+                pts = np.array(trail, dtype=np.int32).reshape(-1, 1, 2)
+                cv2.polylines(out, [pts], isClosed=False, color=colour, thickness=TRAIL_THICKNESS)
+
+    return out
 
 
 def draw_frame(  # noqa: PLR0913 — each arg controls an orthogonal overlay aspect; bundling into a config object would hurt call-site readability

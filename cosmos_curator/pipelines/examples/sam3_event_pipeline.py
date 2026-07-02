@@ -164,8 +164,8 @@ class _WriteSam3OutputsStage(CuratorStage):
 
         if clip.sam3_instances is not None:
             _write_json("instances.json", sam3_instances_envelope(clip.sam3_instances))
-        if clip.sam3_objects_by_frame is not None:
-            _write_json("objects.json", sam3_objects_envelope(clip.sam3_objects_by_frame))
+        if clip.sam3_frames is not None:
+            _write_json("objects.json", sam3_objects_envelope(clip.sam3_frames))
         if clip.sam3_events is not None:
             _write_json("events.json", sam3_events_envelope(clip.sam3_events))
 
@@ -230,6 +230,7 @@ def _assemble_stages(args: argparse.Namespace) -> list[CuratorStage | CuratorSta
                     high_conf_thresh=args.sam3_high_conf_thresh,
                     high_iou_thresh=args.sam3_high_iou_thresh,
                 ),
+                region=args.sam3_region,
                 # Annotation is always on for this example — visual output is the point.
                 write_annotated_video=True,
                 draw_trails=args.sam3_annotated_video_trails,

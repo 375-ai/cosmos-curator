@@ -197,10 +197,10 @@ Run-level aggregates of caption status and quality-flag fields are documented in
 |---|---|
 | Stage | `SAM3BBoxStage` |
 | Code | [`tracking/sam3_bbox_stage.py`](../../../cosmos_curator/pipelines/video/tracking/sam3_bbox_stage.py), built by [`tracking_builders.py`](../../../cosmos_curator/pipelines/video/tracking/tracking_builders.py) |
-| Main flags | `--sam3`, `--sam3-prompts`, `--sam3-target-fps`, `--sam3-max-clip-duration-s`, `--sam3-write-annotated-video` |
-| Purpose | Tracks prompted objects through each clip with SAM3. Prompts are plain-text object descriptions such as `"a car"` or `"a pedestrian"`. |
-| Output | Populates `clip.sam3_instances`, `clip.sam3_objects_by_frame`, and optionally `clip.sam3_annotated_video`; the writer emits `sam3_instances/`, `sam3_objects/`, and optionally `sam3_tracked/`. |
-| Cost notes | Runs in the `sam3` Pixi environment and uses a GPU. Event captioning automatically enables annotated video because the VLM needs object ID overlays. |
+| Main flags | `--sam3`, `--sam3-prompts`, `--sam3-target-fps`, `--sam3-max-clip-duration-s`, `--sam3-region`, `--sam3-output-format`, `--sam3-write-annotated-video` |
+| Purpose | Single fused stage that tracks prompted objects through each clip with SAM3 — decoding once (real per-frame timestamps via the sensor library), serializing the track data, and optionally rendering+encoding the annotated video in the same pass. Prompts are plain-text object descriptions such as `"a car"` or `"a pedestrian"`. |
+| Output | Populates `clip.sam3_instances`, `clip.sam3_frames` (per-frame records with real `timestamp_s`), frame geometry, and optionally `clip.sam3_annotated_video`. The writer emits `sam3_instances/`, the per-frame track data in the `--sam3-output-format` (`native` → `sam3_objects/`, `coco` → `sam3_coco/`, `mot` → `sam3_mot/`), and optionally `sam3_tracked/`. |
+| Cost notes | Runs in the `sam3` Pixi environment and uses a GPU. Decoded frames stay in-process (the stage is a thin router over stateless decode/track/serialize/annotate/encode functions), so the clip is decoded and encoded at most once. Event captioning automatically enables annotated video because the VLM needs object ID overlays. |
 
 ### Per-Event Captioning
 

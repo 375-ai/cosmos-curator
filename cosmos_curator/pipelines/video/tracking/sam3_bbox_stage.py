@@ -13,29 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SAM3 bounding-box tracking stage for the splitting pipeline.
+"""SAM3 object-tracking stage for the splitting pipeline.
 
-Runs SAM3 in pre-loaded chunked mode (enables hotstart heuristics:
-phantom/duplicate removal, occlusion handling) on each clip's transcoded
-mp4 bytes and populates per-clip outputs:
+A single fused stage that decodes each clip once, runs SAM3 in pre-loaded
+chunked mode (enables hotstart heuristics: phantom/duplicate removal, occlusion
+handling), and — in the same pass — serializes the track data and (optionally)
+renders the annotated mp4, encoding once. Annotation is folded into the stage
+rather than split into separate CPU stages because (a) SAM3 masks are too large
+to transport across the Ray task boundary and (b) splitting forces a re-encode
+between stages; keeping it here means exactly one decode and one encode.
 
-- ``clip.sam3_instances``        — per-``object_id`` summary across the clip
-- ``clip.sam3_objects_by_frame`` — ``{frame_idx: [{object_id, prompt, box_xyxy}, ...]}``
-- ``clip.sam3_annotated_video``  — optional re-encoded mp4 with overlays drawn
+The work is decomposed into small, stateless functions wired by a thin
+``_process_clip`` so each can be unit-tested and recomposed (e.g. a future
+annotate-only stage reuses ``annotate_frames`` over loaded track data):
 
-This stage runs in the ``sam3`` pixi environment (isolated from vLLM) and
-requires one full GPU. Annotation is folded into the stage rather than being
-a separate CPU stage because SAM3 masks are too large to transport across the
-Ray task boundary (roughly ``frames * objects * H * W`` boolean bytes per clip).
+- ``decode_clip_at_fps`` (``sensor_decode``) — bytes -> frames + real PTS
+- ``track_objects``      — frames -> per-frame ``Detection`` lists + instances
+- ``build_track_records`` (``track_funcs``) — ``Detection`` lists -> ``sam3_frames`` JSON
+- ``annotate_frames`` (``track_funcs``)     — frames + ``sam3_frames`` -> annotated BGR
+- ``encode_frames_to_mp4`` (``track_funcs``)— annotated frames -> mp4 bytes
+
+The CPU-only serialize/render/encode helpers live in ``track_funcs`` (no
+``torch`` dependency, so they unit-test on CPU); only ``track_objects`` (model
+inference) and the stage wiring live here. Frames are decoded via the shared
+sensor library, so each carries its real presentation timestamp (PTS) rather
+than ``frame_idx / fps``. This stage runs in the ``sam3`` pixi environment
+(isolated from vLLM) and requires one full GPU.
 """
 
-import collections
-import pathlib
-import tempfile
 from typing import Any, Literal
 
 import attrs
-import cv2
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -45,9 +53,14 @@ from cosmos_curator.core.interfaces.model_interface import ModelInterface
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
 from cosmos_curator.core.utils.infra.gpu_start_helper import gpu_stage_startup
-from cosmos_curator.core.utils.misc.memfd import buffer_as_memfd_path
 from cosmos_curator.models.sam3 import SAM3Model
-from cosmos_curator.pipelines.video.tracking.visualization import Detection, draw_frame
+from cosmos_curator.pipelines.video.tracking.sensor_decode import decode_clip_at_fps
+from cosmos_curator.pipelines.video.tracking.track_funcs import (
+    annotate_frames,
+    build_track_records,
+    encode_frames_to_mp4,
+)
+from cosmos_curator.pipelines.video.tracking.visualization import Detection
 from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask
 
 
@@ -68,55 +81,6 @@ class SAM3QualityConfig:
         """Return a dict of non-``None`` overrides or ``None`` if all are default."""
         overrides = {k: v for k, v in attrs.asdict(self).items() if v is not None}
         return overrides or None
-
-
-def _read_frames_from_bytes(
-    mp4_bytes: bytes,
-    target_fps: float,
-) -> tuple[
-    list[npt.NDArray[np.uint8]],
-    list[npt.NDArray[np.uint8]],
-    list[int],
-    float,
-    float,
-    int,
-    int,
-    int,
-]:
-    """Decode ``mp4_bytes`` and return frames subsampled to ``target_fps``.
-
-    Returns:
-        ``(rgb_frames, bgr_frames, source_indices, src_fps, out_fps, step, width, height)``.
-
-    """
-    with buffer_as_memfd_path(mp4_bytes, name="sam3-bbox-clip") as path:
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            msg = "SAM3BBoxStage: cannot open clip mp4 bytes via memfd"
-            raise RuntimeError(msg)
-        src_fps: float = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        step = max(1, round(src_fps / target_fps))
-        out_fps = src_fps / step
-
-        rgb_frames: list[npt.NDArray[np.uint8]] = []
-        bgr_frames: list[npt.NDArray[np.uint8]] = []
-        source_indices: list[int] = []
-        idx = 0
-        while True:
-            ret, bgr = cap.read()
-            if not ret:
-                break
-            if idx % step == 0:
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                rgb_frames.append(rgb.astype(np.uint8, copy=False))
-                bgr_frames.append(np.asarray(bgr, dtype=np.uint8))
-                source_indices.append(idx)
-            idx += 1
-        cap.release()
-
-    return rgb_frames, bgr_frames, source_indices, src_fps, out_fps, step, w, h
 
 
 def _postprocess_to_detections(processed: dict[str, Any], prompts: list[str]) -> list[Detection]:
@@ -145,75 +109,46 @@ def _postprocess_to_detections(processed: dict[str, Any], prompts: list[str]) ->
     return detections
 
 
-def _encode_annotated_video(
-    annotated_bgr_frames: list[npt.NDArray[np.uint8]],
-    out_fps: float,
-    width: int,
-    height: int,
-) -> bytes | None:
-    """Encode a list of BGR frames to an mp4 byte buffer via a temp file.
-
-    ``cv2.VideoWriter`` needs a filesystem path, so we write to a temp file and
-    read the bytes back. ``delete=False`` + explicit ``unlink`` avoids racing
-    the ``VideoWriter``'s own handle on the same path.
-    """
-    if not annotated_bgr_frames:
-        return None
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-        tmp_path = tf.name
-    try:
-        writer = cv2.VideoWriter(
-            tmp_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),  # type: ignore[attr-defined]
-            out_fps,
-            (width, height),
-        )
-        if not writer.isOpened():
-            logger.warning("SAM3BBoxStage: cv2.VideoWriter failed to open — skipping annotated video")
-            return None
-        for frame in annotated_bgr_frames:
-            writer.write(frame)
-        writer.release()
-        return pathlib.Path(tmp_path).read_bytes()
-    finally:
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-
-
-def _run_sam3_on_clip(  # noqa: PLR0913  # inference helper, parameters mirror SAM3Model API
+def track_objects(  # noqa: PLR0913 — inference helper; params mirror the SAM3 + decode contract
     sam3: SAM3Model,
-    clip_mp4_bytes: bytes,
+    frames_rgb: list[npt.NDArray[np.uint8]],
+    timestamps_s: list[float],
     prompts: list[str],
-    target_fps: float,
-    session_reset_s: float,
     *,
-    write_annotated: bool,
-    draw_trails: bool,
-    label_style: Literal["id", "name", "none"] = "id",
-    mask_opacity: int = 0,
-) -> tuple[dict[int, list[dict[str, Any]]], list[dict[str, Any]], bytes | None]:
-    """Run SAM3 pre-loaded chunked inference on a single clip.
+    session_reset_s: float,
+    target_fps: float,
+) -> tuple[list[list[Detection]], list[dict[str, Any]]]:
+    """Run SAM3 pre-loaded chunked inference over already-decoded frames.
+
+    Pure inference: no decode, no drawing, no I/O. Returns per-frame in-memory
+    ``Detection`` lists (carrying boolean masks) aligned 1:1 with
+    ``frames_rgb``, plus per-object instance summaries.
+
+    SAM3 assigns object_ids fresh per session (per chunk), so the same raw id
+    recurs in every chunk. Each ``(chunk_idx, raw_object_id)`` is remapped to a
+    clip-global id (rewritten onto the detections and instances) so no two
+    unrelated tracks from different chunks ever share an id downstream. Instance
+    start/end times use the frames' real sensor PTS (``timestamps_s``, aligned
+    1:1 with ``frames_rgb``).
 
     Returns:
-        ``(objects_by_frame, instances, annotated_mp4_bytes_or_none)``.
+        ``(per_frame_dets, instances)`` where ``per_frame_dets[i]`` are the
+        detections for ``frames_rgb[i]`` and ``instances`` is sorted by
+        ``(start_time_s, object_id)``.
 
     """
-    rgb_frames, bgr_frames, source_indices, src_fps, out_fps, _step, width, height = _read_frames_from_bytes(
-        clip_mp4_bytes,
-        target_fps=target_fps,
-    )
+    rgb_frames = frames_rgb
+    per_frame_dets: list[list[Detection]] = [[] for _ in rgb_frames]
+    instances_map: dict[int, dict[str, Any]] = {}
+    # (chunk_idx, raw per-chunk object_id) -> clip-global id, assigned in order
+    # of first appearance so ids are compact and collision-free across chunks.
+    global_id_map: dict[tuple[int, int], int] = {}
 
     if not rgb_frames:
-        return {}, [], None
+        return per_frame_dets, []
 
     chunk_size = max(1, int(session_reset_s * target_fps) if session_reset_s else len(rgb_frames))
     n_chunks = (len(rgb_frames) + chunk_size - 1) // chunk_size
-
-    objects_by_frame: dict[int, list[dict[str, Any]]] = {}
-    # SAM3 assigns object_ids fresh per session, so we namespace by
-    # ``(chunk_idx, object_id)`` to avoid cross-chunk collisions.
-    instances_map: dict[tuple[int, int], dict[str, Any]] = {}
-    annotated_bgr: list[npt.NDArray[np.uint8]] = []
-    trails: dict[int, list[tuple[int, int]]] = collections.defaultdict(list)
 
     with torch.no_grad():
         session = None
@@ -221,8 +156,6 @@ def _run_sam3_on_clip(  # noqa: PLR0913  # inference helper, parameters mirror S
             start = chunk_idx * chunk_size
             end = min(start + chunk_size, len(rgb_frames))
             chunk_rgb = rgb_frames[start:end]
-            chunk_bgr = bgr_frames[start:end]
-            chunk_src_indices = source_indices[start:end]
 
             if session is not None:
                 del session
@@ -244,62 +177,44 @@ def _run_sam3_on_clip(  # noqa: PLR0913  # inference helper, parameters mirror S
             ):
                 processed = sam3.processor.postprocess_outputs(session, model_outputs)
                 local_idx = model_outputs.frame_idx
-                if local_idx >= len(chunk_bgr):
+                if local_idx >= len(chunk_rgb):
                     continue
-                src_idx = chunk_src_indices[local_idx]
+                sampled_idx = start + local_idx
+                frame_time_s = timestamps_s[sampled_idx]
 
                 detections = _postprocess_to_detections(processed, prompts)
+                per_frame_dets[sampled_idx] = detections
 
-                objects_by_frame[src_idx] = [det.to_json_dict() for det in detections]
-
-                # Seconds since clip start (``src_idx`` indexes the ORIGINAL,
-                # pre-subsampled video); rounded to ms for compact JSON.
-                src_time_s = round(src_idx / src_fps, 3) if src_fps > 0 else 0.0
                 for det in detections:
-                    key = (chunk_idx, det.object_id)
+                    global_id = global_id_map.setdefault((chunk_idx, det.object_id), len(global_id_map))
+                    det.object_id = global_id
                     entry = instances_map.setdefault(
-                        key,
+                        global_id,
                         {
-                            "object_id": det.object_id,
+                            "object_id": global_id,
                             "prompt": det.prompt,
-                            "start_time_s": src_time_s,
-                            "end_time_s": src_time_s,
+                            "start_time_s": frame_time_s,
+                            "end_time_s": frame_time_s,
                             "num_frames": 0,
                         },
                     )
-                    entry["end_time_s"] = src_time_s
+                    entry["end_time_s"] = frame_time_s
                     entry["num_frames"] += 1
-                    trails[det.object_id].append(det.center)
-
-                if write_annotated:
-                    annotated_bgr.append(
-                        draw_frame(
-                            chunk_bgr[local_idx],
-                            detections,
-                            prompts,
-                            trails,
-                            draw_trails=draw_trails,
-                            current_time_s=src_time_s,
-                            label_style=label_style,
-                            mask_opacity=mask_opacity,
-                        )
-                    )
-
-            trails.clear()
 
     # Chronological by start time, then object_id for stable output.
     instances = sorted(instances_map.values(), key=lambda e: (e["start_time_s"], e["object_id"]))
-    annotated_bytes = _encode_annotated_video(annotated_bgr, out_fps, width, height) if write_annotated else None
-    return objects_by_frame, instances, annotated_bytes
+    return per_frame_dets, instances
 
 
 class SAM3BBoxStage(CuratorStage):
-    """SAM3 object tracking stage producing per-clip bbox/instance metadata.
+    """SAM3 object tracking stage producing per-clip track data + annotated mp4.
 
     Uses pre-loaded chunked inference (enables SAM3's hotstart heuristics for
-    higher-quality tracks) and optionally draws annotated mp4 output. Consumes
-    ``clip.encoded_data`` (post-transcode mp4 bytes) and populates ``Clip``'s
-    SAM3 output fields.
+    higher-quality tracks). Fused single pass: consumes ``clip.encoded_data``
+    (post-transcode mp4 bytes), decodes once, and populates
+    ``clip.sam3_frames`` / ``clip.sam3_instances`` (+ frame geometry) and,
+    when ``write_annotated_video`` is set, ``clip.sam3_annotated_video``
+    (encoded once).
     """
 
     def __init__(  # noqa: PLR0913  # flat config surface keeps CLI wiring straightforward
@@ -310,6 +225,7 @@ class SAM3BBoxStage(CuratorStage):
         max_clip_duration_s: float = 30.0,
         session_reset_s: float = 10.0,
         quality_config: SAM3QualityConfig | None = None,
+        region: Literal["box", "contour"] = "contour",
         write_annotated_video: bool = False,
         draw_trails: bool = False,
         annotated_video_label_style: Literal["id", "name", "none"] = "id",
@@ -328,8 +244,11 @@ class SAM3BBoxStage(CuratorStage):
             session_reset_s: Chunk length in seconds. The SAM3 session is re-init'd
                 between chunks to bound GPU memory.
             quality_config: Optional ``Sam3VideoConfig`` tuning knobs.
+            region: ``"contour"`` (default) emits per-detection polygons; ``"box"``
+                emits bounding boxes only (skips contour extraction).
             write_annotated_video: If ``True``, emit an annotated mp4 per clip
-                (boxes + masks + ids + optional trails) into ``clip.sam3_annotated_video``.
+                (masks + ids + timestamp + optional trails) into
+                ``clip.sam3_annotated_video``.
             draw_trails: If ``True`` and ``write_annotated_video`` is on, draw
                 trajectory trails.
             annotated_video_label_style: ``"id"`` (default), ``"name"`` or
@@ -353,6 +272,7 @@ class SAM3BBoxStage(CuratorStage):
         self._max_clip_duration_s = max_clip_duration_s
         self._session_reset_s = session_reset_s
         self._quality_config = quality_config or SAM3QualityConfig()
+        self._region = region
         self._write_annotated_video = write_annotated_video
         self._draw_trails = draw_trails
         self._annotated_video_label_style = annotated_video_label_style
@@ -407,33 +327,58 @@ class SAM3BBoxStage(CuratorStage):
         mp4_bytes = mp4_data.tobytes()
 
         try:
-            objects_by_frame, instances, annotated_bytes = _run_sam3_on_clip(
+            # Decode ONCE; everything below operates on these frames in memory.
+            decoded = decode_clip_at_fps(mp4_bytes, self._target_fps)
+            per_frame_dets, instances = track_objects(
                 self._sam3_model,
-                mp4_bytes,
+                decoded.frames_rgb,
+                decoded.timestamps_s,
                 self._prompts,
-                target_fps=self._target_fps,
                 session_reset_s=self._session_reset_s,
-                write_annotated=self._write_annotated_video,
-                draw_trails=self._draw_trails,
-                label_style=self._annotated_video_label_style,
-                mask_opacity=self._annotated_video_mask_opacity,
+                target_fps=self._target_fps,
+            )
+            sam3_frames = build_track_records(
+                per_frame_dets,
+                decoded.timestamps_s,
+                include_contours=self._region == "contour",
             )
         except Exception:  # noqa: BLE001
             clip.errors["sam3_bbox"] = "inference_error"
             logger.exception(f"[SAM3BBoxStage] clip {clip.uuid}: SAM3 inference failed")
             return
 
-        clip.sam3_objects_by_frame = objects_by_frame
+        clip.sam3_frames = sam3_frames
         clip.sam3_instances = instances
-        if annotated_bytes is not None:
-            clip.sam3_annotated_video = bytes_to_numpy(annotated_bytes)  # type: ignore[assignment]
+        clip.sam3_frame_width = decoded.width
+        clip.sam3_frame_height = decoded.height
+
+        if self._write_annotated_video and decoded.frames_rgb:
+            # Track data is already committed above; a render/encode failure only
+            # costs the annotated video, so record it per-clip and keep going
+            # rather than aborting the whole run.
+            try:
+                annotated_bgr = annotate_frames(
+                    decoded.frames_rgb,
+                    sam3_frames,
+                    self._prompts,
+                    draw_masks=True,
+                    draw_timestamps=True,
+                    label_style=self._annotated_video_label_style,
+                    mask_opacity=self._annotated_video_mask_opacity,
+                    draw_trails=self._draw_trails,
+                )
+                # Encode ONCE at the sampling fps (frames were sampled at target_fps).
+                annotated_bytes = encode_frames_to_mp4(annotated_bgr, self._target_fps, decoded.width, decoded.height)
+                if annotated_bytes is not None:
+                    clip.sam3_annotated_video = bytes_to_numpy(annotated_bytes)  # type: ignore[assignment]
+            except Exception:  # noqa: BLE001
+                clip.errors["sam3_annotated"] = "annotate_error"
+                logger.exception(f"[SAM3BBoxStage] clip {clip.uuid}: annotated video render/encode failed")
 
         if self._verbose:
-            num_frames = len(objects_by_frame)
-            num_instances = len(instances)
             logger.info(
-                f"[SAM3BBoxStage] clip {clip.uuid}: {num_frames} annotated frames, "
-                f"{num_instances} instances, prompts={self._prompts}"
+                f"[SAM3BBoxStage] clip {clip.uuid}: {len(sam3_frames)} tracked frames, "
+                f"{len(instances)} instances, prompts={self._prompts}"
             )
 
     def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:  # type: ignore[override]

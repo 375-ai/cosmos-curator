@@ -103,6 +103,26 @@ def add_sam3_args(
             "to bound GPU memory; lower = safer but loses ID consistency across chunks."
         ),
     )
+    parser.add_argument(
+        "--sam3-region",
+        choices=("box", "contour"),
+        default="contour",
+        help=(
+            "Region representation in the track data. 'contour' (default) stores per-detection "
+            "polygons (needed for silhouette masks); 'box' stores bounding boxes only and skips "
+            "contour extraction (smaller output, box-only masks)."
+        ),
+    )
+    parser.add_argument(
+        "--sam3-output-format",
+        choices=("native", "coco", "mot"),
+        default="native",
+        help=(
+            "On-disk format for the per-frame track data. 'native' (default) writes "
+            "objects.json; 'coco' writes a COCO detection JSON; 'mot' writes MOT-challenge "
+            "CSV rows. instances.json / events.json / tracked.mp4 are unaffected."
+        ),
+    )
 
     # Quality knobs (None = SAM3 default from Sam3VideoConfig).
     parser.add_argument(

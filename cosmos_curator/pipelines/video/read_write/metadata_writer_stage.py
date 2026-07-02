@@ -56,7 +56,10 @@ from cosmos_curator.pipelines.video.read_write.clip_metadata_lance_schema import
     CLIP_METADATA_LANCE_SCHEMA_VERSION,
     build_clip_metadata_lance_table,
 )
+from cosmos_curator.pipelines.video.tracking.exporters import to_coco_dict, to_mot_text
 from cosmos_curator.pipelines.video.tracking.serialization import (
+    SAM3_OUTPUT_FORMATS,
+    Sam3OutputFormat,
     sam3_events_envelope,
     sam3_instances_envelope,
     sam3_objects_envelope,
@@ -114,6 +117,7 @@ class ClipWriterStage(CuratorStage):
         caption_quality_stats_enabled: bool = False,
         caption_quality_flags_enabled: bool = True,
         generate_cosmos_predict_dataset: bool = False,
+        sam3_output_format: Sam3OutputFormat = "native",
         verbose: bool = False,
         log_stats: bool = False,
     ) -> None:
@@ -143,6 +147,11 @@ class ClipWriterStage(CuratorStage):
         self._caption_quality_stats_enabled = caption_quality_stats_enabled
         self._caption_quality_flags_enabled = caption_quality_flags_enabled
         self._generate_cosmos_predict_dataset = generate_cosmos_predict_dataset
+        # Fail fast at construction on a bad format rather than mid-run per-clip.
+        if sam3_output_format not in SAM3_OUTPUT_FORMATS:
+            msg = f"unknown sam3_output_format {sam3_output_format!r}; expected one of {SAM3_OUTPUT_FORMATS}"
+            raise ValueError(msg)
+        self._sam3_output_format = sam3_output_format
         self._verbose = verbose
         self._log_stats = log_stats
         self._embedding_buffer: list[dict[str, Any]] = []
@@ -307,6 +316,16 @@ class ClipWriterStage(CuratorStage):
     def get_output_path_sam3_objects(output_path: str) -> str:
         """Get path to store per-clip SAM3 ``objects.json`` files."""
         return ClipWriterStage._get_output_path(output_path, "sam3_objects")
+
+    @staticmethod
+    def get_output_path_sam3_coco(output_path: str) -> str:
+        """Get path to store per-clip SAM3 COCO detection JSON files."""
+        return ClipWriterStage._get_output_path(output_path, "sam3_coco")
+
+    @staticmethod
+    def get_output_path_sam3_mot(output_path: str) -> str:
+        """Get path to store per-clip SAM3 MOT-challenge CSV files."""
+        return ClipWriterStage._get_output_path(output_path, "sam3_mot")
 
     @staticmethod
     def get_output_path_sam3_events(output_path: str) -> str:
@@ -738,19 +757,8 @@ class ClipWriterStage(CuratorStage):
                 source_video,
             )
 
-        if clip.sam3_objects_by_frame is not None:
-            dest = self._get_clip_uri(
-                clip.uuid,
-                self.get_output_path_sam3_objects(self._output_path),
-                "json",
-                filename_suffix="_objects",
-            )
-            self._write_json_data(
-                sam3_objects_envelope(clip.sam3_objects_by_frame),
-                dest,
-                f"sam3 objects {clip.uuid}",
-                source_video,
-            )
+        if clip.sam3_frames is not None:
+            self._write_clip_sam3_frames(clip, source_video)
 
         if clip.sam3_events is not None:
             dest = self._get_clip_uri(
@@ -776,6 +784,69 @@ class ClipWriterStage(CuratorStage):
             self._write_data(annotated, dest, f"sam3 tracked {clip.uuid}", source_video)
 
         return clip_stats
+
+    def _write_clip_sam3_frames(self, clip: Clip, source_video: str) -> None:
+        """Write per-frame SAM3 track data in the configured format.
+
+        ``native`` -> ``objects.json``; ``coco`` -> COCO detection JSON;
+        ``mot`` -> MOT-challenge CSV. instances / events / tracked outputs are
+        unaffected by this choice.
+        """
+        frames = clip.sam3_frames or []
+        # Format is validated once in __init__, so it's a known-good value here.
+        if self._sam3_output_format == "coco":
+            width = clip.sam3_frame_width or 0
+            height = clip.sam3_frame_height or 0
+            if width <= 0 or height <= 0:
+                # Per-clip data problem (track stage didn't record geometry):
+                # skip this clip's COCO export rather than aborting the whole job.
+                # NB: only log here -- this runs as a concurrent per-clip future
+                # alongside ``_write_clip_metadata``, which iterates ``clip.errors``
+                # (``len`` / ``list``), so mutating that shared dict from here could
+                # race ("dictionary changed size during iteration").
+                logger.error(
+                    f"clip {clip.uuid}: COCO export requires positive frame geometry, "
+                    f"got width={width}, height={height} (track stage did not record it?) — skipping"
+                )
+                return
+            dest = self._get_clip_uri(
+                clip.uuid,
+                self.get_output_path_sam3_coco(self._output_path),
+                "json",
+                filename_suffix="_coco",
+            )
+            self._write_json_data(
+                to_coco_dict(
+                    frames,
+                    image_width=width,
+                    image_height=height,
+                    file_stem=str(clip.uuid),
+                ),
+                dest,
+                f"sam3 coco {clip.uuid}",
+                source_video,
+            )
+        elif self._sam3_output_format == "mot":
+            dest = self._get_clip_uri(
+                clip.uuid,
+                self.get_output_path_sam3_mot(self._output_path),
+                "txt",
+                filename_suffix="_mot",
+            )
+            self._write_text_data(to_mot_text(frames), dest, f"sam3 mot {clip.uuid}", source_video)
+        else:
+            dest = self._get_clip_uri(
+                clip.uuid,
+                self.get_output_path_sam3_objects(self._output_path),
+                "json",
+                filename_suffix="_objects",
+            )
+            self._write_json_data(
+                sam3_objects_envelope(frames),
+                dest,
+                f"sam3 objects {clip.uuid}",
+                source_video,
+            )
 
     def _get_clip_embedding(self, clip: Clip) -> npt.NDArray[np.float32] | None:
         if self._embedding_algorithm == "internvideo2":

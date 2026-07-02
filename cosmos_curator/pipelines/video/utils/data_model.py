@@ -481,8 +481,17 @@ class Clip:
     # Seconds (not frame indices) are used so the downstream VLM captioning
     # stage can pass the payload to a VLM unchanged.
     sam3_instances: list[dict[str, Any]] | None = None
-    # Per-frame object detections: {frame_idx: [{object_id, prompt, box_xyxy}, ...]}
-    sam3_objects_by_frame: dict[int, list[dict[str, Any]]] | None = None
+    # Per-frame track records, one per sampled frame and aligned to the sampled
+    # decode order. Each entry has keys: frame_idx (int native display index),
+    # timestamp_s (float real sensor PTS, seconds since clip start), and
+    # detections (list of dicts with prompt, object_id, box_xyxy, contours_xy).
+    # Real PTS is carried per frame so downstream consumers (annotate render,
+    # COCO/MOT exporters) never re-derive time from frame_idx / fps.
+    sam3_frames: list[dict[str, Any]] | None = None
+    # Frame geometry (pixels) captured at decode time, used by the COCO exporter
+    # which needs image width/height independent of the (dropped) masks.
+    sam3_frame_width: int | None = None
+    sam3_frame_height: int | None = None
     # Per-event VLM annotations populated by PerEventCaptionStage. The shape
     # of each entry is defined entirely by the prompt — the stage passes the
     # model's JSON output through unchanged, so downstream consumers must be
@@ -562,6 +571,7 @@ class Clip:
             total_size += self.openai_embedding.nbytes
         if self.pts_ns is not None:
             total_size += self.pts_ns.nbytes
+        total_size += self.sam3_annotated_video.nbytes
         for window in self.windows:
             total_size += window.get_major_size()
         return total_size

@@ -19,6 +19,7 @@ import attrs
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
 from cosmos_curator.pipelines.video.read_write.download_stages import VideoDownloader
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
+from cosmos_curator.pipelines.video.tracking.serialization import Sam3OutputFormat
 
 
 @attrs.define(frozen=True)
@@ -55,6 +56,7 @@ class OutputConfig:
     caption_quality_stats_enabled: bool = False
     caption_quality_flags_enabled: bool = True
     generate_cosmos_predict_dataset: bool = False
+    sam3_output_format: Sam3OutputFormat = "native"
     num_workers_per_node: int = 8
     num_run_attempts: int = 5
     verbose: bool = False
@@ -99,6 +101,7 @@ def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStag
                 caption_quality_stats_enabled=config.caption_quality_stats_enabled,
                 caption_quality_flags_enabled=config.caption_quality_flags_enabled,
                 generate_cosmos_predict_dataset=config.generate_cosmos_predict_dataset,
+                sam3_output_format=config.sam3_output_format,
                 verbose=config.verbose,
                 log_stats=config.perf_profile,
             ),
