@@ -24,6 +24,28 @@ if TYPE_CHECKING:
 # Default per-node concurrency cap for IO-bound Ray Data work.
 DEFAULT_IO_SLOTS_PER_NODE = 16
 
+# Substring patterns matched against ``"ClassName: message"`` (via
+# ``ray._common.retry.format_exception``) to decide whether a map function
+# error is transient and worth retrying. Class-name substrings avoid
+# dragging in botocore just to reference exception types.
+#
+# ``botocore.exceptions.ClientError`` is deliberately excluded because it
+# is the base class for *all* AWS HTTP responses -- including deterministic
+# 4xx errors (NoSuchKey, AccessDenied, InvalidBucketName) that should fail
+# fast, not consume ``_MAP_MAX_RETRIES`` attempts. Botocore already retries
+# transient 5xx / throttling at its own HTTP client layer; what still
+# bubbles up to us is caught via the transport-level patterns below
+# (DNS / URL, socket read stalls, mid-stream drops on large GETs).
+_MAP_RETRY_PATTERNS: list[str] = [
+    "OSError",
+    "ConnectionError",
+    "TimeoutError",
+    "EndpointConnectionError",
+    "ReadTimeoutError",
+    "IncompleteRead",
+]
+_MAP_MAX_RETRIES = 3
+
 
 def configure_ray_data_progress(*, progress: bool) -> None:
     """Configure Ray Data progress output before creating datasets."""
@@ -33,6 +55,31 @@ def configure_ray_data_progress(*, progress: bool) -> None:
     ctx.enable_rich_progress_bars = progress
     ctx.print_on_execution_start = progress
     ctx.use_ray_tqdm = False
+
+
+def configure_ray_data_stability() -> None:
+    """Enable Ray 2.56 stability knobs for map-heavy Ray Data pipelines.
+
+    - ``default_map_logical_memory_enabled`` (PR ray-project/ray#63814) gives
+      map operators a default logical memory footprint so the scheduler
+      back-pressures before triggering object-store spills or worker OOM
+      kills in IO / transcode / write stages.
+    - ``retried_map_errors`` + ``max_map_retries`` (PR ray-project/ray#63023)
+      retry map functions when the raised exception looks like a transient
+      network / S3 / OS error, up to ``_MAP_MAX_RETRIES`` attempts.
+
+    Attributes are guarded with ``hasattr`` so importing this module on a
+    stale (pre-2.56) Ray wheel still works.
+    """
+    ctx = ray.data.DataContext.get_current()
+    if hasattr(ctx, "default_map_logical_memory_enabled"):
+        ctx.default_map_logical_memory_enabled = True  # type: ignore[attr-defined]
+    # retried_map_errors and max_map_retries both shipped in ray-project/ray#63023;
+    # gate them together so a partial-implementation Ray build can't end up with
+    # the error list set but no retry cap (or vice versa).
+    if hasattr(ctx, "retried_map_errors") and hasattr(ctx, "max_map_retries"):
+        ctx.retried_map_errors = list(_MAP_RETRY_PATTERNS)  # type: ignore[attr-defined]
+        ctx.max_map_retries = _MAP_MAX_RETRIES  # type: ignore[attr-defined]
 
 
 def ensure_ray_initialized() -> None:

@@ -185,7 +185,7 @@ websockets = "<16"
 
 [feature.core.pypi-dependencies]
 cosmos-xenna = "==0.4.3"
-ray = { version = "==2.55.1", extras = ["default", "data"] }
+ray = { version = "==2.56.0", extras = ["default", "data"] }
 google-genai = ">=1.59.0"
 webdataset = "*"
 ```

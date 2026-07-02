@@ -43,6 +43,7 @@ from cosmos_curator.pipelines.ray_data._runtime import (
     DEFAULT_IO_SLOTS_PER_NODE,
     capped_slots_for_items,
     configure_ray_data_progress,
+    configure_ray_data_stability,
     live_ray_node_count,
 )
 from cosmos_curator.pipelines.ray_data.video_split._clip_transcoder import make_transcode_fn
@@ -240,6 +241,7 @@ def run_config(config: ResolvedVideoSplitConfig) -> int:
         ray.init(ignore_reinit_error=True)
 
     _configure_ray_data_progress(progress=config.execution.progress)
+    configure_ray_data_stability()
 
     video_paths = _discover_videos(config.input.video_path, limit=config.input.limit)
     if not video_paths:
