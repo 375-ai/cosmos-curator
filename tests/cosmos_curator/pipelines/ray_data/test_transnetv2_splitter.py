@@ -22,7 +22,7 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
-from cosmos_curator.pipelines.ray_data import _transnetv2_splitter as _splitter
+from cosmos_curator.pipelines.ray_data.video_split import _transnetv2_splitter as _splitter
 
 
 def test_split_transnetv2_frames_outputs_clip_columns(monkeypatch: pytest.MonkeyPatch) -> None:

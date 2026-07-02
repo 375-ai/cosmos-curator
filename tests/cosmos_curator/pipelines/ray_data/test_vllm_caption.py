@@ -29,8 +29,8 @@ import ray
 from ray.llm._internal.batch.stages.vllm_engine_stage import vLLMEngineStage, vLLMEngineStageUDF
 
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
-from cosmos_curator.pipelines.ray_data import _vllm_caption as _captioner
-from cosmos_curator.pipelines.ray_data._vllm_caption import (
+from cosmos_curator.pipelines.ray_data.video_split import _vllm_caption as _captioner
+from cosmos_curator.pipelines.ray_data.video_split._vllm_caption import (
     _add_ray_llm_columns,
     _arrow_data_column_to_rows,
     _assemble_ray_multimodal_data,

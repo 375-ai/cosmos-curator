@@ -17,13 +17,17 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import typer
 
 from cosmos_curator.client.pipeline_cli import pipeline_runtime
-from cosmos_curator.pipelines.ray_data import splitting_pipeline
-from cosmos_curator.pipelines.ray_data.video_split_config import ResolvedVideoSplitConfig
+from cosmos_curator.pipelines.ray_data.caption_judge import driver as caption_judge_driver
+from cosmos_curator.pipelines.ray_data.caption_judge import report_io as caption_judge_report_io
+from cosmos_curator.pipelines.ray_data.caption_judge.config import CaptionJudgePipelineConfig
+from cosmos_curator.pipelines.ray_data.video_split import pipeline as splitting_pipeline
+from cosmos_curator.pipelines.ray_data.video_split.config import ResolvedVideoSplitConfig
 
 
 def _write_config(path: Path, *, extra: str = "") -> Path:
@@ -34,6 +38,22 @@ input:
   video_path: /videos
 output:
   clip_path: /clips
+{extra}
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_caption_judge_config(path: Path, *, extra: str = "") -> Path:
+    path.write_text(
+        f"""schema_version: 1
+kind: caption_judge
+input:
+  baseline: /baseline
+  candidate: /candidate
+output:
+  report_path: /reports/caption_judge_report.json
 {extra}
 """,
         encoding="utf-8",
@@ -61,6 +81,52 @@ def test_pipeline_runtime_hands_resolved_config_to_ray_data_pipeline(
     assert json.loads(capsys.readouterr().out) == {"clips_written": 12}
     assert captured["config"].split.method == "fixed_stride"
     assert captured["config"].input.video_path == "/videos"
+
+
+def test_pipeline_runtime_hands_caption_judge_config_to_ray_data_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Runtime entrypoint dispatches caption_judge configs by kind."""
+    captured: dict[str, object] = {}
+
+    def fake_run_caption_judge_pipeline(*, config: CaptionJudgePipelineConfig) -> SimpleNamespace:
+        captured["config"] = config
+        return SimpleNamespace(
+            passed=False,
+            issues=SimpleNamespace(num_rows=2),
+            stats=SimpleNamespace(windows_judged=5),
+        )
+
+    def fake_write_report(report: SimpleNamespace, path: str, *, report_format: str) -> str:
+        captured["report"] = report
+        captured["report_format"] = report_format
+        return path
+
+    monkeypatch.setattr(caption_judge_driver, "run_caption_judge_pipeline", fake_run_caption_judge_pipeline)
+    monkeypatch.setattr(caption_judge_report_io, "write_report", fake_write_report)
+    config_path = _write_caption_judge_config(tmp_path / "caption_judge.yaml")
+
+    pipeline_runtime.main(
+        config_path,
+        set_overrides=["judge.max_output_tokens=1024"],
+        json_output=True,
+    )
+
+    assert json.loads(capsys.readouterr().out) == {
+        "passed": False,
+        "issues": 2,
+        "windows_judged": 5,
+        "report_path": "/reports/caption_judge_report.json",
+    }
+    assert isinstance(captured["config"], CaptionJudgePipelineConfig)
+    config = captured["config"]
+    assert isinstance(config, CaptionJudgePipelineConfig)
+    assert config.input.baseline == "/baseline"
+    assert config.baseline_metadata == "/baseline/lance/v0"
+    assert config.judge.max_output_tokens == 1024
+    assert captured["report_format"] == "json"
 
 
 def test_pipeline_runtime_reports_runtime_errors_as_json(

@@ -21,15 +21,11 @@ is a self-describing audit spec -- the comparison targets (``output_a`` /
 The CLI loads one via ``--config PATH``.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
+
+from cosmos_curator.core.utils.config.pydantic_config import STRICT_CONFIG_MODEL_CONFIG
 
 DEFAULT_PROFILE_NAME = "default"
-
-# Project precedent: every config model uses this triple.
-#   frozen=True       -- immutability by design
-#   strict=True       -- no "5" -> 5 coercion; YAML/JSON typos in value types fail loudly
-#   extra="forbid"    -- typos in field names fail at load (instead of silently ignored)
-_CONFIG_MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")
 
 
 class SummaryPolicy(BaseModel):
@@ -40,7 +36,7 @@ class SummaryPolicy(BaseModel):
     else is compared by strict equality.
     """
 
-    model_config = _CONFIG_MODEL_CONFIG
+    model_config = STRICT_CONFIG_MODEL_CONFIG
 
     token_count_abs_tolerance: float = Field(default=0.0, ge=0.0)
     token_count_rel_tolerance: float = Field(default=0.0, ge=0.0)
@@ -49,7 +45,7 @@ class SummaryPolicy(BaseModel):
 class ScoreTolerance(BaseModel):
     """Abs / rel tolerance for scalar per-clip score comparisons (aesthetic, motion)."""
 
-    model_config = _CONFIG_MODEL_CONFIG
+    model_config = STRICT_CONFIG_MODEL_CONFIG
 
     abs_tolerance: float = Field(default=1e-6, ge=0.0)
     rel_tolerance: float = Field(default=1e-6, ge=0.0)
@@ -64,7 +60,7 @@ class CaptionPolicy(BaseModel):
     128 is CPU-friendly for BGE-small at audit batch sizes.
     """
 
-    model_config = _CONFIG_MODEL_CONFIG
+    model_config = STRICT_CONFIG_MODEL_CONFIG
 
     model_id: str = Field(default="BAAI/bge-small-en-v1.5", min_length=1)
     min_similarity: float = Field(default=0.85, ge=0.0, le=1.0)
@@ -79,7 +75,7 @@ class SplitComparisonConfig(BaseModel):
     round-trip via :meth:`model_validate_json` / :meth:`model_dump_json`.
     """
 
-    model_config = _CONFIG_MODEL_CONFIG
+    model_config = STRICT_CONFIG_MODEL_CONFIG
 
     # Comparison targets.
     output_a: str = Field(min_length=1)

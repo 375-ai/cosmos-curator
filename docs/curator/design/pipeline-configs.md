@@ -73,14 +73,13 @@ kind: video_split
 
 input:
   video_path: /data/videos
-  limit: 100
+  limit: null
 
 split:
   method: transnetv2
 
 caption:
   enabled: true
-  backend: ray_data_llm
   model: qwen
   preprocess_mode: model
   preset: balanced
@@ -105,7 +104,7 @@ Reasons:
 
 - It provides typed Python models and strict validation from JSON/YAML data.
 - It supports JSON Schema generation for docs, tooling, and agent-facing validation.
-- It supports discriminated unions for stage, model, backend, and output variants.
+- It supports discriminated unions for stage, model, and output variants.
 - It provides useful error locations for unknown fields, invalid values, and invalid combinations.
 - It can emit canonical dictionaries for resolved config rendering.
 

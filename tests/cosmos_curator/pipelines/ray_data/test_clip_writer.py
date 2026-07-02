@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from cosmos_curator.pipelines.ray_data._clip_writer import make_write_fn
+from cosmos_curator.pipelines.ray_data.video_split._clip_writer import make_write_fn
 from cosmos_curator.pipelines.video.utils.decoder_utils import extract_video_metadata
 
 _FIXTURE_CLIP = Path(__file__).parents[2] / "pipelines" / "video" / "data" / "test_clip_10s.mp4"

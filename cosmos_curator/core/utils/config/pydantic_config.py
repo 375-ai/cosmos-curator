@@ -12,12 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Compatibility wrapper for the Ray Data video split pipeline."""
+"""Shared Pydantic settings for config-file driven pipeline contracts."""
 
-from cosmos_curator.pipelines.ray_data.video_split.pipeline import main, run, run_config
+from pydantic import ConfigDict
 
-__all__ = ["main", "run", "run_config"]
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+STRICT_CONFIG_MODEL_CONFIG = ConfigDict(frozen=True, strict=True, extra="forbid")

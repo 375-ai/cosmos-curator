@@ -60,6 +60,15 @@ class _WindowCaptionTask:
     window_index: int
 
 
+def _caption_text_or_raise(result: CaptionResult, detail: str | None) -> str:
+    """Return result text or raise a provider error."""
+    text: str | None = result.text
+    if text is None:
+        msg = detail or f"OpenAI request produced no caption text (outcome={result.outcome.value!r})."
+        raise RuntimeError(msg)
+    return text
+
+
 class OpenAICaptionStage(SingleInferenceCaptionStage):
     """Caption video windows using an OpenAI-compatible vision API.
 
@@ -371,10 +380,7 @@ class OpenAICaptionStage(SingleInferenceCaptionStage):
         if result.outcome == CaptionOutcome.BLOCKED:
             msg = "OpenAI request blocked by content filter."
             raise RuntimeError(msg)
-        if result.text is None:
-            msg = detail or f"OpenAI request produced no caption text (outcome={result.outcome.value!r})."
-            raise RuntimeError(msg)
-        return result.text
+        return _caption_text_or_raise(result, detail)
 
     def destroy(self) -> None:
         """Close the async runner and any provider clients."""

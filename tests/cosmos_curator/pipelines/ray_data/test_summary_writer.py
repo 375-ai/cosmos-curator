@@ -20,7 +20,7 @@ from pathlib import Path
 
 import ray
 
-from cosmos_curator.pipelines.ray_data._summary_writer import (
+from cosmos_curator.pipelines.ray_data.video_split._summary_writer import (
     _relative_path,
     _video_uuid,
     write_summary,

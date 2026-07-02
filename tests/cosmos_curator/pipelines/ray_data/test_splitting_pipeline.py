@@ -24,8 +24,8 @@ import ray
 from ray.data import ActorPoolStrategy, TaskPoolStrategy
 
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
-from cosmos_curator.pipelines.ray_data import splitting_pipeline as _pipeline
-from cosmos_curator.pipelines.ray_data.video_split_config import (
+from cosmos_curator.pipelines.ray_data.video_split import pipeline as _pipeline
+from cosmos_curator.pipelines.ray_data.video_split.config import (
     ResolvedVideoSplitConfig,
     resolve_video_split_config_data,
 )
@@ -177,8 +177,8 @@ def test_run_config_downloads_models_before_ray_startup_and_discovery(monkeypatc
         del progress
         events.append("progress")
 
-    def fake_discover_videos(_input_path: str, *, limit: int = 0) -> list[str]:
-        del limit
+    def fake_discover_videos(_input_path: str, *, limit: int | None = None) -> list[str]:
+        assert limit is None
         events.append("discover")
         return []
 
@@ -201,8 +201,8 @@ def test_run_config_uses_downloaded_gpu_count_for_caption_workers(monkeypatch: p
     def fake_configure_ray_data_progress(*, progress: bool) -> None:
         del progress
 
-    def fake_discover_videos(_input_path: str, *, limit: int = 0) -> list[str]:
-        del limit
+    def fake_discover_videos(_input_path: str, *, limit: int | None = None) -> list[str]:
+        assert limit is None
         return ["/input/a.mp4"]
 
     def fake_caption_window_rows(dataset: RecordingDataset, **kwargs: object) -> RecordingDataset:
@@ -256,6 +256,18 @@ def test_apply_split_stage_wires_transnetv2_actor_resources() -> None:
     assert kwargs["runtime_env"].get("py_executable") == "pixi run --as-is -e default python"
     assert kwargs["runtime_env"].get("env_vars") == {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0"}
     assert kwargs["scheduling_strategy"] == "DEFAULT"
+
+
+def test_apply_split_stage_converts_null_clip_limit_to_splitter_sentinel() -> None:
+    """The resolved config renders null, while splitters still receive 0 for unlimited."""
+    config = _config()
+    ds = RecordingDataset()
+
+    _pipeline._apply_split_stage(ds, config, download_slots=3)  # type: ignore[arg-type]
+
+    _, kwargs = ds.map_calls[0]
+    assert config.split.limit_clips is None
+    assert kwargs["fn_constructor_kwargs"]["limit_clips"] == 0
 
 
 def test_apply_split_stage_keeps_fixed_stride_as_task_pool() -> None:

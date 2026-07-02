@@ -24,7 +24,7 @@ from pydantic import ValidationError
 
 from cosmos_curator.core.utils.environment import MODEL_WEIGHTS_PREFIX
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
-from cosmos_curator.pipelines.ray_data.video_split_config import (
+from cosmos_curator.pipelines.ray_data.video_split.config import (
     CaptionPreprocessMode,
     ConfigResolutionError,
     ResolvedVideoSplitConfig,
@@ -58,8 +58,9 @@ def test_resolve_minimal_config_fills_canonical_defaults() -> None:
     assert config.schema_version == 1
     assert config.kind == "video_split"
     assert config.input.video_path == "/videos"
-    assert config.input.limit == 0
+    assert config.input.limit is None
     assert config.split.method == "transnetv2"
+    assert config.split.limit_clips is None
     assert config.split.transnetv2.threshold == 0.4
     assert config.caption.enabled is True
     assert config.caption.batch_size == 32
@@ -140,6 +141,20 @@ def test_unknown_user_field_rejected_before_resolution() -> None:
         resolve_video_split_config_data(_minimal_raw(caption={"batc_size": 4}))
 
 
+def test_caption_backend_field_rejected() -> None:
+    """The Ray Data video split config has one caption backend, so it is not user-authored."""
+    with pytest.raises(ValidationError):
+        resolve_video_split_config_data(_minimal_raw(caption={"backend": "ray_data_llm"}))
+
+
+def test_zero_limits_rejected() -> None:
+    """Null means unlimited; positive integers are real limits."""
+    with pytest.raises(ValidationError):
+        resolve_video_split_config_data(_minimal_raw(input={"video_path": "/videos", "limit": 0}))
+    with pytest.raises(ValidationError):
+        resolve_video_split_config_data(_minimal_raw(split={"limit_clips": 0}))
+
+
 def test_missing_required_resolved_field_rejected() -> None:
     """Defaults do not satisfy required semantic paths."""
     raw = {
@@ -195,6 +210,7 @@ def test_presets_can_be_listed_and_shown_by_short_name() -> None:
     preset = show_video_split_preset("balanced")
     assert preset["qualified_name"] == "caption.balanced"
     assert preset["fragment"]["model"] == "qwen"
+    assert "backend" not in preset["fragment"]
 
 
 def test_unknown_preset_rejected() -> None:

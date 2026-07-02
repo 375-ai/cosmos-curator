@@ -15,6 +15,9 @@
 """Utilities which are used in multiple places in the pipeline and/or are unit-tested."""
 
 import subprocess
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -30,7 +33,12 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     Window,
     WindowConfig,
 )
-from cosmos_curator.pipelines.video.utils.decoder_utils import DEFAULT_TRANSCODE_BITRATE_M, get_frame_count
+from cosmos_curator.pipelines.video.utils.decoder_utils import (
+    DEFAULT_TRANSCODE_BITRATE_M,
+    get_frame_count,
+    get_video_timestamps,
+)
+from cosmos_curator.pipelines.video.utils.ns_timing import NS_PER_SECOND
 from cosmos_curator.pipelines.video.utils.windowing_types import WindowFrameInfo
 
 if pixi_utils.is_running_in_env("default"):
@@ -38,6 +46,7 @@ if pixi_utils.is_running_in_env("default"):
 
 
 WINDOW_MIN_FRAMES = 4
+DEFAULT_NS_BOUND_TOLERANCE = 1
 
 
 def compute_windows(total_frames: int, window_size: int = 128, remainder_threshold: int = 64) -> list[WindowFrameInfo]:
@@ -77,6 +86,163 @@ def compute_windows(total_frames: int, window_size: int = 128, remainder_thresho
         # Expand the last window with the remainder if it exists
         out[-1] = WindowFrameInfo(out[-1].start, total_frames - 1)
     return out
+
+
+def window_frame_info_from_clip_relative_ns_bounds(
+    pts_ns: Sequence[int] | npt.NDArray[np.integer[Any]],
+    *,
+    start_ns: int,
+    end_ns: int,
+    tolerance_ns: int = DEFAULT_NS_BOUND_TOLERANCE,
+) -> WindowFrameInfo:
+    """Map clip-relative nanosecond bounds to an inclusive frame window.
+
+    The window metadata persisted by the clip writer stores bounds relative to
+    the clip's first PTS. This helper converts those bounds back to frame
+    indices without assuming a particular ``WindowConfig``.
+
+    Args:
+        pts_ns: Per-frame PTS in nanoseconds for the clip.
+        start_ns: Inclusive clip-relative window start in nanoseconds.
+        end_ns: Inclusive clip-relative window end in nanoseconds.
+        tolerance_ns: Symmetric tolerance for integer rounding differences.
+
+    Returns:
+        Inclusive frame window matching the requested nanosecond bounds.
+
+    Raises:
+        ValueError: If the bounds are invalid, PTS are empty/non-monotonic, or no
+            decoded frames fall inside the requested bounds.
+
+    """
+    if tolerance_ns < 0:
+        msg = f"tolerance_ns must be non-negative, got {tolerance_ns}"
+        raise ValueError(msg)
+    if end_ns < start_ns:
+        msg = f"Invalid window bounds start_ns={start_ns}, end_ns={end_ns}"
+        raise ValueError(msg)
+    if len(pts_ns) == 0:
+        msg = "pts_ns must not be empty"
+        raise ValueError(msg)
+
+    pts_array: npt.NDArray[np.int64] = np.asarray(pts_ns, dtype=np.int64)
+    relative_pts_ns = pts_array - int(pts_array[0])
+    if bool(np.any(relative_pts_ns[1:] < relative_pts_ns[:-1])):
+        msg = "pts_ns must be monotonically increasing"
+        raise ValueError(msg)
+
+    adjusted_start_ns = start_ns - tolerance_ns
+    adjusted_end_ns = end_ns + tolerance_ns
+    start_frame = int(np.searchsorted(relative_pts_ns, adjusted_start_ns, side="left"))
+    end_frame = int(np.searchsorted(relative_pts_ns, adjusted_end_ns, side="right") - 1)
+
+    last_frame = len(relative_pts_ns) - 1
+    if start_frame > last_frame or end_frame < 0 or start_frame > end_frame:
+        msg = f"No decoded frames fell within clip-relative bounds start_ns={start_ns}, end_ns={end_ns}"
+        raise ValueError(msg)
+
+    return WindowFrameInfo(start=max(start_frame, 0), end=min(end_frame, last_frame))
+
+
+def extract_window_mp4_from_clip_relative_ns_bounds(  # noqa: PLR0913
+    mp4_bytes: bytes | npt.NDArray[np.uint8],
+    *,
+    start_ns: int,
+    end_ns: int,
+    target_bit_rate: str = f"{DEFAULT_TRANSCODE_BITRATE_M}M",
+    num_threads: int = 1,
+    tolerance_ns: int = DEFAULT_NS_BOUND_TOLERANCE,
+) -> bytes:
+    """Extract an MP4 window using persisted clip-relative nanosecond bounds.
+
+    This is the inverse of the metadata writer's frame-range-to-ns mapping and
+    intentionally does not call :func:`compute_windows`; callers can extract a
+    saved window even if the original captioning run used a non-default window
+    size or remainder threshold.
+
+    Args:
+        mp4_bytes: Input clip video bytes.
+        start_ns: Inclusive clip-relative window start in nanoseconds.
+        end_ns: Inclusive clip-relative window end in nanoseconds.
+        target_bit_rate: Target bit rate for transcoded window bytes.
+        num_threads: Number of ffmpeg threads.
+        tolerance_ns: Symmetric tolerance for integer rounding differences.
+
+    Returns:
+        MP4 bytes for the requested frame range.
+
+    """
+    raw_mp4_bytes = _as_mp4_bytes(mp4_bytes)
+    pts_s = get_video_timestamps(raw_mp4_bytes)
+    pts_ns = np.round(pts_s.astype(np.float64) * NS_PER_SECOND).astype(np.int64)
+    window = window_frame_info_from_clip_relative_ns_bounds(
+        pts_ns,
+        start_ns=start_ns,
+        end_ns=end_ns,
+        tolerance_ns=tolerance_ns,
+    )
+
+    if window.start == 0 and window.end == len(pts_ns) - 1:
+        return raw_mp4_bytes
+    return _extract_mp4_frame_window_from_bytes(
+        raw_mp4_bytes,
+        window,
+        target_bit_rate=target_bit_rate,
+        num_threads=num_threads,
+    )
+
+
+def _as_mp4_bytes(mp4_bytes: bytes | npt.NDArray[np.uint8]) -> bytes:
+    return mp4_bytes if isinstance(mp4_bytes, bytes) else mp4_bytes.tobytes()
+
+
+def _extract_mp4_frame_window_from_bytes(
+    mp4_bytes: bytes,
+    window: WindowFrameInfo,
+    *,
+    target_bit_rate: str,
+    num_threads: int,
+) -> bytes:
+    with make_pipeline_named_temporary_file(sub_dir="windowing") as input_file:
+        input_file.write_bytes(mp4_bytes)
+        return _extract_mp4_frame_window(
+            input_file,
+            window,
+            target_bit_rate=target_bit_rate,
+            num_threads=num_threads,
+        )
+
+
+def _extract_mp4_frame_window(
+    input_file: Path,
+    window: WindowFrameInfo,
+    *,
+    target_bit_rate: str,
+    num_threads: int,
+) -> bytes:
+    with make_pipeline_named_temporary_file(sub_dir="windowing") as tmp_file:
+        command = [
+            "ffmpeg",
+            "-threads",
+            str(num_threads),
+            "-y",
+            "-i",
+            str(input_file),
+            "-loglevel",
+            "error",
+            "-vf",
+            f"select='between(n\\,{window.start}\\,{window.end})',setpts=PTS-STARTPTS",
+            "-b:v",
+            str(target_bit_rate),
+            "-threads",
+            str(num_threads),
+            "-f",
+            "mp4",
+            "-an",
+            str(tmp_file),
+        ]
+        subprocess.check_call(command)  # noqa: S603
+        return tmp_file.read_bytes()
 
 
 def estimate_native_frame_count(clip: Clip, fallback_window: Window | None = None) -> int:
@@ -323,33 +489,17 @@ def split_video_into_windows(  # noqa: PLR0913
 
         if return_bytes:
             if len(windows) == 1:
-                raw = mp4_bytes.tobytes() if not isinstance(mp4_bytes, bytes) else mp4_bytes
-                mp4_bytes_list.append(raw)
+                mp4_bytes_list.append(_as_mp4_bytes(mp4_bytes))
             else:
-                for window in windows:
-                    with make_pipeline_named_temporary_file(sub_dir="windowing") as tmp_file:
-                        command = [
-                            "ffmpeg",
-                            "-threads",
-                            str(num_threads),
-                            "-y",
-                            "-i",
-                            str(input_file),
-                            "-loglevel",
-                            "error",
-                            "-vf",
-                            f"select='between(n\\,{window.start}\\,{window.end})',setpts=PTS-STARTPTS",
-                            "-b:v",
-                            str(target_bit_rate),
-                            "-threads",
-                            str(num_threads),
-                            "-f",
-                            "mp4",
-                            "-an",
-                            str(tmp_file),
-                        ]
-                        subprocess.check_call(command)  # noqa: S603
-                        mp4_bytes_list.append(tmp_file.read_bytes())
+                mp4_bytes_list.extend(
+                    _extract_mp4_frame_window(
+                        input_file,
+                        window,
+                        target_bit_rate=target_bit_rate,
+                        num_threads=num_threads,
+                    )
+                    for window in windows
+                )
 
         n = len(windows)
         video_frames.extend([None] * (n - len(video_frames)))

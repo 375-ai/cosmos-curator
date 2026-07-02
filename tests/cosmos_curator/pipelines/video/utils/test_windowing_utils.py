@@ -25,7 +25,9 @@ from cosmos_curator.pipelines.video.utils.data_model import Clip, Window, Window
 from cosmos_curator.pipelines.video.utils.windowing_utils import (
     WindowFrameInfo,
     estimate_native_frame_count,
+    extract_window_mp4_from_clip_relative_ns_bounds,
     frame_index_to_source_time_s,
+    window_frame_info_from_clip_relative_ns_bounds,
     window_source_time_bounds_from_clip,
     window_source_time_bounds_s,
     window_source_time_trace_attributes,
@@ -73,6 +75,101 @@ def test_make_windows_for_clip_threads_video_max_pixels_per_frame(monkeypatch: p
     assert captured["max_pixels_per_frame"] == 100500
     assert len(windows) == 1
     assert len(frames) == 1
+
+
+# ---------------------------------------------------------------------------
+# window_frame_info_from_clip_relative_ns_bounds
+# ---------------------------------------------------------------------------
+
+
+class TestWindowFrameInfoFromClipRelativeNsBounds:
+    """``window_frame_info_from_clip_relative_ns_bounds`` inverts metadata ns bounds."""
+
+    def test_exact_bounds_select_nonstandard_window(self) -> None:
+        """A 1..3 frame range is recovered directly from clip-relative PTS."""
+        pts_ns = np.array(
+            [
+                10_000_000_000,
+                10_500_000_000,
+                11_000_000_000,
+                11_500_000_000,
+                12_000_000_000,
+            ],
+            dtype=np.int64,
+        )
+
+        window = window_frame_info_from_clip_relative_ns_bounds(
+            pts_ns,
+            start_ns=500_000_000,
+            end_ns=1_500_000_000,
+        )
+
+        assert window == WindowFrameInfo(start=1, end=3)
+
+    def test_tolerates_one_nanosecond_rounding_difference(self) -> None:
+        """Persisted integer bounds can differ by 1ns after float timestamp conversion."""
+        pts_ns = np.array([0, 500_000_000, 1_000_000_000], dtype=np.int64)
+
+        window = window_frame_info_from_clip_relative_ns_bounds(
+            pts_ns,
+            start_ns=500_000_001,
+            end_ns=999_999_999,
+        )
+
+        assert window == WindowFrameInfo(start=1, end=2)
+
+    def test_raises_when_no_frame_falls_inside_bounds(self) -> None:
+        """Bounds outside the decoded PTS range are explicit extraction failures."""
+        pts_ns = np.array([0, 500_000_000], dtype=np.int64)
+
+        with pytest.raises(ValueError, match="No decoded frames"):
+            window_frame_info_from_clip_relative_ns_bounds(
+                pts_ns,
+                start_ns=1_000_000_000,
+                end_ns=1_500_000_000,
+            )
+
+
+class TestExtractWindowMp4FromClipRelativeNsBounds:
+    """``extract_window_mp4_from_clip_relative_ns_bounds`` selects frames by ns bounds."""
+
+    def test_extracts_frame_range_without_recomputing_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The extracted frame range comes directly from decoded PTS."""
+        captured: dict[str, object] = {}
+
+        def fake_extract(
+            _mp4_bytes: bytes,
+            window: WindowFrameInfo,
+            *,
+            target_bit_rate: str,
+            num_threads: int,
+        ) -> bytes:
+            captured["window"] = window
+            captured["target_bit_rate"] = target_bit_rate
+            captured["num_threads"] = num_threads
+            return b"window"
+
+        monkeypatch.setattr(
+            windowing_utils,
+            "get_video_timestamps",
+            lambda _clip_bytes: np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float32),
+        )
+        monkeypatch.setattr(windowing_utils, "_extract_mp4_frame_window_from_bytes", fake_extract)
+
+        result = extract_window_mp4_from_clip_relative_ns_bounds(
+            b"clip",
+            start_ns=500_000_000,
+            end_ns=1_000_000_000,
+            target_bit_rate="9M",
+            num_threads=2,
+        )
+
+        assert result == b"window"
+        assert captured == {
+            "window": WindowFrameInfo(start=1, end=2),
+            "target_bit_rate": "9M",
+            "num_threads": 2,
+        }
 
 
 # ---------------------------------------------------------------------------

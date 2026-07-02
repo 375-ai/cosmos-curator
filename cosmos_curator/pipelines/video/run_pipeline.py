@@ -36,6 +36,7 @@ from cosmos_curator.core.utils.config.pipeline_config_loader import load_pipelin
 _CONFIG_EXTENSIONS = frozenset({".json", ".yaml", ".yml"})
 
 _NVCF_ENTRY_POINTS: dict[str, str] = {
+    "caption_judge": "cosmos_curator.pipelines.ray_data.caption_judge.pipeline:nvcf_run_caption_judge",
     "split": "cosmos_curator.pipelines.video.splitting_pipeline:nvcf_run_split",
     "dedup": "cosmos_curator.pipelines.video.dedup_pipeline:nvcf_run_semdedup",
     "shard": "cosmos_curator.pipelines.video.sharding_pipeline:nvcf_run_shard",

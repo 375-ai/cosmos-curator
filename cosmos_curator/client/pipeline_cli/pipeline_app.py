@@ -18,10 +18,12 @@
 import json
 import sys
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, NoReturn
 
 import typer
 from typer import Argument, Option
+
+from cosmos_curator.client.pipeline_cli.pipeline_config import PipelineName, load_pipeline_kind, pipeline_cli_spec
 
 pipeline_app = typer.Typer(
     help="Pipeline config tooling.",
@@ -33,32 +35,19 @@ presets_app = typer.Typer(
 )
 pipeline_app.add_typer(presets_app, name="presets")
 
-PipelineName = Literal["video_split"]
-TemplateProfile = Literal["base", "smoke"]
-
 
 @pipeline_app.command(no_args_is_help=True)
 def template(
     *,
     kind: Annotated[PipelineName, Argument(help="Pipeline kind template to print.")],
-    profile: Annotated[
-        TemplateProfile,
-        Option("--profile", help="Template profile to print. Use smoke for cheap first-run runtime checks."),
-    ] = "base",
     json_output: Annotated[bool, Option("--json", help="Emit machine-readable JSON output.")] = False,
 ) -> None:
     """Print an editable config template for a supported pipeline kind."""
-    from cosmos_curator.pipelines.ray_data.video_split_config import (  # noqa: PLC0415
-        user_config_to_yaml,
-        video_split_config_template,
-        video_split_template_payload,
-    )
-
-    del kind
+    spec = pipeline_cli_spec(kind)
     if json_output:
-        typer.echo(json.dumps(video_split_template_payload(profile), indent=2))
+        typer.echo(json.dumps(spec.template_payload(), indent=2))
     else:
-        sys.stdout.write(user_config_to_yaml(video_split_config_template(profile)))
+        sys.stdout.write(spec.template_yaml())
 
 
 @pipeline_app.command(no_args_is_help=True)
@@ -74,15 +63,14 @@ def validate(
     """Validate a config file after defaults, presets, and overrides resolve."""
     from pydantic import ValidationError  # noqa: PLC0415
 
-    from cosmos_curator.pipelines.ray_data.video_split_config import resolve_video_split_config  # noqa: PLC0415
-
     try:
-        resolution = resolve_video_split_config(config, overrides=set_overrides or [])
+        kind = load_pipeline_kind(config)
+        payload = pipeline_cli_spec(kind).validate(config, set_overrides or [])
     except (OSError, TypeError, ValueError, ValidationError) as exc:
         _fail("invalid", exc, json_output=json_output)
 
     if json_output:
-        typer.echo(json.dumps({"ok": True, "selected_presets": resolution.selected_presets}, indent=2))
+        typer.echo(json.dumps(payload, indent=2))
     else:
         typer.echo("valid")
 
@@ -100,16 +88,12 @@ def render(
     """Render the canonical resolved config used for execution."""
     from pydantic import ValidationError  # noqa: PLC0415
 
-    from cosmos_curator.pipelines.ray_data.video_split_config import (  # noqa: PLC0415
-        resolve_video_split_config,
-        resolved_config_to_json,
-    )
-
     try:
-        resolution = resolve_video_split_config(config, overrides=set_overrides or [])
+        kind = load_pipeline_kind(config)
+        rendered = pipeline_cli_spec(kind).render(config, set_overrides or [])
     except (OSError, TypeError, ValueError, ValidationError) as exc:
         _fail("render_failed", exc, json_output=json_output)
-    sys.stdout.write(resolved_config_to_json(resolution.config))
+    sys.stdout.write(rendered)
 
 
 @pipeline_app.command(no_args_is_help=True)
@@ -119,11 +103,8 @@ def schema(
     json_output: Annotated[bool, Option("--json", help="Emit machine-readable JSON output.")] = False,
 ) -> None:
     """Print JSON Schema for a supported pipeline config."""
-    from cosmos_curator.pipelines.ray_data.video_split_config import user_video_split_schema_json  # noqa: PLC0415
-
-    del kind
     del json_output
-    sys.stdout.write(user_video_split_schema_json())
+    sys.stdout.write(pipeline_cli_spec(kind).schema_json())
 
 
 @presets_app.command("list")
@@ -132,7 +113,7 @@ def list_presets(
     json_output: Annotated[bool, Option("--json", help="Emit machine-readable JSON output.")] = False,
 ) -> None:
     """List packaged video_split presets."""
-    from cosmos_curator.pipelines.ray_data.video_split_config import list_video_split_presets  # noqa: PLC0415
+    from cosmos_curator.pipelines.ray_data.video_split.config import list_video_split_presets  # noqa: PLC0415
 
     presets = list_video_split_presets()
     if json_output:
@@ -150,7 +131,7 @@ def show_preset(
     json_output: Annotated[bool, Option("--json", help="Emit machine-readable JSON output.")] = False,
 ) -> None:
     """Show one packaged video_split preset."""
-    from cosmos_curator.pipelines.ray_data.video_split_config import (  # noqa: PLC0415
+    from cosmos_curator.pipelines.ray_data.video_split.config import (  # noqa: PLC0415
         ConfigResolutionError,
         show_video_split_preset,
     )
@@ -166,7 +147,7 @@ def show_preset(
         typer.echo(json.dumps(preset["fragment"], indent=2))
 
 
-def _fail(code: str, exc: Exception, *, json_output: bool) -> None:
+def _fail(code: str, exc: Exception, *, json_output: bool) -> NoReturn:
     if json_output:
         typer.echo(json.dumps({"ok": False, "error": code, "message": str(exc)}, indent=2), err=True)
     else:

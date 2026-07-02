@@ -44,7 +44,7 @@ from cosmos_curator.core.utils.pixi_runtime_envs import PixiRuntimeEnv, ray_data
 from cosmos_curator.core.utils.storage.storage_utils import StorageWriter
 from cosmos_curator.models.vllm_model_ids import get_vllm_model_id
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
-from cosmos_curator.pipelines.ray_data._summary_writer import write_summary_from_rows
+from cosmos_curator.pipelines.ray_data.video_split._summary_writer import write_summary_from_rows
 from cosmos_curator.pipelines.video.utils.data_model import VllmConfig, VllmSamplingConfig, WindowConfig
 
 if TYPE_CHECKING:
