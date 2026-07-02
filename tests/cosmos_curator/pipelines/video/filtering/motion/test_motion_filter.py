@@ -21,65 +21,31 @@ These values serve as a regression test to ensure the motion detection algorithm
 maintains consistency across code changes.
 """
 
+from uuid import uuid4
+
 import numpy as np
 import pytest
 
 from cosmos_curator.core.interfaces.pipeline_interface import run_pipeline
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
 from cosmos_curator.core.sensors.data.camera_data import MotionVectorData, MotionVectorFrameData
+from cosmos_curator.pipelines.video.filtering.motion.motion_builders import (
+    MotionFilterConfig,
+    build_motion_filter_stages,
+)
 from cosmos_curator.pipelines.video.filtering.motion.motion_filter_stages import (
     MotionFilterStage,
     MotionVectorDecodeStage,
 )
 from cosmos_curator.pipelines.video.filtering.motion.motion_vector_backend import (
     sensor_motion_vector_data_to_legacy_matrices,
-    sensor_motion_vector_frame_to_legacy_matrix,
 )
-from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask
+from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
 
 # Golden values for motion scores
 EXPECTED_MOTION_GLOBAL_MEAN: float = 0.002402
 EXPECTED_MOTION_PER_PATCH_MIN_256: float = 0.001553
 TOLERANCE: float = 0.000001
-
-
-def test_sensor_motion_vector_frame_to_legacy_matrix_projects_expected_columns() -> None:
-    """Sensor motion-vector adapter should make legacy column ordering explicit."""
-    frame = MotionVectorFrameData(
-        source=np.array([1, -1], dtype=np.int32),
-        w=np.array([16, 8], dtype=np.int32),
-        h=np.array([16, 8], dtype=np.int32),
-        src_x=np.array([1, 2], dtype=np.int32),
-        src_y=np.array([3, 4], dtype=np.int32),
-        dst_x=np.array([5, 6], dtype=np.int32),
-        dst_y=np.array([7, 8], dtype=np.int32),
-        flags=np.array([9, 10], dtype=np.int64),
-        motion_x=np.array([11, 12], dtype=np.int32),
-        motion_y=np.array([13, 14], dtype=np.int32),
-        motion_scale=np.array([15, 16], dtype=np.int32),
-    )
-
-    legacy_matrix = sensor_motion_vector_frame_to_legacy_matrix(frame)
-
-    assert legacy_matrix.dtype == np.float64
-    np.testing.assert_array_equal(
-        legacy_matrix,
-        np.array(
-            [
-                [16, 16, 1, 3, 5, 7, 9, 11, 13, 15],
-                [8, 8, 2, 4, 6, 8, 10, 12, 14, 16],
-            ],
-            dtype=np.float64,
-        ),
-    )
-
-
-def test_sensor_motion_vector_frame_to_legacy_matrix_accepts_empty_payload() -> None:
-    """Sensor motion-vector adapter should preserve empty-frame shape."""
-    legacy_matrix = sensor_motion_vector_frame_to_legacy_matrix(MotionVectorFrameData.empty())
-
-    assert legacy_matrix.shape == (0, 10)
-    assert legacy_matrix.dtype == np.float64
 
 
 def test_sensor_motion_vector_data_to_legacy_matrices_projects_each_frame() -> None:
@@ -102,8 +68,42 @@ def test_sensor_motion_vector_data_to_legacy_matrices_projects_each_frame() -> N
     legacy_matrices = sensor_motion_vector_data_to_legacy_matrices(motion_vectors)
 
     assert len(legacy_matrices) == 2
-    assert legacy_matrices[0].shape == (1, 10)
-    assert legacy_matrices[1].shape == (0, 10)
+    assert legacy_matrices[0].dtype == np.float64
+    np.testing.assert_array_equal(
+        legacy_matrices[0],
+        np.array([[-1, 16, 8, 1, 2, 3, 4, 5, 6, 7, 8]], dtype=np.float64),
+    )
+    assert legacy_matrices[1].shape == (0, 11)
+
+
+def test_motion_filter_builder_camera_sensor_source_skips_decode_stage() -> None:
+    """Camera-sensor motion source should build only the scoring/filter stage."""
+    stages = build_motion_filter_stages(MotionFilterConfig(motion_vector_source="camera_sensor_clip"))
+
+    assert len(stages) == 1
+    assert isinstance(stages[0], MotionFilterStage)
+
+
+def test_motion_filter_drops_extracted_frames_from_filtered_clips() -> None:
+    """Clips rejected after early frame extraction should not retain frame payloads."""
+    frames = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    clip = Clip(uuid=uuid4(), source_video="source.mp4", span=(0.0, 1.0))
+    clip.extracted_frames.value = {"sequence-2000": frames}
+    clip.extracted_frames.nbytes = frames.nbytes
+    task = SplitPipeTask(session_id="session-a", video=Video(input_video="video.mp4", clips=[clip]))
+    stage = MotionFilterStage(
+        score_only=False,
+        global_mean_threshold=0.00098,
+        per_patch_min_256_threshold=0.000001,
+    )
+
+    result = stage.process_data([task])
+
+    assert result == [task]
+    assert task.video.clips == []
+    assert task.video.filtered_clips == [clip]
+    assert clip.extracted_frames.resolve() is None
+    assert clip.extracted_frames.nbytes == 0
 
 
 @pytest.fixture

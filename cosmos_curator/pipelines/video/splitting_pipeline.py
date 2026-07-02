@@ -76,6 +76,7 @@ from cosmos_curator.pipelines.video.captioning.vllm_async_config import (
     add_vllm_async_cli_args,
     build_vllm_async_config,
 )
+from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import CameraSensorMotionVectorConfig
 from cosmos_curator.pipelines.video.clipping.clipping_builders import (
     FixedStrideSplitConfig,
     FrameExtractionConfig,
@@ -506,12 +507,46 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
+    use_camera_sensor_motion_vectors = (
+        args.motion_filter != "disable" and args.motion_vector_source == "camera_sensor_clip"
+    )
+    if use_camera_sensor_motion_vectors and args.clip_extraction_decoder_mode != "camera_sensor":
+        msg = "--motion-vector-source=camera_sensor_clip requires --clip-extraction-decoder-mode=camera_sensor"
+        raise ValueError(msg)
+
+    has_aesthetics = args.aesthetic_threshold is not None
+    has_embeddings = args.generate_embeddings
+    frame_extraction_target_fps: list[float | int] = []
+    if has_aesthetics:
+        frame_extraction_target_fps.append(1)
+    if has_embeddings:
+        frame_extraction_target_fps.append(2)
+
+    # --- Early camera-sensor frame/motion extraction (optional) ---
+    if use_camera_sensor_motion_vectors:
+        stages.extend(
+            build_frame_extraction_stages(
+                FrameExtractionConfig(
+                    target_fps=frame_extraction_target_fps,
+                    target_res=args.clip_extraction_target_res,
+                    decoder_mode=args.clip_extraction_decoder_mode,
+                    motion_vectors=CameraSensorMotionVectorConfig(
+                        target_fps=args.motion_decode_target_fps,
+                        target_duration_ratio=args.motion_decode_target_duration_ratio,
+                    ),
+                    cpus_per_worker=args.clip_extraction_cpus_per_worker,
+                    perf_profile=args.perf_profile,
+                )
+            )
+        )
+
     # --- Motion filter (optional) ---
     if args.motion_filter != "disable":
         stages.extend(
             build_motion_filter_stages(
                 MotionFilterConfig(
                     score_only=args.motion_filter == "score-only",
+                    motion_vector_source=args.motion_vector_source,
                     global_mean_threshold=args.motion_global_mean_threshold,
                     per_patch_min_256_threshold=args.motion_per_patch_min_256_threshold,
                     decode_cpus_per_worker=args.motion_decode_cpus_per_worker,
@@ -526,14 +561,11 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         )
 
     # --- Frame extraction (shared prerequisite for aesthetics and embedding) ---
-    has_aesthetics = args.aesthetic_threshold is not None
-    has_embeddings = args.generate_embeddings
-    if has_aesthetics or has_embeddings:
-        target_fps: list[float | int] = [1, 2] if has_aesthetics and has_embeddings else [1] if has_aesthetics else [2]
+    if (has_aesthetics or has_embeddings) and not use_camera_sensor_motion_vectors:
         stages.extend(
             build_frame_extraction_stages(
                 FrameExtractionConfig(
-                    target_fps=target_fps,
+                    target_fps=frame_extraction_target_fps,
                     target_res=args.clip_extraction_target_res,
                     decoder_mode=args.clip_extraction_decoder_mode,
                     cpus_per_worker=args.clip_extraction_cpus_per_worker,
@@ -1501,6 +1533,16 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=float,
         default=0.5,
         help="Number of GPUs per worker allocated to motion score computation. Set to 0 to use CPU instead of GPU.",
+    )
+    parser.add_argument(
+        "--motion-vector-source",
+        choices=["legacy_decode", "camera_sensor_clip"],
+        default="legacy_decode",
+        help=(
+            "Source for motion vectors. 'legacy_decode' runs the existing motion decode stage. "
+            "'camera_sensor_clip' reuses the camera-sensor clip extraction stage and requires "
+            "--clip-extraction-decoder-mode=camera_sensor."
+        ),
     )
     parser.add_argument(
         "--clip-extraction-target-res",

@@ -14,6 +14,8 @@
 # limitations under the License.
 """Stage builder for motion vector decoding and filtering."""
 
+from typing import Literal
+
 import attrs
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
@@ -22,12 +24,15 @@ from cosmos_curator.pipelines.video.filtering.motion.motion_filter_stages import
     MotionVectorDecodeStage,
 )
 
+type MotionVectorSource = Literal["legacy_decode", "camera_sensor_clip"]
+
 
 @attrs.define(frozen=True)
 class MotionFilterConfig:
     """Configuration for motion filtering."""
 
     score_only: bool = False
+    motion_vector_source: MotionVectorSource = "legacy_decode"
     global_mean_threshold: float = 0.00098
     per_patch_min_256_threshold: float = 0.000001
     decode_cpus_per_worker: float = 2.0
@@ -41,6 +46,18 @@ class MotionFilterConfig:
 
 def build_motion_filter_stages(config: MotionFilterConfig) -> list[CuratorStage | CuratorStageSpec]:
     """Construct and return the motion decode and filter stages."""
+    filter_stage = MotionFilterStage(
+        score_only=config.score_only,
+        global_mean_threshold=config.global_mean_threshold,
+        per_patch_min_256_threshold=config.per_patch_min_256_threshold,
+        num_gpus_per_worker=config.score_gpus_per_worker,
+        batch_size=config.score_batch_size,
+        verbose=config.verbose,
+        log_stats=config.perf_profile,
+    )
+    if config.motion_vector_source == "camera_sensor_clip":
+        return [filter_stage]
+
     return [
         MotionVectorDecodeStage(
             num_cpus_per_worker=config.decode_cpus_per_worker,
@@ -49,13 +66,5 @@ def build_motion_filter_stages(config: MotionFilterConfig) -> list[CuratorStage 
             target_fps=config.decode_target_fps,
             target_duration_ratio=config.decode_target_duration_ratio,
         ),
-        MotionFilterStage(
-            score_only=config.score_only,
-            global_mean_threshold=config.global_mean_threshold,
-            per_patch_min_256_threshold=config.per_patch_min_256_threshold,
-            num_gpus_per_worker=config.score_gpus_per_worker,
-            batch_size=config.score_batch_size,
-            verbose=config.verbose,
-            log_stats=config.perf_profile,
-        ),
+        filter_stage,
     ]

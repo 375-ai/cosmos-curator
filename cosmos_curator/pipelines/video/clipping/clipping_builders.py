@@ -23,7 +23,10 @@ from cosmos_curator.pipelines.video.clipping.clip_extraction_stages import (
     ClipTranscodingStage,
     FixedStrideExtractorStage,
 )
-from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import ClipFrameExtractionStage
+from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import (
+    CameraSensorMotionVectorConfig,
+    ClipFrameExtractionStage,
+)
 from cosmos_curator.pipelines.video.clipping.frame_extraction_stages import VideoFrameExtractionStage
 from cosmos_curator.pipelines.video.clipping.transnetv2_extraction_stages import TransNetV2ClipExtractionStage
 from cosmos_curator.pipelines.video.utils.decoder_utils import FrameExtractionPolicy
@@ -85,6 +88,7 @@ class FrameExtractionConfig:
     target_fps: list[float | int]
     target_res: int = -1
     decoder_mode: ClipFrameExtractionDecoderMode = ClipFrameExtractionStage.DEFAULT_DECODER_MODE
+    motion_vectors: CameraSensorMotionVectorConfig | None = None
     cpus_per_worker: float = 3.0
     perf_profile: bool = False
 
@@ -162,6 +166,7 @@ def build_frame_extraction_stages(config: FrameExtractionConfig) -> list[Curator
             target_fps=config.target_fps,
             target_res=(config.target_res, config.target_res),
             decoder_mode=config.decoder_mode,
+            motion_vectors=config.motion_vectors,
             num_cpus_per_worker=config.cpus_per_worker,
             log_stats=config.perf_profile,
         ),

@@ -113,7 +113,7 @@ class MotionVectorDecodeStage(CuratorStage):
                         clip.errors["motion_decode"] = "decode_failed"
                     else:
                         if clip.decoded_motion_data is None or len(clip.decoded_motion_data.frames) == 0:
-                            logger.error(f"Clip {clip.uuid} has no motion frames.")
+                            logger.warning(f"Clip {clip.uuid} has no motion frames.")
                             clip.decoded_motion_data = None
                             clip.errors["motion_decode"] = "no_motion_frames"
             if self._log_stats:
@@ -224,6 +224,7 @@ class MotionFilterStage(CuratorStage):
                     if self._score_only:
                         passing_clips.append(clip)
                     else:
+                        clip.extracted_frames.drop()
                         video.filtered_clips.append(clip)
                         video.clip_stats.num_filtered_by_motion += 1
                     if self._verbose:

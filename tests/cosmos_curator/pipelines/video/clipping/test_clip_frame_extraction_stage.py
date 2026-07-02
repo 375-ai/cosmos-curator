@@ -15,6 +15,7 @@
 """Tests for clip frame extraction stage backends and wiring."""
 
 import argparse
+from fractions import Fraction
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -22,12 +23,24 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
+from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
+from cosmos_curator.core.sensors.data.camera_data import CameraData, MotionVectorData, MotionVectorFrameData
+from cosmos_curator.core.sensors.data.video import VideoMetadata
+from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+from cosmos_curator.core.sensors.utils.video import CpuVideoDecodeConfig
 from cosmos_curator.core.utils.misc.stage_compare import run_stage_compare
 from cosmos_curator.core.utils.misc.stage_replay import DirectStageExecutor, PickleTaskSerializer
-from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import ClipFrameExtractionStage
+from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import (
+    CameraSensorMotionVectorConfig,
+    ClipFrameExtractionStage,
+)
 from cosmos_curator.pipelines.video.clipping.clipping_builders import (
     FrameExtractionConfig,
     build_frame_extraction_stages,
+)
+from cosmos_curator.pipelines.video.filtering.motion.motion_filter_stages import (
+    MotionFilterStage,
+    MotionVectorDecodeStage,
 )
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
 from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
@@ -65,6 +78,52 @@ def _frame_signature(fps: float) -> str:
 def _raise_unexpected_backend(*_args: object, **_kwargs: object) -> npt.NDArray[np.uint8]:
     msg = "unexpected backend invocation"
     raise AssertionError(msg)
+
+
+def _stage_object(stage: CuratorStage | CuratorStageSpec) -> CuratorStage:
+    return stage.stage if isinstance(stage, CuratorStageSpec) else stage
+
+
+def _make_video_metadata(height: int = 256, width: int = 256) -> VideoMetadata:
+    return VideoMetadata(
+        codec_name="h264",
+        codec_max_bframes=0,
+        codec_profile="High",
+        container_format="mp4",
+        height=height,
+        width=width,
+        avg_frame_rate=Fraction(30, 1),
+        pix_fmt="yuv420p",
+        bit_rate_bps=1_000,
+    )
+
+
+def _make_motion_vector_frame() -> MotionVectorFrameData:
+    return MotionVectorFrameData(
+        source=np.array([-1], dtype=np.int32),
+        w=np.array([16], dtype=np.int32),
+        h=np.array([16], dtype=np.int32),
+        src_x=np.array([1], dtype=np.int32),
+        src_y=np.array([2], dtype=np.int32),
+        dst_x=np.array([32], dtype=np.int32),
+        dst_y=np.array([32], dtype=np.int32),
+        flags=np.array([0], dtype=np.int64),
+        motion_x=np.array([4], dtype=np.int32),
+        motion_y=np.array([0], dtype=np.int32),
+        motion_scale=np.array([1], dtype=np.int32),
+    )
+
+
+def _make_camera_data(motion_vectors: MotionVectorData | None, *, height: int = 256, width: int = 256) -> CameraData:
+    timestamps = np.array([0], dtype=np.int64)
+    return CameraData(
+        align_timestamps_ns=timestamps,
+        sensor_timestamps_ns=timestamps,
+        pts_stream=timestamps,
+        frames=np.zeros((1, height, width, 3), dtype=np.uint8),
+        metadata=_make_video_metadata(height=height, width=width),
+        motion_vectors=motion_vectors,
+    )
 
 
 def test_clip_frame_extraction_stage_defaults_to_extract_frames_backend(
@@ -110,6 +169,91 @@ def test_clip_frame_extraction_stage_camera_sensor_backend_selected(
     extracted = task.video.clips[0].extracted_frames.resolve()
     assert extracted is not None
     np.testing.assert_array_equal(extracted[_frame_signature(2.0)], expected)
+
+
+def test_clip_frame_extraction_stage_exports_camera_sensor_motion_vectors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_clip_data: bytes
+) -> None:
+    """CameraSensor motion export should populate clip.decoded_motion_data."""
+    task = _make_task(tmp_path, sample_clip_data)
+    captured: dict[str, object] = {}
+    motion_vectors = MotionVectorData(frames=(_make_motion_vector_frame(),))
+
+    class FakeCameraSensor:
+        start_ns = 0
+        end_ns = 1_000_000_000
+
+        def __init__(self, source: bytes, *, decode_config: CpuVideoDecodeConfig | None = None) -> None:
+            captured["source"] = source
+            captured["decode_config"] = decode_config
+
+        def sample(self, spec: object) -> list[CameraData]:
+            captured["spec"] = spec
+            return [_make_camera_data(motion_vectors)]
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages.CameraSensor",
+        FakeCameraSensor,
+    )
+    stage = ClipFrameExtractionStage(
+        target_fps=[],
+        decoder_mode=ClipFrameExtractionStage.CAMERA_SENSOR_DECODER_MODE,
+        motion_vectors=CameraSensorMotionVectorConfig(target_fps=3.0, target_duration_ratio=0.25),
+        num_cpus_per_worker=1.0,
+    )
+
+    stage.process_data([task])
+
+    clip = task.video.clips[0]
+    assert clip.decoded_motion_data is not None
+    assert len(clip.decoded_motion_data.frames) == 1
+    assert tuple(clip.decoded_motion_data.frame_size) == (256, 256, 3)
+    decode_config = captured["decode_config"]
+    assert isinstance(decode_config, CpuVideoDecodeConfig)
+    assert decode_config.export_mvs is True
+    assert decode_config.thread_count == 2
+    spec = captured["spec"]
+    assert isinstance(spec, SamplingSpec)
+    assert spec.grid.start_ns == 0
+    assert spec.grid.exclusive_end_ns == 416_666_666
+    np.testing.assert_array_equal(spec.grid.timestamps_ns, np.array([0, 333_333_333], dtype=np.int64))
+    extracted = clip.extracted_frames.resolve()
+    assert extracted == {}
+
+
+def test_clip_frame_extraction_stage_marks_empty_camera_sensor_motion_vectors(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_clip_data: bytes
+) -> None:
+    """Empty sensor motion-vector payloads should map to no_motion_frames."""
+    task = _make_task(tmp_path, sample_clip_data)
+    motion_vectors = MotionVectorData(frames=(MotionVectorFrameData.empty(),))
+
+    class FakeCameraSensor:
+        start_ns = 0
+        end_ns = 1_000_000_000
+
+        def __init__(self, _source: bytes, *, decode_config: CpuVideoDecodeConfig | None = None) -> None:
+            assert decode_config is not None
+            assert decode_config.export_mvs is True
+
+        def sample(self, _spec: object) -> list[CameraData]:
+            return [_make_camera_data(motion_vectors)]
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages.CameraSensor",
+        FakeCameraSensor,
+    )
+    stage = ClipFrameExtractionStage(
+        target_fps=[],
+        decoder_mode=ClipFrameExtractionStage.CAMERA_SENSOR_DECODER_MODE,
+        motion_vectors=CameraSensorMotionVectorConfig(),
+    )
+
+    stage.process_data([task])
+
+    clip = task.video.clips[0]
+    assert clip.decoded_motion_data is None
+    assert clip.errors["motion_decode"] == "no_motion_frames"
 
 
 def test_clip_frame_extraction_stage_lcm_signatures_and_subsampling(
@@ -217,6 +361,86 @@ def test_split_parser_and_assemble_stages_pass_clip_extraction_decoder_mode() ->
     extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
     assert len(extraction_stages) == 1
     assert extraction_stages[0]._decoder_mode == ClipFrameExtractionStage.CAMERA_SENSOR_DECODER_MODE
+
+
+def test_split_assemble_camera_sensor_motion_source_reorders_and_skips_legacy_decode() -> None:
+    """Integrated camera-sensor motion source should extract before filtering and skip legacy decode."""
+    parser = _parser()
+    input_path = Path.cwd() / "tmp-input"
+    output_path = Path.cwd() / "tmp-output"
+    args = parser.parse_args(
+        [
+            "--input-video-path",
+            input_path.as_posix(),
+            "--output-clip-path",
+            output_path.as_posix(),
+            "--no-generate-embeddings",
+            "--motion-filter",
+            "score-only",
+            "--motion-vector-source",
+            "camera_sensor_clip",
+            "--clip-extraction-decoder-mode",
+            "camera_sensor",
+            "--motion-decode-target-fps",
+            "3.0",
+            "--motion-decode-target-duration-ratio",
+            "0.25",
+        ]
+    )
+
+    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+
+    extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
+    assert len(extraction_stages) == 1
+    motion_filter_index = next(i for i, stage in enumerate(stages) if isinstance(stage, MotionFilterStage))
+    extraction_index = next(i for i, stage in enumerate(stages) if isinstance(stage, ClipFrameExtractionStage))
+    assert extraction_index < motion_filter_index
+    assert not any(isinstance(stage, MotionVectorDecodeStage) for stage in stages)
+
+
+def test_split_assemble_camera_sensor_motion_source_requires_camera_backend() -> None:
+    """camera_sensor_clip motion vectors should fail fast with the default frame backend."""
+    parser = _parser()
+    input_path = Path.cwd() / "tmp-input"
+    output_path = Path.cwd() / "tmp-output"
+    args = parser.parse_args(
+        [
+            "--input-video-path",
+            input_path.as_posix(),
+            "--output-clip-path",
+            output_path.as_posix(),
+            "--no-generate-embeddings",
+            "--motion-filter",
+            "enable",
+            "--motion-vector-source",
+            "camera_sensor_clip",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="requires --clip-extraction-decoder-mode=camera_sensor"):
+        _assemble_stages(args)
+
+
+def test_split_assemble_camera_sensor_motion_source_ignored_when_motion_disabled() -> None:
+    """camera_sensor_clip source should not require camera backend when motion filtering is disabled."""
+    parser = _parser()
+    input_path = Path.cwd() / "tmp-input"
+    output_path = Path.cwd() / "tmp-output"
+    args = parser.parse_args(
+        [
+            "--input-video-path",
+            input_path.as_posix(),
+            "--output-clip-path",
+            output_path.as_posix(),
+            "--no-generate-embeddings",
+            "--motion-vector-source",
+            "camera_sensor_clip",
+        ]
+    )
+
+    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+
+    assert not any(isinstance(stage, MotionFilterStage) for stage in stages)
 
 
 @pytest.mark.env("default")

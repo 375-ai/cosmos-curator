@@ -20,6 +20,7 @@ import math
 from functools import reduce
 from typing import Final, Literal
 
+import attrs
 import cv2
 import numpy as np
 import numpy.typing as npt
@@ -31,15 +32,25 @@ from cosmos_curator.core.sensors.sampling.compat import make_decoder_utils_compa
 from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 from cosmos_curator.core.sensors.sensors.camera_sensor import CameraSensor
+from cosmos_curator.core.sensors.utils.video import CpuVideoDecodeConfig
 from cosmos_curator.core.utils.data.lazy_data import LazyData
 from cosmos_curator.core.utils.data.ref_resolver import prefetch, resolve_as_ready
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
-from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask, Video
+from cosmos_curator.pipelines.video.filtering.motion import motion_vector_backend as motion
+from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
 from cosmos_curator.pipelines.video.utils.decoder_utils import (
     FrameExtractionPolicy,
     FrameExtractionSignature,
     extract_frames,
 )
+
+
+@attrs.define(frozen=True)
+class CameraSensorMotionVectorConfig:
+    """Configuration for exporting motion vectors from the camera-sensor clip backend."""
+
+    target_fps: float = 2.0
+    target_duration_ratio: float = 0.5
 
 
 class ClipFrameExtractionStage(CuratorStage):
@@ -59,6 +70,7 @@ class ClipFrameExtractionStage(CuratorStage):
         target_res: tuple[int, int] | None = None,
         *,
         decoder_mode: Literal["extract_frames", "camera_sensor"] = DEFAULT_DECODER_MODE,
+        motion_vectors: CameraSensorMotionVectorConfig | None = None,
         num_cpus_per_worker: float = 3.0,
         verbose: bool = False,
         log_stats: bool = False,
@@ -70,11 +82,15 @@ class ClipFrameExtractionStage(CuratorStage):
             target_fps: Target frames per second for extraction.
             target_res: Target resolution for extracted frames.
             decoder_mode: Backend used to decode per-clip frames.
+            motion_vectors: Optional camera-sensor motion-vector export config.
             num_cpus_per_worker: Number of CPU cores to allocate per worker.
             verbose: Whether to print verbose logs.
             log_stats: Whether to log performance statistics.
 
         """
+        if motion_vectors is not None and decoder_mode != self.CAMERA_SENSOR_DECODER_MODE:
+            msg = "Camera-sensor motion-vector export requires decoder_mode='camera_sensor'"
+            raise ValueError(msg)
         if target_fps is None:
             target_fps = [2]
         if target_res is None:
@@ -84,6 +100,7 @@ class ClipFrameExtractionStage(CuratorStage):
         self._target_fps = target_fps
         self._target_res = target_res
         self._decoder_mode = decoder_mode
+        self._motion_vector_config = motion_vectors
         self._num_cpus = num_cpus_per_worker
         self._num_threads = max(1, int(num_cpus_per_worker) + 1)
         self._verbose = verbose
@@ -150,9 +167,23 @@ class ClipFrameExtractionStage(CuratorStage):
         sample_rate_fps: float,
     ) -> npt.NDArray[np.uint8]:
         sensor = CameraSensor(bytes(data))
+        spec = self._make_sensor_sampling_spec(sensor, sample_rate_fps, stop_ns=sensor.end_ns)
+        sampled_batches = list(sensor.sample(spec))
+        if len(sampled_batches) != 1:
+            msg = f"Expected exactly one sampled batch, got {len(sampled_batches)}"
+            raise RuntimeError(msg)
+        return self._resize_frames(sampled_batches[0].frames)
+
+    def _make_sensor_sampling_spec(
+        self,
+        sensor: CameraSensor,
+        sample_rate_fps: float,
+        *,
+        stop_ns: int,
+    ) -> SamplingSpec:
         start_ns, exclusive_end_ns, timestamps_ns = make_decoder_utils_compat_grid(
             start_ns=sensor.start_ns,
-            stop_ns=sensor.end_ns,
+            stop_ns=stop_ns,
             sample_rate_hz=float(sample_rate_fps),
         )
         grid = SamplingGrid(
@@ -162,12 +193,68 @@ class ClipFrameExtractionStage(CuratorStage):
             stride_ns=max(1, exclusive_end_ns - start_ns),
             duration_ns=max(1, exclusive_end_ns - start_ns),
         )
-        spec = SamplingSpec(grid=grid)
+        return SamplingSpec(grid=grid)
+
+    def _extract_motion_vectors_for_clip(
+        self,
+        data: bytes | npt.NDArray[np.uint8],
+    ) -> motion.DecodedData | None:
+        motion_vector_config = self._motion_vector_config
+        if motion_vector_config is None:
+            msg = "motion vector config is not enabled"
+            raise RuntimeError(msg)
+
+        sensor = CameraSensor(
+            bytes(data),
+            decode_config=CpuVideoDecodeConfig(export_mvs=True, thread_count=self._num_threads),
+        )
+        source_duration_ns = max(0, sensor.end_ns - sensor.start_ns)
+        target_duration_ns = round(source_duration_ns * motion_vector_config.target_duration_ratio)
+        stop_ns = sensor.end_ns if target_duration_ns <= 0 else min(sensor.end_ns, sensor.start_ns + target_duration_ns)
+        spec = self._make_sensor_sampling_spec(sensor, motion_vector_config.target_fps, stop_ns=stop_ns)
         sampled_batches = list(sensor.sample(spec))
         if len(sampled_batches) != 1:
             msg = f"Expected exactly one sampled batch, got {len(sampled_batches)}"
             raise RuntimeError(msg)
-        return self._resize_frames(sampled_batches[0].frames)
+
+        camera_data = sampled_batches[0]
+        if camera_data.motion_vectors is None:
+            return None
+
+        frame_size = (camera_data.metadata.height, camera_data.metadata.width, 3)
+        min_side_resolution = motion._MIN_SIDE_RESOLUTION  # noqa: SLF001
+        if frame_size[0] < min_side_resolution or frame_size[1] < min_side_resolution:
+            error_msg = f"Expected min resolution of {min_side_resolution}, but got a resolution of {frame_size}"
+            raise motion.VideoResolutionTooSmallError(error_msg)
+
+        frames = [
+            legacy_matrix
+            for legacy_matrix in motion.sensor_motion_vector_data_to_legacy_matrices(camera_data.motion_vectors)
+            if legacy_matrix.shape[0] > 0
+        ]
+        return motion.DecodedData(frames=frames, frame_size=frame_size)  # type: ignore[arg-type]
+
+    def _populate_motion_vectors_for_clip(self, clip: Clip, data: bytes | npt.NDArray[np.uint8]) -> None:
+        if self._motion_vector_config is None:
+            return
+
+        try:
+            clip.decoded_motion_data = self._extract_motion_vectors_for_clip(data)
+        except motion.VideoResolutionTooSmallError:
+            if self._verbose:
+                logger.warning(f"Clip {clip.uuid} has too small resolution.")
+            clip.decoded_motion_data = None
+            clip.errors["motion_decode"] = "resolution_too_small"
+        except Exception as e:  # noqa: BLE001
+            if self._verbose:
+                logger.exception(f"Clip {clip.uuid} failed to decode motion data: {e}")
+            clip.decoded_motion_data = None
+            clip.errors["motion_decode"] = "decode_failed"
+        else:
+            if clip.decoded_motion_data is None or len(clip.decoded_motion_data.frames) == 0:
+                logger.warning(f"Clip {clip.uuid} has no motion frames.")
+                clip.decoded_motion_data = None
+                clip.errors["motion_decode"] = "no_motion_frames"
 
     def _extract_frames_for_policy(
         self,
@@ -227,6 +314,8 @@ class ClipFrameExtractionStage(CuratorStage):
                 # reset the buffer to disable further operations on this clip
                 clip.encoded_data.drop()
                 continue
+
+            self._populate_motion_vectors_for_clip(clip, data)
 
     @nvtx.annotate("ClipFrameExtractionStage")  # type: ignore[untyped-decorator]
     def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:
