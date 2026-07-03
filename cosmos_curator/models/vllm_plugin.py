@@ -43,6 +43,7 @@ from cosmos_curator.pipelines.video.utils.data_model import (
     VllmAsyncConfig,
     VllmCaptionRequest,
     VllmConfig,
+    VllmSamplingConfig,
 )
 
 
@@ -64,6 +65,16 @@ class VllmPlugin(ABC):
     def model_id(cls) -> str:
         """Return the model ID."""
         return get_vllm_model_id(cls.model_variant())
+
+    @classmethod
+    def default_sampling_config(cls) -> VllmSamplingConfig | None:
+        """Return model-authored generation defaults, if the checkpoint publishes them."""
+        return None
+
+    @classmethod
+    def default_sampling_fps(cls) -> float | None:
+        """Return the model's preferred captioning input FPS, if known."""
+        return None
 
     @classmethod
     def model_path(cls, config: VllmConfig) -> Path:

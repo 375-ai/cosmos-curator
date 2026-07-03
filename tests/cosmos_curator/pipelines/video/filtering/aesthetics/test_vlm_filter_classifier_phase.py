@@ -34,7 +34,7 @@ from cosmos_curator.pipelines.video.filtering.aesthetics.semantic_filter_stages 
     VllmFilteringStage,
     VllmVideoClassifierStage,
 )
-from cosmos_curator.pipelines.video.utils.data_model import Clip, Video, Window
+from cosmos_curator.pipelines.video.utils.data_model import Clip, Video, VllmSamplingConfig, Window
 
 _GEMINI_LOAD_CONFIG = "cosmos_curator.pipelines.video.captioning.gemini_caption_stage.load_config"
 
@@ -95,6 +95,35 @@ def test_vlm_filter_classifier_build_stages_both() -> None:
     assert isinstance(stages[4].stage, VllmCaptionStage)
     assert isinstance(stages[5], CuratorStageSpec)
     assert isinstance(stages[5].stage, VllmVideoClassifierStage)
+
+
+def test_vlm_filter_keeps_qwen_sampling_defaults() -> None:
+    """Qwen filter configs keep the historical generic vLLM sampling defaults."""
+    stages = build_vllm_filter_classifier_stages(filter_config=VlmFilterConfig(max_output_tokens=1024))
+    caption_spec = stages[1]
+
+    assert isinstance(caption_spec, CuratorStageSpec)
+    assert isinstance(caption_spec.stage, VllmCaptionStage)
+    assert caption_spec.stage._vllm_config.sampling_config == VllmSamplingConfig(max_tokens=1024)
+
+
+def test_vlm_classifier_cosmos3_uses_model_sampling_defaults() -> None:
+    """Cosmos3 classifier configs use model-authored sampling defaults."""
+    stages = build_vllm_filter_classifier_stages(
+        classifier_config=VideoClassifierConfig(model_variant="cosmos3_super", max_output_tokens=1024)
+    )
+    caption_spec = stages[1]
+
+    assert isinstance(caption_spec, CuratorStageSpec)
+    assert isinstance(caption_spec.stage, VllmCaptionStage)
+    sampling_config = caption_spec.stage._vllm_config.sampling_config
+    assert sampling_config.temperature == 0.7
+    assert sampling_config.top_p == 0.8
+    assert sampling_config.top_k == 20
+    assert sampling_config.repetition_penalty == 1.0
+    assert sampling_config.presence_penalty == 1.5
+    assert sampling_config.min_tokens == 0
+    assert sampling_config.max_tokens == 1024
 
 
 def test_vlm_filter_build_stages_openai_endpoint() -> None:

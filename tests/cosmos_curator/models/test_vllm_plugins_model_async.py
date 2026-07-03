@@ -252,6 +252,28 @@ def test_cosmos3_omni_uses_native_vllm_architecture() -> None:
     assert args.hf_overrides == expected_overrides
 
 
+@pytest.mark.parametrize(
+    "plugin_cls_name",
+    [
+        pytest.param("VllmCosmos3NanoOmniVL", id="nano"),
+        pytest.param("VllmCosmos3SuperOmniVL", id="super"),
+    ],
+)
+def test_cosmos3_omni_exposes_model_generation_defaults(plugin_cls_name: str) -> None:
+    """Cosmos3-Nano and Cosmos3-Super publish the same model-owned generation defaults."""
+    plugin_cls = getattr(vllm_cosmos3_omni, plugin_cls_name)
+    sampling_config = plugin_cls.default_sampling_config()
+
+    assert sampling_config is not None
+    assert sampling_config.temperature == 0.7
+    assert sampling_config.top_p == 0.8
+    assert sampling_config.top_k == 20
+    assert sampling_config.repetition_penalty == 1.0
+    assert sampling_config.presence_penalty == 1.5
+    assert sampling_config.min_tokens == 0
+    assert plugin_cls.default_sampling_fps() == 4.0
+
+
 def test_cosmos3_omni_decode_uses_cosmos3_name_for_truncated_reasoning() -> None:
     """Cosmos3 inherits Qwen3-style reasoning parsing but should not report itself as Qwen3."""
     raw_output = MagicMock()

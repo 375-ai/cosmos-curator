@@ -35,6 +35,10 @@ from vllm import LLM, RequestOutput
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 
+from cosmos_curator.models.vllm_model_defaults import (
+    get_vllm_default_sampling_config,
+    get_vllm_default_sampling_fps,
+)
 from cosmos_curator.models.vllm_qwen import (
     GPU_MEMORY_UTILIZATION,
     LIMIT_MM_PER_PROMPT_IMAGE,
@@ -46,7 +50,7 @@ from cosmos_curator.models.vllm_qwen import (
     make_message,
     qwen3_video_size_kwargs,
 )
-from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig
+from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig, VllmSamplingConfig
 
 if TYPE_CHECKING:
     import torch
@@ -104,6 +108,24 @@ class VllmCosmos3NanoOmniVL(VllmQwen3VL):
     def model_variant() -> str:
         """Return the model variant name."""
         return "cosmos3_nano"
+
+    @classmethod
+    def default_sampling_config(cls) -> VllmSamplingConfig:
+        """Return the shared Cosmos3-Nano/Super generation defaults from the model configs."""
+        sampling_config = get_vllm_default_sampling_config(cls.model_variant())
+        if sampling_config is None:
+            msg = f"Missing Cosmos3 sampling defaults for {cls.model_variant()}"
+            raise RuntimeError(msg)
+        return sampling_config
+
+    @classmethod
+    def default_sampling_fps(cls) -> float:
+        """Return the recommended video sampling FPS for Cosmos3 captioning inputs."""
+        sampling_fps = get_vllm_default_sampling_fps(cls.model_variant())
+        if sampling_fps is None:
+            msg = f"Missing Cosmos3 sampling FPS default for {cls.model_variant()}"
+            raise RuntimeError(msg)
+        return sampling_fps
 
     @classmethod
     def model(cls, config: VllmConfig) -> LLM:

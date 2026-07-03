@@ -71,7 +71,10 @@ from cosmos_curator.pipelines.video.captioning.per_event_cli_args import (
     add_event_caption_args,
     resolve_event_caption_prompt,
 )
-from cosmos_curator.pipelines.video.captioning.per_event_inner_builder import build_event_caption_inner_stage
+from cosmos_curator.pipelines.video.captioning.per_event_inner_builder import (
+    build_event_caption_inner_stage,
+    resolve_event_vllm_async_defaults,
+)
 from cosmos_curator.pipelines.video.captioning.vllm_async_config import (
     add_vllm_async_cli_args,
     build_vllm_async_config,
@@ -144,6 +147,10 @@ from cosmos_curator.pipelines.video.utils.video_pipe_input import (
     extract_multi_cam_split_tasks,
     extract_single_cam_split_tasks,
     format_session_videos_tree,
+)
+from cosmos_curator.pipelines.video.utils.vllm_defaults import (
+    resolve_vllm_sampling_config,
+    resolve_vllm_sampling_fps,
 )
 
 QWEN2_CAPTION_ALGOS = {"qwen"}
@@ -363,6 +370,36 @@ def _get_vllm_sampling_defaults() -> dict[str, Any]:
     """
     default_config = VllmSamplingConfig()
     return {field.name: getattr(default_config, field.name) for field in attrs.fields(VllmSamplingConfig)}
+
+
+def _resolve_sampling_model_variant(args: argparse.Namespace, caption_algo: str) -> str:
+    """Return the actual model variant behind a captioning algorithm selection."""
+    if caption_algo == "vllm_async":
+        model_variant = getattr(args, "vllm_async_model_name", None)
+        if model_variant is None:
+            msg = "--vllm-async-model-name must be set when --captioning-algorithm is vllm_async"
+            raise ValueError(msg)
+        return str(model_variant).lower()
+    return caption_algo
+
+
+def _make_requested_vllm_sampling_config(
+    args: argparse.Namespace,
+    *,
+    max_tokens: int | None,
+) -> VllmSamplingConfig:
+    """Build the vLLM sampling config requested by CLI/config args."""
+    return VllmSamplingConfig(
+        temperature=args.vllm_sampling_temperature,
+        top_p=args.vllm_sampling_top_p,
+        top_k=args.vllm_sampling_top_k,
+        repetition_penalty=args.vllm_sampling_repetition_penalty,
+        presence_penalty=args.vllm_sampling_presence_penalty,
+        frequency_penalty=args.vllm_sampling_frequency_penalty,
+        min_p=args.vllm_sampling_min_p,
+        min_tokens=args.vllm_sampling_min_tokens,
+        max_tokens=max_tokens,
+    )
 
 
 def _validate_deprecated_vllm_preprocess_args(args: argparse.Namespace) -> None:
@@ -614,6 +651,14 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
     video_classifier_num_gpus = _clamp_num_gpus_for_model(
         args.video_classifier_model_variant, args.video_classifier_num_gpus
     )
+    vlm_filter_sampling_fps = resolve_vllm_sampling_fps(
+        args.vlm_filter_model_variant,
+        args.captioning_sampling_fps,
+    )
+    video_classifier_sampling_fps = resolve_vllm_sampling_fps(
+        args.video_classifier_model_variant,
+        args.captioning_sampling_fps,
+    )
     vlm_filter_cfg = (
         VlmFilterConfig(
             score_only=args.vlm_filter == "score-only",
@@ -626,7 +671,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             max_output_tokens=args.vlm_filter_max_output_tokens,
             num_gpus=vlm_filter_num_gpus,
             use_mmcache=args.qwen_use_vllm_mmcache,
-            sampling_fps=args.captioning_sampling_fps,
+            sampling_fps=vlm_filter_sampling_fps,
             window_size=args.captioning_window_size,
             remainder_threshold=args.captioning_remainder_threshold,
             preprocess_mode=args.vllm_preprocess_mode,
@@ -653,7 +698,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             max_output_tokens=args.video_classifier_max_output_tokens,
             num_gpus=video_classifier_num_gpus,
             use_mmcache=args.qwen_use_vllm_mmcache,
-            sampling_fps=args.captioning_sampling_fps,
+            sampling_fps=video_classifier_sampling_fps,
             window_size=args.captioning_window_size,
             remainder_threshold=args.captioning_remainder_threshold,
             preprocess_mode=args.vllm_preprocess_mode,
@@ -721,20 +766,20 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             msg = f"Unsupported captioning algorithm: {caption_algo}"
             raise RuntimeError(msg)
 
+        caption_sampling_model_variant = _resolve_sampling_model_variant(args, caption_algo)
+
         max_tokens: int | None = args.captioning_max_output_tokens
         if max_tokens is not None and max_tokens < 0:
             max_tokens = None
 
-        sampling_config = VllmSamplingConfig(
-            temperature=args.vllm_sampling_temperature,
-            top_p=args.vllm_sampling_top_p,
-            top_k=args.vllm_sampling_top_k,
-            repetition_penalty=args.vllm_sampling_repetition_penalty,
-            presence_penalty=args.vllm_sampling_presence_penalty,
-            frequency_penalty=args.vllm_sampling_frequency_penalty,
-            min_p=args.vllm_sampling_min_p,
-            min_tokens=args.vllm_sampling_min_tokens,
-            max_tokens=max_tokens,
+        requested_sampling_config = _make_requested_vllm_sampling_config(args, max_tokens=max_tokens)
+        sampling_config = resolve_vllm_sampling_config(
+            caption_sampling_model_variant,
+            requested_sampling_config,
+        )
+        captioning_sampling_fps = resolve_vllm_sampling_fps(
+            caption_sampling_model_variant,
+            args.captioning_sampling_fps,
         )
 
         vllm_config = VllmConfig(
@@ -752,7 +797,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         window_config = WindowConfig(
             window_size=args.captioning_window_size,
             remainder_threshold=args.captioning_remainder_threshold,
-            sampling_fps=args.captioning_sampling_fps,
+            sampling_fps=captioning_sampling_fps,
             use_input_bit_rate=args.transcode_use_input_video_bit_rate,
         )
 
@@ -947,17 +992,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             event_max_tokens: int | None = args.captioning_max_output_tokens
             if event_max_tokens is not None and event_max_tokens < 0:
                 event_max_tokens = None
-            event_sampling_config = VllmSamplingConfig(
-                temperature=args.vllm_sampling_temperature,
-                top_p=args.vllm_sampling_top_p,
-                top_k=args.vllm_sampling_top_k,
-                repetition_penalty=args.vllm_sampling_repetition_penalty,
-                presence_penalty=args.vllm_sampling_presence_penalty,
-                frequency_penalty=args.vllm_sampling_frequency_penalty,
-                min_p=args.vllm_sampling_min_p,
-                min_tokens=args.vllm_sampling_min_tokens,
-                max_tokens=event_max_tokens,
-            )
+            requested_event_sampling_config = _make_requested_vllm_sampling_config(args, max_tokens=event_max_tokens)
+            event_sampling_config = resolve_event_vllm_async_defaults(args, requested_event_sampling_config)
             event_vllm_async_config = build_vllm_async_config(
                 args, sampling_config=event_sampling_config, prefix="event-caption-"
             )

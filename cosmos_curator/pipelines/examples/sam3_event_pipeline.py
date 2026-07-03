@@ -61,6 +61,7 @@ from cosmos_curator.pipelines.video.captioning.per_event_cli_args import (
 )
 from cosmos_curator.pipelines.video.captioning.per_event_inner_builder import (
     build_event_caption_inner_stage,
+    resolve_event_vllm_async_defaults,
 )
 from cosmos_curator.pipelines.video.captioning.vllm_async_config import (
     build_vllm_async_config,
@@ -254,7 +255,7 @@ def _assemble_stages(args: argparse.Namespace) -> list[CuratorStage | CuratorSta
                     _QWEN3_VL_235B_MIN_GPUS,
                     num_gpus,
                 )
-            event_sampling_config = VllmSamplingConfig()
+            event_sampling_config = resolve_event_vllm_async_defaults(args, VllmSamplingConfig())
             event_vllm_async_config = build_vllm_async_config(
                 args, sampling_config=event_sampling_config, prefix="event-caption-"
             )

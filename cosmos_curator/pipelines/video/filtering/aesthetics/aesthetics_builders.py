@@ -35,6 +35,7 @@ from cosmos_curator.pipelines.video.filtering.aesthetics.semantic_filter_stages 
     VllmVideoClassifierStage,
 )
 from cosmos_curator.pipelines.video.utils.data_model import VllmConfig, VllmSamplingConfig, WindowConfig
+from cosmos_curator.pipelines.video.utils.vllm_defaults import resolve_vllm_sampling_config
 
 
 @attrs.define(frozen=True)
@@ -172,6 +173,10 @@ def build_artificial_text_filter_stages(config: ArtificialTextFilterConfig) -> l
 
 def _make_vllm_config(config: VlmFilterConfig | VideoClassifierConfig, prompt_text: str) -> VllmConfig:
     """Build a VllmConfig from a filter/classifier config."""
+    sampling_config = resolve_vllm_sampling_config(
+        config.model_variant,
+        VllmSamplingConfig(max_tokens=config.max_output_tokens),
+    )
     return VllmConfig(
         model_variant=config.model_variant,
         prompt_text=prompt_text,
@@ -180,7 +185,7 @@ def _make_vllm_config(config: VlmFilterConfig | VideoClassifierConfig, prompt_te
         disable_mmcache=not config.use_mmcache,
         num_gpus=config.num_gpus,
         batch_size=config.batch_size,
-        sampling_config=VllmSamplingConfig(max_tokens=config.max_output_tokens),
+        sampling_config=sampling_config,
     )
 
 

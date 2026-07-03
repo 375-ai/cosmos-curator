@@ -44,6 +44,28 @@ from cosmos_curator.pipelines.video.captioning.openai_caption_stage import OpenA
 from cosmos_curator.pipelines.video.captioning.single_inference import SingleInferenceCaptionStage
 from cosmos_curator.pipelines.video.captioning.vllm_caption_stage import VllmCaptionStage
 from cosmos_curator.pipelines.video.utils.data_model import VllmAsyncConfig, VllmConfig, VllmSamplingConfig
+from cosmos_curator.pipelines.video.utils.vllm_defaults import (
+    resolve_vllm_sampling_config,
+    resolve_vllm_sampling_fps,
+)
+
+
+def resolve_event_vllm_async_defaults(
+    args: argparse.Namespace,
+    requested_sampling_config: VllmSamplingConfig,
+) -> VllmSamplingConfig:
+    """Resolve model-authored defaults for per-event vllm_async config.
+
+    The per-event inner stage reads sampling FPS directly from ``args`` when it
+    builds ``CaptionSingleOptions``, so this helper updates that value in place
+    while returning the resolved sampling config for ``VllmAsyncConfig``.
+    """
+    model_variant = args.event_caption_vllm_async_model_name
+    args.event_caption_vllm_async_sampling_fps = resolve_vllm_sampling_fps(
+        model_variant,
+        args.event_caption_vllm_async_sampling_fps,
+    )
+    return resolve_vllm_sampling_config(model_variant, requested_sampling_config)
 
 
 def _build_qwen_inner(args: argparse.Namespace, *, verbose: bool, log_stats: bool) -> VllmCaptionStage:
@@ -207,4 +229,5 @@ def build_event_caption_inner_stage(
 
 __all__ = [
     "build_event_caption_inner_stage",
+    "resolve_event_vllm_async_defaults",
 ]

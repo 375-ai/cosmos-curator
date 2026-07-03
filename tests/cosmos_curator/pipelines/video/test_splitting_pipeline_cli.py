@@ -23,10 +23,15 @@ import pytest
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
 from cosmos_curator.core.utils.config.args_utils import fill_default_args
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
-from cosmos_curator.pipelines.video.captioning.captioning_builders import CaptioningConfig
+from cosmos_curator.pipelines.video.captioning.captioning_builders import CaptioningConfig, VllmAsyncCaptionConfig
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
-from cosmos_curator.pipelines.video.utils.data_model import VllmConfig
+from cosmos_curator.pipelines.video.utils.data_model import (
+    VllmAsyncConfig,
+    VllmConfig,
+    VllmSamplingConfig,
+    WindowConfig,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
 _SPLIT_INVOKE_TEMPLATES = (
@@ -256,6 +261,193 @@ def test_legacy_qwen_model_does_preprocess_true_raises_migration_error() -> None
 
     with pytest.raises(ValueError, match="--vllm-preprocess-mode"):
         _assemble_stages(args)
+
+
+def test_qwen_captioning_keeps_legacy_sampling_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Qwen keeps the historical split-pipeline sampling defaults."""
+    captured = _capture_captioning_config(monkeypatch)
+    args = _caption_args(["--captioning-algorithm", "qwen"])
+
+    _assemble_stages(args)
+
+    config = captured["config"]
+    assert isinstance(config.backend, VllmConfig)
+    assert config.window_config.sampling_fps == WindowConfig().sampling_fps
+    assert config.backend.sampling_config == VllmSamplingConfig()
+
+
+@pytest.mark.parametrize("caption_algo", ["cosmos3_nano", "cosmos3_super"])
+def test_cosmos3_sync_captioning_uses_model_generation_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    caption_algo: str,
+) -> None:
+    """Cosmos3 sync captioning resolves legacy generic defaults to model generation defaults."""
+    captured = _capture_captioning_config(monkeypatch)
+    args = _caption_args(["--captioning-algorithm", caption_algo])
+
+    _assemble_stages(args)
+
+    config = captured["config"]
+    assert isinstance(config.backend, VllmConfig)
+    assert config.window_config.sampling_fps == 4.0
+    assert config.backend.sampling_config.temperature == 0.7
+    assert config.backend.sampling_config.top_p == 0.8
+    assert config.backend.sampling_config.top_k == 20
+    assert config.backend.sampling_config.repetition_penalty == 1.0
+    assert config.backend.sampling_config.min_tokens == 0
+    assert config.backend.sampling_config.presence_penalty == 1.5
+
+
+def test_cosmos3_sync_captioning_keeps_non_default_sampling_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-default CLI/config values still override Cosmos3 model defaults."""
+    captured = _capture_captioning_config(monkeypatch)
+    args = _caption_args(
+        [
+            "--captioning-algorithm",
+            "cosmos3_nano",
+            "--captioning-sampling-fps",
+            "3.0",
+            "--vllm-sampling-temperature",
+            "0.2",
+            "--vllm-sampling-top-p",
+            "0.95",
+            "--vllm-sampling-min-tokens",
+            "7",
+        ]
+    )
+
+    _assemble_stages(args)
+
+    config = captured["config"]
+    assert isinstance(config.backend, VllmConfig)
+    assert config.window_config.sampling_fps == 3.0
+    assert config.backend.sampling_config.temperature == 0.2
+    assert config.backend.sampling_config.top_p == 0.95
+    assert config.backend.sampling_config.top_k == 20
+    assert config.backend.sampling_config.min_tokens == 7
+
+
+def test_cosmos3_async_captioning_uses_model_generation_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vllm_async uses the underlying Cosmos3 model name when resolving defaults."""
+    captured = _capture_captioning_config(monkeypatch)
+    args = _caption_args(
+        [
+            "--captioning-algorithm",
+            "vllm_async",
+            "--vllm-async-model-name",
+            "cosmos3_nano",
+        ]
+    )
+
+    _assemble_stages(args)
+
+    config = captured["config"]
+    assert config.window_config.sampling_fps == 4.0
+    assert isinstance(config.backend, VllmAsyncCaptionConfig)
+    assert config.backend.serve_config is not None
+    assert config.backend.serve_config.sampling_config.temperature == 0.7
+    assert config.backend.serve_config.sampling_config.top_p == 0.8
+    assert config.backend.serve_config.sampling_config.top_k == 20
+    assert config.backend.serve_config.sampling_config.repetition_penalty == 1.0
+    assert config.backend.serve_config.sampling_config.min_tokens == 0
+    assert config.backend.serve_config.sampling_config.presence_penalty == 1.5
+
+
+def test_vllm_async_captioning_rejects_missing_model_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hand-built config namespaces should fail clearly when the async model name is missing."""
+    _capture_captioning_config(monkeypatch)
+    args = _caption_args(["--captioning-algorithm", "vllm_async"])
+    args.vllm_async_model_name = None
+
+    with pytest.raises(ValueError, match="--vllm-async-model-name"):
+        _assemble_stages(args)
+
+
+def _capture_event_vllm_async_config(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("cosmos_curator.pipelines.video.splitting_pipeline.build_sam3_tracking_stages", lambda _: [])
+
+    def fake_build_event_caption_inner_stage(
+        args: argparse.Namespace,
+        *,
+        vllm_async_config: VllmAsyncConfig | None = None,
+        verbose: bool = False,  # noqa: ARG001
+        log_stats: bool = False,  # noqa: ARG001
+    ) -> object:
+        captured["sampling_fps"] = args.event_caption_vllm_async_sampling_fps
+        captured["config"] = vllm_async_config
+        return object()
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.splitting_pipeline.build_event_caption_inner_stage",
+        fake_build_event_caption_inner_stage,
+    )
+    return captured
+
+
+def test_cosmos3_event_vllm_async_uses_model_generation_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-event vllm_async resolves Cosmos3 sampling config and FPS defaults."""
+    _capture_captioning_config(monkeypatch)
+    captured = _capture_event_vllm_async_config(monkeypatch)
+    args = _caption_args(
+        [
+            "--sam3",
+            "--sam3-prompts",
+            "person",
+            "--event-captioning",
+            "--event-caption-backend",
+            "vllm_async",
+            "--event-caption-vllm-async-model-name",
+            "cosmos3_nano",
+        ]
+    )
+
+    _assemble_stages(args)
+
+    assert captured["sampling_fps"] == 4.0
+    config = captured["config"]
+    assert isinstance(config, VllmAsyncConfig)
+    assert config.sampling_config.temperature == 0.7
+    assert config.sampling_config.top_p == 0.8
+    assert config.sampling_config.top_k == 20
+    assert config.sampling_config.repetition_penalty == 1.0
+    assert config.sampling_config.min_tokens == 0
+    assert config.sampling_config.presence_penalty == 1.5
+
+
+def test_cosmos3_event_vllm_async_keeps_sampling_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-event vllm_async keeps explicit FPS and global sampling overrides."""
+    _capture_captioning_config(monkeypatch)
+    captured = _capture_event_vllm_async_config(monkeypatch)
+    args = _caption_args(
+        [
+            "--sam3",
+            "--sam3-prompts",
+            "person",
+            "--event-captioning",
+            "--event-caption-backend",
+            "vllm_async",
+            "--event-caption-vllm-async-model-name",
+            "cosmos3_nano",
+            "--event-caption-vllm-async-sampling-fps",
+            "3.0",
+            "--vllm-sampling-temperature",
+            "0.2",
+        ]
+    )
+
+    _assemble_stages(args)
+
+    assert captured["sampling_fps"] == 3.0
+    config = captured["config"]
+    assert isinstance(config, VllmAsyncConfig)
+    assert config.sampling_config.temperature == 0.2
+    assert config.sampling_config.top_p == 0.8
 
 
 @pytest.mark.parametrize(
