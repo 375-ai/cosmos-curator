@@ -100,7 +100,7 @@ class ModelManager(NvcfBase):
         """
         super().__init__(url=url, nvcf_url=nvcf_url, key=key, org=org, team=team, timeout=timeout)
         self.clnt: Client = Client()
-        self.clnt.configure(api_key=self.key, org_name=self.org, team_name=self.team, ace_name="no-ace")
+        self.clnt.configure(api_key=self.key, org_name=self.org, team_name=self.team)
         self.model: ModelAPI = self.clnt.registry.model
 
     def upload_model(self, fname: str, src_path: str) -> dict[str, Any] | None:

@@ -1234,7 +1234,7 @@ resolve_nvcf_staging_tag:
       aud: ${VAULT_ADDR}
   before_script:
     - source .gitlab/vault/vault-auth.sh
-    - *setup_ci_builder_env
+    - *setup_ci_builder_env_synced
     - *setup_curator_cli
   script:
     - *configure_nvcf_cli
