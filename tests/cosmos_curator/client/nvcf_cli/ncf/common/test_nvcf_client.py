@@ -217,7 +217,7 @@ def test_nvcf_client_post() -> None:
 
 
 def test_nvcf_client_post_uses_full_url_without_poll_header() -> None:
-    """Test posting to a full URL without NVCF pexec polling headers."""
+    """Test posting to a full URL without polling headers."""
     client = NvcfClient(logger=MagicMock(), url="testurl")
 
     mock_response = MagicMock()

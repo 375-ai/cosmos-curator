@@ -34,11 +34,8 @@ import concurrent.futures
 import contextlib
 import copy
 import json
-import os
 import tempfile
 import time
-from collections.abc import Callable
-from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, NoReturn
 from urllib.parse import quote as q
@@ -52,22 +49,10 @@ _MODULE_NAME: str = "Function"
 _EXCEPTION_MESSAGE: str = "unexpected empty response"
 _INVOCATION_API_HOST = "invocation.api.nvcf.nvidia.com"
 _RUN_PIPELINE_PATH = "/v1/run_pipeline"
-_NVCF_INVOCATION_MODE = "NVCF_INVOCATION_MODE"
-_PEXEC_INVOCATION_FALLBACK_STATUSES = frozenset({404, 405, 410, 500})
+_STATUS_INCLUDE_LOGS_HEADER = "CURATOR-STATUS-INCLUDE-LOGS"
+_HTTP_INTERNAL_SERVER_ERROR = 500
 
 
-class InvocationMode(StrEnum):
-    """NVCF invocation modes used during the pexec-to-direct migration."""
-
-    AUTO = "auto"
-    PEXEC = "pexec"
-    DIRECT = "direct"
-
-
-# Migration note: AUTO and PEXEC exist to keep old functions and old CLIs
-# working while NVCF deprecates pexec. Once every supported deployment uses
-# direct invocation, remove AUTO/PEXEC, the pexec endpoints, and the fallback
-# request-id tracking sets. DIRECT invocation and direct status checks remain.
 def _raise_runtime_err(msg: str | dict[str, Any]) -> NoReturn:
     """Raise a RuntimeError with the given message.
 
@@ -144,31 +129,17 @@ def _nvcf_direct_invocation_url(funcid: str, path: str = _RUN_PIPELINE_PATH) -> 
     return f"https://{q(funcid, safe='')}.{_INVOCATION_API_HOST}{path}"
 
 
-def _invocation_mode() -> InvocationMode:
-    mode = os.environ.get(_NVCF_INVOCATION_MODE, InvocationMode.AUTO).lower()
-    try:
-        return InvocationMode(mode)
-    except ValueError:
-        valid_modes = ", ".join(mode.value for mode in InvocationMode)
-        _raise_runtime_err(f"{_NVCF_INVOCATION_MODE} must be one of: {valid_modes}")
-
-
-def _can_fallback_invocation_to_direct(resp: dict[str, Any] | None) -> bool:
-    """Temporary migration fallback for when the pexec invoke endpoint is unavailable."""
-    if resp is None:
-        return True
-    return int(resp.get("status", 500)) in _PEXEC_INVOCATION_FALLBACK_STATUSES
-
-
-def _can_fallback_status_to_direct(resp: dict[str, Any] | None) -> bool:
-    """Temporary migration fallback for status-only checks after pexec is unavailable."""
-    if resp is None:
-        return False
-    return int(resp.get("status", 500)) in _PEXEC_INVOCATION_FALLBACK_STATUSES
-
-
 class CloudError(Exception):
     """Custom Error to distinguis a failed get-request-status vs cloud err."""
+
+
+class RetryableNvcfError(RuntimeError):
+    """Error type for transient NVCF server-side failures that can be retried."""
+
+
+def _is_retryable_server_response(resp: NVCFResponse) -> bool:
+    """Return whether an NVCF response should be retried by caller policy."""
+    return resp.status >= _HTTP_INTERNAL_SERVER_ERROR and not resp.is_timeout
 
 
 class NvcfHelper(NvcfBase):
@@ -208,36 +179,6 @@ class NvcfHelper(NvcfBase):
 
         self.ncg_api_hdl = NvcfClient(self.logger.getChild("ncgApiHdl"), self.url, self.key)
         self.nvcf_api_hdl = NvcfClient(self.logger.getChild("nvcfApiHdl"), self.nvcf_url, self.key)
-        self._direct_fallback_reqids: set[str] = set()
-        self._pexec_invocation_reqids: set[str] = set()
-
-    def _record_invocation_request(self, reqid: str | None, *, used_direct: bool, mode: InvocationMode) -> None:
-        if reqid is None:
-            return
-        if used_direct:
-            if mode == InvocationMode.AUTO:
-                self._direct_fallback_reqids.add(reqid)
-        elif mode != InvocationMode.DIRECT:
-            self._pexec_invocation_reqids.add(reqid)
-
-    def _invoke_auto_with_direct_fallback(
-        self,
-        invoke_pexec: Callable[[], NVCFResponse | None],
-        invoke_direct: Callable[[], NVCFResponse | None],
-    ) -> tuple[NVCFResponse | None, bool]:
-        """Invoke through pexec in auto mode, falling back to direct when pexec is unavailable."""
-        try:
-            resp = invoke_pexec()
-        except RuntimeError as e:
-            self.logger.warning("Pexec invocation failed; falling back to direct invocation: %s", e)
-            return invoke_direct(), True
-
-        if _can_fallback_invocation_to_direct(resp):
-            status = "empty response" if resp is None else f"status {resp.status}"
-            self.logger.warning("Pexec invocation returned %s; falling back to direct invocation", status)
-            return invoke_direct(), True
-
-        return resp, False
 
     def load_ids(self) -> dict[str, Any]:
         """Load function identifiers from the stored file.
@@ -702,9 +643,9 @@ class NvcfHelper(NvcfBase):
         job_variant_file: str,
         ddir: str,
         s3_config: str | None = None,
-        legacy_cf: bool = False,
         retry_cnt: int = 2,
         retry_delay: int = 300,
+        include_logs: bool = True,
     ) -> None:
         """Execute a batch of function invocations using multiple threads.
 
@@ -719,10 +660,10 @@ class NvcfHelper(NvcfBase):
             job_variant_file (str): Path to a JSON file containing job variants to process.
             ddir (str): Directory to download results to.
             s3_config (str | None, optional): S3 configuration to use. Defaults to None.
-            legacy_cf (bool, optional): Whether to use the legacy client flow.
-                                      Defaults to False.
             retry_cnt (int, optional): Number of times to retry on failure. Defaults to 2.
             retry_delay (int, optional): Delay in seconds between retries. Defaults to 300.
+            include_logs (bool, optional): Whether status polling should include the
+                log zip payload. Defaults to True.
 
         Raises:
             ValueError: If required files cannot be read or the function ID list is empty.
@@ -770,10 +711,10 @@ class NvcfHelper(NvcfBase):
                 job["data_file"] = item
                 job["ddir"] = ddir
                 job["s3_config"] = s3_config
-                job["legacy_cf"] = legacy_cf
                 job["wait"] = True
                 job["retry_cnt"] = retry_cnt
                 job["retry_delay"] = retry_delay
+                job["include_logs"] = include_logs
                 job_list.append(job)
 
             # load function id/version files
@@ -821,10 +762,10 @@ class NvcfHelper(NvcfBase):
         data_file: str | None = None,
         prompt_file: str | None = None,
         s3_config: str | None = None,
-        legacy_cf: bool = True,
         wait: bool = True,
         retry_cnt: int = 2,
         retry_delay: int = 300,
+        include_logs: bool = True,
     ) -> None:
         """Invoke a function with retries, waiting for completion.
 
@@ -841,11 +782,11 @@ class NvcfHelper(NvcfBase):
             prompt_file (str | None, optional): Path to a file containing a prompt text.
                                              Defaults to None.
             s3_config (str | None, optional): S3 configuration to use. Defaults to None.
-            legacy_cf (bool, optional): Whether to use the legacy client flow.
-                                      Defaults to True.
             wait (bool, optional): Whether to wait for function completion. Defaults to True.
             retry_cnt (int, optional): Number of times to retry on failure. Defaults to 2.
             retry_delay (int, optional): Delay in seconds between retries. Defaults to 300.
+            include_logs (bool, optional): Whether status polling should include the
+                log zip payload. Defaults to True.
 
         Raises:
             ValueError: If required files cannot be read or for non-retryable errors.
@@ -869,8 +810,15 @@ class NvcfHelper(NvcfBase):
                     s3_config=s3_config,
                     ddir=ddir,
                 )
+            except RetryableNvcfError as e:
+                cnt -= 1
+                msg = f"Retryable error invoking function, retries left = {cnt}: {e!s}"
+                self.logger.warning(msg)
+                if cnt == 0:
+                    raise
+                continue
             except (ValueError, RuntimeError):
-                # Use ValueError, RuntimeError for all cases that must not be retried
+                # Use ValueError and other RuntimeError for all cases that must not be retried.
                 raise
             except Exception as e:
                 cnt -= 1
@@ -915,18 +863,24 @@ class NvcfHelper(NvcfBase):
                     while cnt > 0:
                         try:
                             self.nvcf_helper_get_request_status_with_wait(
-                                reqid=reqid, ddir=ddir, funcid=funcid, version=version, wait=wait, legacy_cf=legacy_cf
+                                reqid=reqid,
+                                ddir=ddir,
+                                funcid=funcid,
+                                version=version,
+                                wait=wait,
+                                retry_cnt=cnt,
+                                include_logs=include_logs,
                             )
                         except TimeoutError as e:
                             cnt -= 1
-                            msg = f"Timeout getting request status, retrys left = {cnt}: {e!s}"
+                            msg = f"Timeout getting request status, retries left = {cnt}: {e!s}"
                             self.logger.warning(msg)
                             if cnt == 0:
                                 raise
                             continue
                         except RuntimeError as e:
                             cnt -= 1
-                            msg = f"Error getting request status, retrys left = {cnt}: {e!s}"
+                            msg = f"Error getting request status, retries left = {cnt}: {e!s}"
                             self.logger.warning(msg)
                             if cnt == 0:
                                 raise
@@ -938,7 +892,7 @@ class NvcfHelper(NvcfBase):
                                 raise RuntimeError(msg) from e
                             # Need to retry the whole request, that will happen if we break out of this loop
                             # and forcibly set status
-                            detail = f"Request has failed, retrying, retrys left = {cnt}: {e!s}"
+                            detail = f"Request has failed, retrying, retries left = {cnt}: {e!s}"
                             status = "failed"
                             cnt += 1  # need to bump the count back to be reduced below
                             break
@@ -952,14 +906,14 @@ class NvcfHelper(NvcfBase):
             # Check to see if we should retry the whole request
             if (status is not None and status == "failed") or reqid is None:
                 cnt -= 1
-                msg = f"Failed function invocation: {detail}, retrys left = {cnt}"
+                msg = f"Failed function invocation: {detail}, retries left = {cnt}"
                 self.logger.warning(msg)
                 continue
 
         if cnt <= 0:
             _raise_runtime_err(f"Giving up after retrying for {retry_cnt} times")
 
-    def nvcf_helper_invoke_function(  # noqa: C901, PLR0913
+    def nvcf_helper_invoke_function(  # noqa: PLR0913
         self,
         *,
         funcid: str,
@@ -991,7 +945,6 @@ class NvcfHelper(NvcfBase):
 
         """
         invoke_data = {}
-        ret = {}
 
         if data_file is not None:
             try:
@@ -1015,57 +968,21 @@ class NvcfHelper(NvcfBase):
         if s3_config is not None and "args" in invoke_data and isinstance(invoke_data["args"], dict):
             invoke_data["args"]["s3_config"] = s3_config
 
-        used_direct = False
-
-        def invoke_direct() -> NVCFResponse | None:
-            direct_headers = {"CURATOR-DIRECT-MODE": "true"}
-            return self.nvcf_api_hdl.post(
+        direct_headers = {"CURATOR-DIRECT-MODE": "true"}
+        try:
+            resp = self.nvcf_api_hdl.post(
                 _nvcf_direct_invocation_url(funcid),
                 data=invoke_data,
                 extra_head=direct_headers,
                 addl_headers=True,
                 full_url=True,
             )
-
-        def invoke_pexec() -> NVCFResponse | None:
-            if version is not None:
-                endpoint = f"/v2/nvcf/pexec/functions/{q(funcid, safe='')}/versions/{q(version, safe='')}"
-            else:
-                endpoint = f"/v2/nvcf/pexec/functions/{q(funcid, safe='')}"
-            return self.nvcf_api_hdl.post(
-                endpoint,
-                data=invoke_data,
-                timeout=self.timeout,
-                addl_headers=True,
-                enable_504=True,
-            )
-
-        mode = _invocation_mode()
-        if mode == InvocationMode.DIRECT:
-            used_direct = True
-            resp = invoke_direct()
-        elif mode == InvocationMode.PEXEC:
-            resp = invoke_pexec()
-        else:
-            # Temporary migration mode: prefer pexec so older deployed
-            # functions keep working. Only fall back when pexec is clearly
-            # unavailable; timeouts may mean the request was accepted.
-            resp, used_direct = self._invoke_auto_with_direct_fallback(invoke_pexec, invoke_direct)
+        except RuntimeError as e:
+            raise RetryableNvcfError(str(e)) from e
 
         if resp is None:
             raise RuntimeError(_EXCEPTION_MESSAGE)
-        # Pexec invocation is async by contract and must provide request tracking
-        # headers. Direct invocation can also complete synchronously in the HTTP
-        # response, leaving no request id for later polling.
-        ret = self._handle_invoke_response(
-            resp,
-            funcid,
-            version,
-            ddir,
-            require_async_tracking_headers=not used_direct,
-        )
-        self._record_invocation_request(ret.get("reqid"), used_direct=used_direct, mode=mode)
-        return ret
+        return self._handle_invoke_response(resp, funcid, version, ddir)
 
     def _handle_invoke_response(
         self,
@@ -1073,8 +990,6 @@ class NvcfHelper(NvcfBase):
         funcid: str,
         version: str | None,
         ddir: str,
-        *,
-        require_async_tracking_headers: bool = False,
     ) -> dict[str, Any]:
         ret = {}
         # these checks are positional and need to happen in order
@@ -1082,6 +997,14 @@ class NvcfHelper(NvcfBase):
             _raise_timeout_err(f"Function with Id '{funcid}', version '{version}', timed out")
 
         if resp.is_error:
+            if _is_retryable_server_response(resp):
+                detail = resp.get_detail()
+                msg = (
+                    detail
+                    if detail is not None
+                    else resp.get_error(f"Function with Id '{funcid}', version '{version}'")
+                )
+                raise RetryableNvcfError(msg)
             detail = resp.get_detail()
             if detail is not None:
                 _raise_runtime_err(detail)
@@ -1090,11 +1013,8 @@ class NvcfHelper(NvcfBase):
         headers = resp.get("headers", {})
         header_reqid = headers.get("reqid")
         header_status = headers.get("status")
-        if require_async_tracking_headers and (not header_reqid or not header_status):
-            _raise_runtime_err(f"Pexec invocation for function '{funcid}' is missing request status headers")
-
-        reqid = header_reqid or resp.get("reqid")
-        status = header_status or resp.get("body-status")
+        reqid = resp.get("reqid") or header_reqid
+        status = resp.get("body-status") or header_status
         if reqid is None:
             if status is not None and status != "fulfilled":
                 _raise_runtime_err(
@@ -1126,14 +1046,14 @@ class NvcfHelper(NvcfBase):
             ret["logs"] = lines
         return ret
 
-    def nvcf_helper_get_request_status(  # noqa: C901, PLR0912, PLR0915
+    def nvcf_helper_get_request_status(
         self,
         reqid: str,
         ddir: str,
         funcid: str | None = None,
         version: str | None = None,
         *,
-        legacy_cf: bool | None = False,
+        include_logs: bool = True,
     ) -> dict[str, Any] | None:
         """Get the status of a function request.
 
@@ -1146,9 +1066,8 @@ class NvcfHelper(NvcfBase):
             funcid (str | None, optional): Function ID associated with the request. Defaults to None.
             version (str | None, optional): Function version associated with the request.
                                           Defaults to None.
-            legacy_cf (bool | None, optional): Whether to use the legacy API or the new API.
-                                             Set to None to only download assets.
-                                             Defaults to False.
+            include_logs (bool, optional): Whether the status response should include
+                the log zip payload. Defaults to True.
 
         Returns:
             dict[str, Any] | None: Dictionary containing request status information,
@@ -1158,94 +1077,22 @@ class NvcfHelper(NvcfBase):
             RuntimeError: If the API request fails or returns an error.
 
         """
-        mode = _invocation_mode()
-        if funcid is not None and (
-            (legacy_cf is not None and not legacy_cf)
-            or mode == InvocationMode.DIRECT
-            or reqid in self._direct_fallback_reqids
-        ):
-            return self._nvcf_helper_get_request_status_new(reqid, funcid, version)
+        _ = ddir
+        if funcid is None:
+            _raise_runtime_err("funcid is required for request status")
+        return self._nvcf_helper_get_request_status_new(reqid, funcid, version, include_logs=include_logs)
 
-        endpoint = f"/v2/nvcf/pexec/status/{q(reqid, safe='')}"
-        ret = {}
-        resp = self.nvcf_api_hdl.get(endpoint, timeout=self.timeout, addl_headers=True, enable_504=True)
-
-        if mode == InvocationMode.AUTO and funcid is not None and reqid not in self._pexec_invocation_reqids:
-            # Temporary migration path for status-only checks after the pexec
-            # status endpoint is removed. Requests that this helper already
-            # invoked through pexec do not fall back here because retrying a
-            # pexec timeout as direct could duplicate work.
-            can_fallback_to_direct = _can_fallback_status_to_direct(resp)
-        else:
-            can_fallback_to_direct = False
-
-        if can_fallback_to_direct and funcid is not None:
-            status = "empty response" if resp is None else f"status {resp.status}"
-            self.logger.warning("Pexec status returned %s; falling back to direct status", status)
-            self._direct_fallback_reqids.add(reqid)
-            return self._nvcf_helper_get_request_status_new(reqid, funcid, version)
-
-        if resp is None:
-            raise RuntimeError(_EXCEPTION_MESSAGE)
-        if resp.is_timeout:
-            _raise_timeout_err(f"{reqid} May have timed out")
-
-        if resp.is_error:
-            detail = resp.get_detail()
-            if detail is not None:
-                _raise_runtime_err(detail)
-            _raise_runtime_err(resp.get_error(f"request with funcid '{reqid}'"))
-
-        if not resp.has_status:
-            _raise_runtime_err(f"unexpected response: {resp}")
-
-        headers = resp.get("headers", {})
-        if len(headers) > 0:
-            reqid = headers.get("reqid")
-            status = headers.get("status")
-            location = headers.pop("location", "")
-            pct = headers.get("pct")
-            if location:
-                self.logger.info("Output is ready, attempting to download")
-                path = Path(ddir) / f"{reqid}.zip"
-                self.nvcf_api_hdl.download(url=location, dest=str(path))
-                dl_msg = f"Downloaded result {path}"
-                self.logger.info(dl_msg)
-            # indicate that this was not called just for location
-            # when get_request_status is called just for download from location
-            # to support new container types, we set this to None
-            elif legacy_cf is not None:
-                status_msg = f"ReqId: {reqid}, Status: '{status}', Completed: {pct}"
-                self.logger.info(status_msg)
-
-            ret["reqid"] = reqid
-            logs = resp.get("logs", "")
-            if logs:
-                ret["logs"] = logs.split("\n")
-            ret["status"] = status
-            return ret
-
-        issue = resp.get("issue", {})
-        sts = issue.get("requestStatus") if issue else resp.get("requestStatus", {})
-        if sts:
-            code = sts.get("statusCode")
-            desc = sts.get("statusDescription")
-            self.console.print(f"{code}: {desc}")
-            return None
-
-        self.console.print(f"Unhandled Error: {resp}")
-        self.logger.error("Unhandled Error: %s", resp)
-        return None
-
-    def nvcf_helper_get_request_status_with_wait(  # noqa: C901, PLR0912, PLR0913, PLR0915
+    def nvcf_helper_get_request_status_with_wait(  # noqa: C901, PLR0913
         self,
         reqid: str,
         ddir: str,
         funcid: str | None = None,
         version: str | None = None,
         *,
-        legacy_cf: bool | None = False,
         wait: bool = True,
+        retry_cnt: int = 3,
+        retry_delay: int = 3,
+        include_logs: bool = True,
     ) -> None:
         """Get request status with periodic checking until completion.
 
@@ -1258,10 +1105,12 @@ class NvcfHelper(NvcfBase):
             funcid (str | None, optional): Function ID associated with the request. Defaults to None.
             version (str | None, optional): Function version associated with the request.
                                           Defaults to None.
-            legacy_cf (bool | None, optional): Whether to use the legacy API or the new API.
-                                             Defaults to False.
             wait (bool, optional): Whether to wait and repeatedly check the status
                                  until completion. Defaults to True.
+            retry_cnt (int, optional): Number of transient server errors to retry. Defaults to 3.
+            retry_delay (int, optional): Delay in seconds between transient server error retries. Defaults to 3.
+            include_logs (bool, optional): Whether status responses should include the
+                log zip payload. Defaults to True.
 
         Raises:
             RunTimeError: If the API request fails or returns an error.
@@ -1270,55 +1119,35 @@ class NvcfHelper(NvcfBase):
 
         """
         first_log = True
+        retries_left = retry_cnt
         while True:
             try:
                 resp = self.nvcf_helper_get_request_status(
-                    reqid, ddir=ddir, funcid=funcid, version=version, legacy_cf=legacy_cf
+                    reqid,
+                    ddir=ddir,
+                    funcid=funcid,
+                    version=version,
+                    include_logs=include_logs,
                 )
+            except RetryableNvcfError as e:
+                retries_left -= 1
+                msg = f"Retryable error getting request status, retries left = {retries_left}: {e!s}"
+                self.logger.warning(msg)
+                if retries_left == 0:
+                    raise
+                time.sleep(retry_delay)
+                continue
             except (RuntimeError, TimeoutError):
                 self.logger.exception("Could not get request status: ")
                 raise
+
+            retries_left = retry_cnt
 
             # Normalized status can only be
             # fulfilled or done
             # failed
             # in-progress
-            if resp is not None and legacy_cf:
-                rqid = resp.get("reqid")
-                logs = resp.get("logs")
-                if rqid is not None and logs is not None:
-                    fname = f"{tempfile.gettempdir()}/{rqid}.log"
-                    try:
-                        with Path(fname).open("a") as fd:
-                            fd.writelines(f"{line}\n" for line in logs)
-                        msg = f"Wrote the collected logs to {fname}"
-                        self.logger.info(msg)
-                    except RuntimeError:
-                        err_msg = f"Failed to write the logs to {fname}: "
-                        self.logger.exception(err_msg)
-
-                fzip = resp.get("zip")
-                if rqid is not None and fzip is not None:
-                    fname = f"{tempfile.gettempdir()}/{rqid}-log.zip"
-                    try:
-                        with Path(fname).open("wb") as fd:
-                            fd.write(fzip.getvalue())
-                        if first_log:
-                            log_msg = f"Writing logs to {fname}"
-                            self.logger.info(log_msg)
-                            first_log = False
-                    except RuntimeError:
-                        err_msg = f"Failed to write the logs to {fname}: "
-                        self.logger.exception(err_msg)
-
-                status = resp.get("status")
-                if status in {"fulfilled", "done"}:
-                    break
-                if status == "failed":
-                    msg = f"RequestId: {reqid} has failed, check logs for details"
-                    raise CloudError(msg)
-
-            if resp is not None and not legacy_cf:
+            if resp is not None:
                 rqid = resp.get("reqid")
                 fzip = resp.get("zip")
                 if rqid is not None and fzip is not None:
@@ -1345,9 +1174,7 @@ class NvcfHelper(NvcfBase):
                 break
             if wait:
                 self.console.print()
-            # dont sleep to adapt to long-polling for legacy_cf
-            if not legacy_cf:
-                time.sleep(120)
+            time.sleep(120)
 
     def nvcf_helper_terminate_request(
         self,
@@ -1518,6 +1345,8 @@ class NvcfHelper(NvcfBase):
         reqid: str,
         funcid: str,
         version: str | None = None,
+        *,
+        include_logs: bool = True,
     ) -> dict[str, Any] | None:
         """Get request status using the new cosmos-curator-based API.
 
@@ -1528,6 +1357,8 @@ class NvcfHelper(NvcfBase):
             funcid (str): Function ID associated with the request.
             version (str | None, optional): Function version associated with the request.
                                           Defaults to None.
+            include_logs (bool, optional): Whether the status response should include
+                the log zip payload. Defaults to True.
 
         Returns:
             dict[str, Any] | None: Dictionary containing request status information,
@@ -1539,12 +1370,17 @@ class NvcfHelper(NvcfBase):
         """
         _ = version
         eh = {"CURATOR-NVCF-REQID": reqid, "CURATOR-STATUS-CHECK": "true"}
-        resp = self.nvcf_api_hdl.post(
-            _nvcf_direct_invocation_url(funcid),
-            extra_head=eh,
-            addl_headers=True,
-            full_url=True,
-        )
+        if not include_logs:
+            eh[_STATUS_INCLUDE_LOGS_HEADER] = "false"
+        try:
+            resp = self.nvcf_api_hdl.post(
+                _nvcf_direct_invocation_url(funcid),
+                extra_head=eh,
+                addl_headers=True,
+                full_url=True,
+            )
+        except RuntimeError as e:
+            raise RetryableNvcfError(str(e)) from e
 
         if resp is None:
             raise RuntimeError(_EXCEPTION_MESSAGE)
@@ -1553,6 +1389,10 @@ class NvcfHelper(NvcfBase):
             _raise_timeout_err(f"{reqid} May have timed out")
 
         if resp.is_error:
+            if _is_retryable_server_response(resp):
+                detail = resp.get_detail()
+                msg = detail if detail is not None else resp.get_error(f"request with funcid '{reqid}'")
+                raise RetryableNvcfError(msg)
             detail = resp.get_detail()
             if detail is not None:
                 _raise_runtime_err(detail)

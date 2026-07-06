@@ -185,6 +185,7 @@ class NvcfFunction(NvcfHelper):
         wait: bool = True,
         retry_cnt: int = 2,
         retry_delay: int = 3,
+        include_logs: bool = True,
     ) -> None:
         """Invoke NVCF Function.
 
@@ -195,6 +196,7 @@ class NvcfFunction(NvcfHelper):
             wait: Whether to wait for completion.
             retry_cnt: Number of retry attempts.
             retry_delay: Delay between retries in seconds.
+            include_logs: Whether status polling should include the log zip payload.
 
         """
         logger.info(f"Invoking nvcf function {self.funcid} {self.version} with {data_file}")
@@ -207,7 +209,7 @@ class NvcfFunction(NvcfHelper):
             wait=wait,
             retry_cnt=retry_cnt,
             retry_delay=retry_delay,
-            legacy_cf=False,
+            include_logs=include_logs,
         )
 
     def get_status(self) -> NvcfFunctionStatus:

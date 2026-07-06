@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, mock_open, patch
 from benchmarks.secrets import KratosSecrets
 from benchmarks.split_pipeline.nvcf_split_benchmark import (
     _read_optional_json,
+    _run_benchmark_attempt,
     _summary_counts_are_valid,
     report_metrics,
 )
@@ -57,6 +58,46 @@ def _make_caption_quality_metrics() -> dict[str, Any]:
 def _make_kratos_secrets() -> KratosSecrets:
     bearer_token = "test_token"  # noqa: S105
     return KratosSecrets(api_key="test_api", bearer_token=bearer_token)
+
+
+def test_run_benchmark_attempt_skips_status_logs(tmp_path: Path) -> None:
+    """Split benchmark polling should avoid downloading log payloads."""
+    nvcf_function = MagicMock()
+    nvcf_function.deploy.return_value.__enter__.return_value = None
+    nvcf_function.deploy.return_value.__exit__.return_value = None
+    invoke_config = tmp_path / "invoke.json"
+    deploy_config = tmp_path / "deploy.json"
+    invoke_data = {"args": {}}
+
+    with patch("benchmarks.split_pipeline.nvcf_split_benchmark._summary_counts_are_valid", return_value=True):
+        summary_path = _run_benchmark_attempt(
+            attempt=1,
+            max_attempts=1,
+            attempt_output_prefix="s3://bucket/output/attempt_1",
+            invoke_data=invoke_data,
+            invoke_config=invoke_config,
+            nvcf_function=nvcf_function,
+            backend="test-backend",
+            gpu="H100",
+            instance_type="test-instance",
+            deploy_config=deploy_config,
+            num_nodes=2,
+            max_concurrency=4,
+            s3_config_str="encoded-s3-config",
+            tmpdir_path=tmp_path,
+            transport_params={},
+            limit=1,
+            post_active_settle_seconds=0,
+        )
+
+    assert summary_path == "s3://bucket/output/attempt_1/summary.json"
+    nvcf_function.invoke.assert_called_once_with(
+        invoke_config,
+        "encoded-s3-config",
+        out_dir=tmp_path,
+        retry_cnt=1,
+        include_logs=False,
+    )
 
 
 @patch("benchmarks.split_pipeline.nvcf_split_benchmark.push_cloudevent")

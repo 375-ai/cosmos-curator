@@ -2,6 +2,16 @@
 
 ## Latest
 
+### Breaking Changes
+
+- Remove legacy NVCF `pexec`/`legacy_cf` invocation selection; function invokes and status
+  checks now use the direct invocation endpoints.
+
+### Added
+
+- Add `--include-logs`/`--no-include-logs` support to NVCF `invoke-batch` status polling
+  without requiring full downloads - useful for status checking loops.
+
 ## [2.2.0]
 
 ### Released

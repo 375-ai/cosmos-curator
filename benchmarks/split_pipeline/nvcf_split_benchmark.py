@@ -164,7 +164,13 @@ def _run_benchmark_attempt(  # noqa: PLR0913
             if post_active_settle_seconds > 0:
                 logger.info(f"Waiting {post_active_settle_seconds}s after deployment reached ACTIVE before invoke")
                 time.sleep(post_active_settle_seconds)
-            nvcf_function.invoke(invoke_config, s3_config_str, out_dir=tmpdir_path, retry_cnt=1)
+            nvcf_function.invoke(
+                invoke_config,
+                s3_config_str,
+                out_dir=tmpdir_path,
+                retry_cnt=1,
+                include_logs=False,
+            )
             logger.info(f"Invoke completed for attempt {attempt}/{max_attempts}; deployment cleanup will run next")
     except NvcfFunctionAlreadyDeployedError as e:
         msg = "Function is already deployed, this should not happen, previous benchmark may be running."

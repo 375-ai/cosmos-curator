@@ -22,6 +22,7 @@ import json
 import queue
 import tempfile
 import threading
+import uuid
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -486,6 +487,7 @@ class TestFastAPIEndpoints:
                 data = response.json()
                 assert data["progress"] == pytest.approx(PROGRESS_60_0)
                 assert data["status"] == "running"
+                mock_read.assert_called_once_with(mock_request_id, read_log=False)
 
     def test_run_pipeline_termination_request(self, test_client: TestClient, mock_request_id: str) -> None:
         """Test /v1/run_pipeline handles termination request."""
@@ -642,6 +644,29 @@ class TestFastAPIEndpoints:
                     assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
                     assert "CURATOR-PIPELINE-PERCENT-COMPLETE" in response.headers
 
+    def test_run_pipeline_status_check_can_skip_logs(self, test_client: TestClient, mock_request_id: str) -> None:
+        """Test status checks can return only status/progress headers."""
+        with patch("cosmos_curator.core.cf.nvcf_main._read_progress_and_log_files") as mock_read:
+            mock_read.return_value = (PROGRESS_33_3, "")
+            with patch("cosmos_curator.core.cf.nvcf_main._get_request_status") as mock_status:
+                mock_status.return_value = "running"
+                with patch.dict(nvcf_main.using_nvcf_status, {"get_req_sts": False}):
+                    response = test_client.post(
+                        "/v1/run_pipeline",
+                        headers={
+                            "CURATOR-STATUS-CHECK": "true",
+                            "CURATOR-STATUS-INCLUDE-LOGS": "false",
+                            "CURATOR-NVCF-REQID": mock_request_id,
+                        },
+                    )
+
+        assert response.status_code == HTTP_OK
+        assert response.content == b""
+        assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
+        assert response.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] == "33.30"
+        assert response.headers.get("content-type") != "application/zip"
+        mock_read.assert_called_once_with(mock_request_id, read_log=False)
+
     def test_run_pipeline_pexec_request_runs_synchronously(self, test_client: TestClient, mock_request_id: str) -> None:
         """Test pexec-shaped requests keep the synchronous request lifecycle."""
         fake_manager = MagicMock()
@@ -667,7 +692,52 @@ class TestFastAPIEndpoints:
             assert response.json()["message"] == "Pipeline executed successfully"
             mock_run.assert_called_once()
 
-    def test_run_pipeline_direct_request_returns_request_id(self, test_client: TestClient) -> None:
+    def test_run_pipeline_direct_request_without_nvcf_request_id_uses_generated_fallback(
+        self, test_client: TestClient
+    ) -> None:
+        """Test direct requests preserve the historical generated request ID fallback."""
+        fake_manager = MagicMock()
+        ipc_status = SimpleNamespace(value=False)
+        fake_manager.Value.return_value = ipc_status
+        fake_manager.Queue.return_value = queue.Queue()
+        fake_manager.list.return_value = []
+        fake_stop_event = threading.Event()
+        executed = threading.Event()
+
+        class FakeProgressThread:
+            def join(self) -> None:
+                pass
+
+        def fake_execute(*_args: object) -> None:
+            ipc_status.value = True
+            executed.set()
+
+        with (
+            patch("cosmos_curator.core.cf.nvcf_main.Manager", return_value=fake_manager),
+            patch(
+                "cosmos_curator.core.cf.nvcf_main._setup_request",
+                return_value=(FakeProgressThread(), fake_stop_event),
+            ),
+            patch("cosmos_curator.core.cf.nvcf_main.execute_pipeline", side_effect=fake_execute),
+            patch("cosmos_curator.core.cf.nvcf_main.gather_and_upload_outputs"),
+        ):
+            response = test_client.post(
+                "/v1/run_pipeline",
+                headers={"CURATOR-DIRECT-MODE": "true"},
+                json={"pipeline": "split", "args": {"input_video_path": "/in", "output_clip_path": "/out"}},
+            )
+            assert executed.wait(timeout=1)
+
+        assert response.status_code == HTTP_OK
+        response_body = response.json()
+        assert uuid.UUID(response_body["reqid"])
+        assert response_body["status"] == "in-progress"
+        assert "nvcf-status" not in response.headers
+        assert "nvcf-reqid" not in response.headers
+
+    def test_run_pipeline_direct_request_returns_request_id(
+        self, test_client: TestClient, mock_request_id: str
+    ) -> None:
         """Test direct requests return quickly and upload before publishing terminal status."""
         fake_manager = MagicMock()
         ipc_status = SimpleNamespace(value=False)
@@ -708,7 +778,7 @@ class TestFastAPIEndpoints:
         ):
             response = test_client.post(
                 "/v1/run_pipeline",
-                headers={"CURATOR-DIRECT-MODE": "true"},
+                headers={"CURATOR-DIRECT-MODE": "true", "NVCF-REQID": mock_request_id},
                 json={
                     "pipeline": "split",
                     "args": {
@@ -721,13 +791,17 @@ class TestFastAPIEndpoints:
             assert executed.wait(timeout=1)
 
             assert response.status_code == HTTP_OK
-            assert response.headers["nvcf-status"] == "in-progress"
+            assert response.json()["reqid"] == mock_request_id
+            assert response.json()["status"] == "in-progress"
+            assert "nvcf-status" not in response.headers
+            assert "nvcf-reqid" not in response.headers
             assert response.headers["CURATOR-PIPELINE-STATUS"] == "running"
             assert response.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] == "0.00"
-            assert response.headers["nvcf-reqid"]
             assert events == ["execute", "upload", "stop", "join"]
 
-    def test_run_pipeline_direct_upload_failure_marks_request_failed(self, test_client: TestClient) -> None:
+    def test_run_pipeline_direct_upload_failure_marks_request_failed(
+        self, test_client: TestClient, mock_request_id: str
+    ) -> None:
         """Test direct upload failures are visible before terminal progress status is written."""
         fake_manager = MagicMock()
         ipc_status = SimpleNamespace(value=False)
@@ -770,7 +844,7 @@ class TestFastAPIEndpoints:
         ):
             response = test_client.post(
                 "/v1/run_pipeline",
-                headers={"CURATOR-DIRECT-MODE": "true"},
+                headers={"CURATOR-DIRECT-MODE": "true", "NVCF-REQID": mock_request_id},
                 json={
                     "pipeline": "split",
                     "args": {
@@ -787,7 +861,9 @@ class TestFastAPIEndpoints:
             assert events == ["execute", "upload", "stop:False", "join:False"]
             assert ipc_status.value is False
 
-    def test_run_pipeline_direct_non_presigned_request_returns_request_id(self, test_client: TestClient) -> None:
+    def test_run_pipeline_direct_non_presigned_request_returns_request_id(
+        self, test_client: TestClient, mock_request_id: str
+    ) -> None:
         """Test direct non-presigned requests do not add a separate upload step."""
         fake_manager = MagicMock()
         fake_manager.Value.return_value = SimpleNamespace(value=False)
@@ -820,7 +896,7 @@ class TestFastAPIEndpoints:
         ):
             response = test_client.post(
                 "/v1/run_pipeline",
-                headers={"CURATOR-DIRECT-MODE": "true"},
+                headers={"CURATOR-DIRECT-MODE": "true", "NVCF-REQID": mock_request_id},
                 json={
                     "pipeline": "split",
                     "args": {"input_video_path": "/in", "output_clip_path": "/out"},
@@ -829,8 +905,10 @@ class TestFastAPIEndpoints:
             assert executed.wait(timeout=1)
 
             assert response.status_code == HTTP_OK
-            assert response.headers["nvcf-status"] == "in-progress"
-            assert response.headers["nvcf-reqid"]
+            assert response.json()["reqid"] == mock_request_id
+            assert response.json()["status"] == "in-progress"
+            assert "nvcf-status" not in response.headers
+            assert "nvcf-reqid" not in response.headers
             assert events == ["execute", "stop", "join"]
 
     @pytest.mark.parametrize(

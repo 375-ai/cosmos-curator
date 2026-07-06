@@ -32,7 +32,7 @@ import time
 import traceback
 import uuid
 import zipfile
-from collections.abc import Callable, MutableSequence
+from collections.abc import Callable, Mapping, MutableSequence
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import Manager
 from multiprocessing.sharedctypes import Synchronized
@@ -76,6 +76,7 @@ _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _REQUEST_OUTPUT_DIR_PATTERN = "request_output_dir_{req_id}.txt"
 _DIRECT_REQUEST_PATTERN = "direct_request_{req_id}"
 _CURATOR_DIRECT_MODE_HEADER = "CURATOR-DIRECT-MODE"
+_CURATOR_STATUS_INCLUDE_LOGS_HEADER = "CURATOR-STATUS-INCLUDE-LOGS"
 _RAY_DASHBOARD = f"http://127.0.0.1:{os.getenv('RAY_DASHBOARD_PORT', '8265')}"
 _METRICS_PORT = 9002
 
@@ -109,6 +110,14 @@ def _validate_request_id(req_id: str) -> str:
         error_msg = "request_id must contain only letters, numbers, dots, underscores, or hyphens"
         raise ValueError(error_msg)
     return req_id
+
+
+def _header_bool(headers: Mapping[str, str], name: str, *, default: bool) -> bool:
+    """Parse common boolean header values, falling back to default when absent."""
+    raw_value = headers.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _setup_request(
@@ -268,15 +277,15 @@ def _read_progress_and_log_files(
                         log_lines = fp.read()
     else:
         log_lines = "_read_progress_and_log_files called without req_id"
-    try:
-        jobs = _list_all_jobs()
-        # `(job_id/submission_id, (type, status, message))`
-        str_jobs = list(jobs.items())
-        log_lines += (
-            f"================Jobs Status================\n{str_jobs}\n===========================================\n"
-        )
-    except Exception as e:  # noqa: BLE001
-        log_lines += str(e)
+    if read_log:
+        try:
+            jobs = _list_all_jobs()
+            # `(job_id/submission_id, (type, status, message))`
+            str_jobs = list(jobs.items())
+            log_lines += f"================Jobs Status================\n{str_jobs}\n"
+            log_lines += "===========================================\n"
+        except Exception as e:  # noqa: BLE001
+            log_lines += str(e)
     return progress_pct, log_lines
 
 
@@ -540,20 +549,25 @@ class PipelineLockMiddleware(BaseHTTPMiddleware):
         assert req_id is not None
 
         logger.info(f"Received status check for request {req_id}")
-        progress_pct, log_lines = _read_progress_and_log_files(req_id)
+        include_logs = _header_bool(request.headers, _CURATOR_STATUS_INCLUDE_LOGS_HEADER, default=True)
+        progress_pct, log_lines = _read_progress_and_log_files(req_id, read_log=include_logs)
         status_str = _get_request_status(req_id)
 
         logger.debug(
             f"Progress for request {req_id}: {status_str=} {progress_pct}",
         )
+        headers = {
+            "CURATOR-PIPELINE-STATUS": status_str,
+            "CURATOR-PIPELINE-PERCENT-COMPLETE": f"{progress_pct:.2f}",
+            "access-control-expose-headers": ("CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE"),
+        }
+        if not include_logs:
+            return Response(status_code=200, headers=headers)
+
         buffer = self._create_zip_file(req_id, progress_pct, log_lines)
         zresponse = StreamingResponse(buffer, media_type="application/zip")
         zresponse.headers["Content-Disposition"] = "attachment; filename=files.zip"
-        zresponse.headers["CURATOR-PIPELINE-STATUS"] = status_str
-        zresponse.headers["CURATOR-PIPELINE-PERCENT-COMPLETE"] = f"{progress_pct:.2f}"
-        zresponse.headers["access-control-expose-headers"] = (
-            "CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE"
-        )
+        zresponse.headers.update(headers)
         return zresponse
 
     async def dispatch(  # noqa: PLR0911
@@ -703,7 +717,7 @@ def get_progress(request_id: str) -> JSONResponse:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
     try:
-        progress_pct, _ = _read_progress_and_log_files(request_id)
+        progress_pct, _ = _read_progress_and_log_files(request_id, read_log=False)
         status_str = _get_request_status(request_id)
 
         return JSONResponse(
@@ -912,14 +926,10 @@ async def curate_video(request: Request) -> JSONResponse:  # noqa: C901, PLR0912
                 status_code=200,
                 content={"message": "Pipeline accepted", "reqid": request_id, "status": "in-progress"},
                 headers={
-                    "nvcf-reqid": request_id,
-                    "nvcf-status": "in-progress",
                     "CURATOR-PIPELINE-STATUS": "running",
                     "CURATOR-PIPELINE-PERCENT-COMPLETE": "0.00",
                     "CURATOR-INVOCATION-MODE": "direct",
-                    "access-control-expose-headers": (
-                        "nvcf-reqid, nvcf-status, CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE"
-                    ),
+                    "access-control-expose-headers": "CURATOR-PIPELINE-STATUS, CURATOR-PIPELINE-PERCENT-COMPLETE",
                 },
             )
 

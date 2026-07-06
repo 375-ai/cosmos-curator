@@ -194,12 +194,14 @@ def test_nvcf_function_get_status(  # noqa: PLR0913
 
 
 @pytest.mark.parametrize(
-    ("invoke_kwargs", "expected_wait", "expected_retry_cnt", "expected_retry_delay"),
+    ("invoke_kwargs", "expected_wait", "expected_retry_cnt", "expected_retry_delay", "expected_include_logs"),
     [
         # Test with default parameters
-        ({}, True, 2, 3),
+        ({}, True, 2, 3, True),
         # Test with custom parameters
-        ({"wait": False, "retry_cnt": 5, "retry_delay": 10}, False, 5, 10),
+        ({"wait": False, "retry_cnt": 5, "retry_delay": 10}, False, 5, 10, True),
+        # Test status polling without log payloads
+        ({"include_logs": False}, True, 2, 3, False),
     ],
 )
 @patch.object(NvcfFunction, "nvcf_helper_invoke_wait_retry_function")
@@ -212,6 +214,7 @@ def test_nvcf_function_invoke(  # noqa: PLR0913
     expected_wait: bool,
     expected_retry_cnt: int,
     expected_retry_delay: int,
+    expected_include_logs: bool,
 ) -> None:
     """Test invoke method with various parameter combinations."""
     data_file = tmp_path / "invoke.json"
@@ -233,7 +236,7 @@ def test_nvcf_function_invoke(  # noqa: PLR0913
         wait=expected_wait,
         retry_cnt=expected_retry_cnt,
         retry_delay=expected_retry_delay,
-        legacy_cf=False,
+        include_logs=expected_include_logs,
     )
 
 

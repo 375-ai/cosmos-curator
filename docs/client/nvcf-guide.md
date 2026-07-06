@@ -157,3 +157,16 @@ cosmos-curator nvcf function invoke-function \
     --data-file ~/.config/cosmos_curator/templates/function/invoke_video_split.json \
     --s3-config-file ~/.aws/credentials
 ```
+
+##### NVCF Status Log Downloads
+
+NVCF request-status polling downloads the NVCF status log zip by default. Use `--no-include-logs` when you only need progress/status and want to avoid repeatedly downloading that payload:
+
+```bash
+cosmos-curator nvcf function invoke-function \
+    --data-file ~/.config/cosmos_curator/templates/function/invoke_video_split.json \
+    --s3-config-file ~/.aws/credentials \
+    --no-include-logs
+```
+
+The same `--include-logs` / `--no-include-logs` option is also available on `invoke-batch` and `get-request-status`.

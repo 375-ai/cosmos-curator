@@ -501,11 +501,6 @@ def nvcf_invoke_batch(  # noqa: PLR0913
             resolve_path=True,
         ),
     ],
-    legacy_cf: Annotated[bool, Option] = Option(
-        default=False,
-        help=("Pass this flag for legacy cloud functions."),
-        rich_help_panel="InvokeBatch",
-    ),
     retry_cnt: Annotated[
         int,
         Option(
@@ -522,6 +517,11 @@ def nvcf_invoke_batch(  # noqa: PLR0913
             callback=validate_positive_integer,
         ),
     ] = 300,
+    include_logs: Annotated[bool, Option] = Option(
+        default=True,
+        help="Download the status log zip payload while polling",
+        rich_help_panel="InvokeBatch",
+    ),
     out_dir: Annotated[
         Path,
         Option(
@@ -546,7 +546,7 @@ def nvcf_invoke_batch(  # noqa: PLR0913
         s3_config_file: Path to S3 configuration file.
         retry_cnt: Number of retry attempts.
         retry_delay: Delay between retries in seconds.
-        legacy_cf: Flag for legacy cloud functions.
+        include_logs: Whether to download the status log zip payload while polling.
         out_dir: Output dir in case content can be downloaded
 
     Returns:
@@ -561,9 +561,9 @@ def nvcf_invoke_batch(  # noqa: PLR0913
             job_variant_file=job_variant_file,
             ddir=str(out_dir),
             s3_config=_get_s3_config_str(s3_config_file),
-            legacy_cf=legacy_cf,
             retry_cnt=retry_cnt,
             retry_delay=retry_delay,
+            include_logs=include_logs,
         )
     except Exception as e:
         error_msg = f"Could not invoke batch: {e!s}"
@@ -603,11 +603,6 @@ def nvcf_invoke_function(  # noqa: PLR0913
     wait: Annotated[bool, Option] = Option(
         default=True,
         help="Wait for request to complete by polling status",
-        rich_help_panel="Invoke",
-    ),
-    legacy_cf: Annotated[bool, Option] = Option(
-        default=False,
-        help="Pass this flag for legacy cloud functions.",
         rich_help_panel="Invoke",
     ),
     funcid: Annotated[
@@ -655,6 +650,11 @@ def nvcf_invoke_function(  # noqa: PLR0913
             callback=validate_positive_integer,
         ),
     ] = 300,
+    include_logs: Annotated[bool, Option] = Option(
+        default=True,
+        help="Download the status log zip payload while polling",
+        rich_help_panel="Invoke",
+    ),
     out_dir: Annotated[
         Path,
         Option(
@@ -681,7 +681,7 @@ def nvcf_invoke_function(  # noqa: PLR0913
         wait: Whether to wait for completion.
         retry_cnt: Number of retry attempts.
         retry_delay: Delay between retries in seconds.
-        legacy_cf: Flag for legacy cloud functions.
+        include_logs: Whether to download the status log zip payload while polling.
         out_dir: Output dir in case content can be downloaded
 
     Returns:
@@ -703,10 +703,10 @@ def nvcf_invoke_function(  # noqa: PLR0913
                 data_file=data_file,
                 prompt_file=prompt_file,
                 s3_config=_get_s3_config_str(s3_config_file),
-                legacy_cf=legacy_cf,
                 wait=wait,
                 retry_cnt=retry_cnt,
                 retry_delay=retry_delay,
+                include_logs=include_logs,
             )
         else:
             resp = nvcf_hdl.nvcf_helper_invoke_function(
@@ -774,9 +774,9 @@ def nvcf_get_request_status(  # noqa: PLR0913
         help="Wait for request to complete by polling status",
         rich_help_panel="Request",
     ),
-    legacy_cf: Annotated[bool, Option] = Option(
-        default=False,
-        help="Pass this flag for legacy cloud functions.\n\n[red]This support will be removed in future[/red]",
+    include_logs: Annotated[bool, Option] = Option(
+        default=True,
+        help="Download the status log zip payload while polling",
         rich_help_panel="Request",
     ),
 ) -> None:
@@ -788,7 +788,7 @@ def nvcf_get_request_status(  # noqa: PLR0913
         funcid: Function ID used in invoke.
         version: Function version ID used in invoke.
         wait: Whether to wait for completion.
-        legacy_cf: Flag for legacy cloud functions.
+        include_logs: Whether to download the status log zip payload.
         out_dir: Output dir in case content can be downloaded
 
     Returns:
@@ -807,8 +807,8 @@ def nvcf_get_request_status(  # noqa: PLR0913
             ddir=str(out_dir),
             funcid=funcid,
             version=version,
-            legacy_cf=legacy_cf,
             wait=wait,
+            include_logs=include_logs,
         )
     except Exception as e:
         error_msg = f"Could not get request status: {e!s}"

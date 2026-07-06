@@ -465,6 +465,18 @@ def test_nvcf_split_benchmark_runs_as_package_module() -> None:
     assert ci_config["variables"]["NVCF_SPLIT_BENCHMARK_MAX_ATTEMPTS"]["value"] == "4"
 
 
+def test_nvcf_helm_deploy_invokes_without_status_logs() -> None:
+    """Verify helm CI invokes do not download status log payloads while polling."""
+    script = _read_repo_file(".gitlab/scripts/nvcf_helm_deploy.sh")
+
+    invoke_lines = [
+        line for line in script.splitlines() if line.startswith("cosmos-curator nvcf function invoke-function")
+    ]
+
+    assert len(invoke_lines) == 4
+    assert all("--no-include-logs" in line for line in invoke_lines)
+
+
 def test_image_cli_default_envs_do_not_include_dev() -> None:
     """Verify image env parsing does not add the developer tooling environment by default."""
     default_envs = set(_parse_envs(""))

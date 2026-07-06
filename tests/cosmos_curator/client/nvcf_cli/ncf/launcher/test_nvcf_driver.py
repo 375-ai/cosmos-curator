@@ -14,6 +14,7 @@
 # limitations under the License.
 """Test nvcf driver commands."""
 
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -23,12 +24,70 @@ import pytest
 from typer.testing import CliRunner
 
 from cosmos_curator.client.cli import cosmos_curator  # type: ignore[import-not-found]
-from cosmos_curator.client.nvcf_cli.ncf.common import NotFoundError
+from cosmos_curator.client.nvcf_cli.ncf.common import NotFoundError, NVCFResponse
+from cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_helper import NvcfHelper
 
 runner = CliRunner()
 
 _FAKE_UUID_ONE = "12345678-1234-1234-1234-123456789abc"
 _FAKE_UUID_TWO = "87654321-4321-4321-4321-987654321def"
+_STATUS_INCLUDE_LOGS_HEADER = "CURATOR-STATUS-INCLUDE-LOGS"
+
+
+def _make_direct_invoke_response(status: str = "in-progress") -> NVCFResponse:
+    return NVCFResponse(
+        {
+            "status": 200,
+            "headers": {
+                "reqid": "test-reqid",
+                "pct": "0.0",
+                "status": status,
+            },
+        }
+    )
+
+
+def _make_status_response(status: str = "fulfilled") -> NVCFResponse:
+    return NVCFResponse(
+        {
+            "status": 200,
+            "headers": {
+                "reqid": "test-reqid",
+                "pct": "100.0" if status == "fulfilled" else "42.0",
+                "status": status,
+            },
+            "invoke-based-status": status,
+        }
+    )
+
+
+def _patch_function_helper(mock_cc: MagicMock, mock_nvcf_client: MagicMock) -> None:
+    class CliTestNvcfHelper(NvcfHelper):
+        def __init__(  # noqa: PLR0913
+            self,
+            url: str,
+            nvcf_url: str,
+            key: str | None,
+            org: str | None,
+            team: str,
+            timeout: int,
+        ) -> None:
+            super().__init__(url=url, nvcf_url=nvcf_url, key=key, org=org, team=team, timeout=timeout)
+            self.cfg = {"key": "test-key", "org": "test-org"}
+            self.nvcf_api_hdl = mock_nvcf_client
+
+        def id_version(self, funcid: str | None, version: str | None) -> tuple[bool, str | None, str | None]:
+            return True, funcid or _FAKE_UUID_ONE, version or _FAKE_UUID_TWO
+
+    mock_cc.return_value = {"function": {"help": "A fake function", "type": CliTestNvcfHelper}}
+
+
+def _status_check_headers(mock_nvcf_client: MagicMock) -> list[dict[str, str]]:
+    return [
+        call.kwargs["extra_head"]
+        for call in mock_nvcf_client.post.call_args_list
+        if call.kwargs.get("extra_head", {}).get("CURATOR-STATUS-CHECK") == "true"
+    ]
 
 
 def test_deploy_function_no_id_version(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -363,6 +422,44 @@ def test_invoke_function_test_wait(mock_cc: MagicMock, tmp_path: Path) -> None:
 
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
+def test_invoke_function_can_skip_status_logs(mock_cc: MagicMock, tmp_path: Path) -> None:
+    """Test invoke-function can request status polling without log payloads."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        _make_direct_invoke_response(),
+        _make_status_response(),
+    ]
+    _patch_function_helper(mock_cc, mock_nvcf_client)
+
+    data_file = tmp_path / "fake.json"
+    data_file.write_text("{}")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    args = [
+        "nvcf",
+        "function",
+        "invoke-function",
+        "--data-file",
+        str(data_file),
+        "--out-dir",
+        str(out_dir),
+        "--no-include-logs",
+    ]
+
+    result = runner.invoke(cosmos_curator, args)
+
+    assert result.exit_code == 0
+    assert _status_check_headers(mock_nvcf_client) == [
+        {
+            "CURATOR-NVCF-REQID": "test-reqid",
+            "CURATOR-STATUS-CHECK": "true",
+            _STATUS_INCLUDE_LOGS_HEADER: "false",
+        }
+    ]
+
+
+@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
 def test_invoke_function_validation_failures(mock_cc: MagicMock, tmp_path: Path) -> None:
     """Test that invoke-function fails validation errors.
 
@@ -570,6 +667,57 @@ def test_nvcf_invoke_batch_function(mock_cc: MagicMock, tmp_path: Path) -> None:
 
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
+def test_invoke_batch_can_skip_status_logs(mock_cc: MagicMock, tmp_path: Path) -> None:
+    """Test invoke-batch can request status polling without log payloads."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.side_effect = [
+        _make_direct_invoke_response(),
+        _make_status_response(),
+    ]
+    _patch_function_helper(mock_cc, mock_nvcf_client)
+
+    data_file = tmp_path / "data.json"
+    id_file = tmp_path / "id.json"
+    job_variant_file = tmp_path / "job_variant.json"
+    s3_config_file = tmp_path / "s3_config.json"
+    out_dir = tmp_path / "out"
+
+    data_file.write_text(json.dumps({"args": {}}))
+    id_file.write_text(json.dumps([{"func": _FAKE_UUID_ONE, "vers": _FAKE_UUID_TWO}]))
+    job_variant_file.write_text(json.dumps([{"input_file": "video1.mp4"}]))
+    s3_config_file.touch()
+    out_dir.mkdir()
+
+    args = [
+        "nvcf",
+        "function",
+        "invoke-batch",
+        "--data-file",
+        str(data_file),
+        "--id-file",
+        str(id_file),
+        "--job-variant-file",
+        str(job_variant_file),
+        "--s3-config-file",
+        str(s3_config_file),
+        "--out-dir",
+        str(out_dir),
+        "--no-include-logs",
+    ]
+
+    result = runner.invoke(cosmos_curator, args)
+
+    assert result.exit_code == 0
+    assert _status_check_headers(mock_nvcf_client) == [
+        {
+            "CURATOR-NVCF-REQID": "test-reqid",
+            "CURATOR-STATUS-CHECK": "true",
+            _STATUS_INCLUDE_LOGS_HEADER: "false",
+        }
+    ]
+
+
+@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
 def test_get_request_status(mock_cc: MagicMock, tmp_path: Path) -> None:
     """Test that get-request-status can succeed.
 
@@ -603,6 +751,39 @@ def test_get_request_status(mock_cc: MagicMock, tmp_path: Path) -> None:
     mock_instance.id_version.return_value = (None, _FAKE_UUID_ONE, _FAKE_UUID_TWO)
     result = runner.invoke(cosmos_curator, args)
     assert result.exit_code == 1
+
+
+@patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")
+def test_get_request_status_can_skip_logs(mock_cc: MagicMock, tmp_path: Path) -> None:
+    """Test that get-request-status can request status without log payload."""
+    mock_nvcf_client = MagicMock()
+    mock_nvcf_client.post.return_value = _make_status_response()
+    _patch_function_helper(mock_cc, mock_nvcf_client)
+
+    custom_out_dir = tmp_path / "custom_output"
+    custom_out_dir.mkdir()
+
+    args = [
+        "nvcf",
+        "function",
+        "get-request-status",
+        "--reqid",
+        _FAKE_UUID_ONE,
+        "--out-dir",
+        str(custom_out_dir),
+        "--no-include-logs",
+    ]
+
+    result = runner.invoke(cosmos_curator, args)
+
+    assert result.exit_code == 0
+    assert _status_check_headers(mock_nvcf_client) == [
+        {
+            "CURATOR-NVCF-REQID": _FAKE_UUID_ONE,
+            "CURATOR-STATUS-CHECK": "true",
+            _STATUS_INCLUDE_LOGS_HEADER: "false",
+        }
+    ]
 
 
 @patch("cosmos_curator.client.nvcf_cli.ncf.common.nvcf_base.cc_client_instances")

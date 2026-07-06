@@ -103,7 +103,7 @@ export DECODE_RAISE_ON_ERROR=true
 jq --arg output_clip_path "$S3_OUTPUT_CLIP_PATH" --arg input_video_path "$S3_INPUT_VIDEO_PATH" --argjson limit 1 \
 '.args.output_clip_path = $output_clip_path | .args.input_video_path = $input_video_path | .args.limit = $limit' \
 < examples/nvcf/function/invoke_video_split_full.json > invoke_split1.json
-cosmos-curator nvcf function invoke-function --data-file invoke_split1.json --s3-config-file aws_credentials
+cosmos-curator nvcf function invoke-function --data-file invoke_split1.json --s3-config-file aws_credentials --no-include-logs
 
 # use GPU decoding & FP8/TP2 for Qwen to process 1 more video
 if [ "$HELM_GPU_REQUESTS" -ge 2 ]; then
@@ -115,12 +115,12 @@ fi
 jq --arg output_clip_path "$S3_OUTPUT_CLIP_PATH" --arg input_video_path "$S3_INPUT_VIDEO_PATH" --argjson limit 1 --arg transnetv2_frame_decoder_mode pynvc --argjson transnetv2_frame_decode_raise_on_pynvc_error "$DECODE_RAISE_ON_ERROR" --argjson transcode_use_hwaccel true --argjson qwen_use_fp8_weights true --argjson qwen_num_gpus_per_worker "$_QWEN_TP_SIZE" \
 '.args.output_clip_path = $output_clip_path | .args.input_video_path = $input_video_path | .args.limit = $limit | .args.transnetv2_frame_decoder_mode = $transnetv2_frame_decoder_mode | .args.transnetv2_frame_decode_raise_on_pynvc_error = $transnetv2_frame_decode_raise_on_pynvc_error | .args.transcode_use_hwaccel = $transcode_use_hwaccel | .args.qwen_use_fp8_weights = $qwen_use_fp8_weights | .args.qwen_num_gpus_per_worker = $qwen_num_gpus_per_worker ' \
 < examples/nvcf/function/invoke_video_split_full.json > invoke_split2.json
-cosmos-curator nvcf function invoke-function --data-file invoke_split2.json --s3-config-file aws_credentials
+cosmos-curator nvcf function invoke-function --data-file invoke_split2.json --s3-config-file aws_credentials --no-include-logs
 
 # Dedup pipeline
 jq --arg output_path "$S3_OUTPUT_DEDUP_PATH" --arg input_embeddings_path "$S3_OUTPUT_CLIP_PATH" '.args.output_path = $output_path | .args.input_embeddings_path = $input_embeddings_path' < examples/nvcf/function/invoke_video_dedup.json > invoke_dedup.json
-cosmos-curator nvcf function invoke-function --data-file invoke_dedup.json --s3-config-file aws_credentials
+cosmos-curator nvcf function invoke-function --data-file invoke_dedup.json --s3-config-file aws_credentials --no-include-logs
 
 # Shard-dataset pipeline
 jq --arg output_dataset_path "$S3_OUTPUT_DATASET_PATH" --arg input_clip_path "$S3_OUTPUT_CLIP_PATH" --arg input_semantic_dedup_path "$S3_OUTPUT_DEDUP_PATH" '.args.output_dataset_path = $output_dataset_path | .args.input_clip_path = $input_clip_path | .args.input_semantic_dedup_path = $input_semantic_dedup_path' < examples/nvcf/function/invoke_video_shard.json > invoke_shard.json
-cosmos-curator nvcf function invoke-function --data-file invoke_shard.json --s3-config-file aws_credentials
+cosmos-curator nvcf function invoke-function --data-file invoke_shard.json --s3-config-file aws_credentials --no-include-logs
