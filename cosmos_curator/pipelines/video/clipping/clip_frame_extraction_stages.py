@@ -15,10 +15,8 @@
 
 """Clip Frame Extraction Stage."""
 
-import io
 import math
 from functools import reduce
-from typing import Final, Literal
 
 import attrs
 import cv2
@@ -41,7 +39,6 @@ from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask,
 from cosmos_curator.pipelines.video.utils.decoder_utils import (
     FrameExtractionPolicy,
     FrameExtractionSignature,
-    extract_frames,
 )
 
 
@@ -58,18 +55,16 @@ class ClipFrameExtractionStage(CuratorStage):
 
     This class processes video clips through a series of steps including frame extraction,
     target frame rate selection, and frame extraction signature creation.
-    """
 
-    DEFAULT_DECODER_MODE: Final = "extract_frames"
-    CAMERA_SENSOR_DECODER_MODE: Final = "camera_sensor"
+    Clip frames are always sampled through ``CameraSensor``, which only supports the
+    ``FrameExtractionPolicy.sequence`` policy.
+    """
 
     def __init__(  # noqa: PLR0913
         self,
-        extraction_policies: tuple[FrameExtractionPolicy, ...] = (FrameExtractionPolicy.sequence,),
         target_fps: list[float | int] | None = None,
         target_res: tuple[int, int] | None = None,
         *,
-        decoder_mode: Literal["extract_frames", "camera_sensor"] = DEFAULT_DECODER_MODE,
         motion_vectors: CameraSensorMotionVectorConfig | None = None,
         num_cpus_per_worker: float = 3.0,
         verbose: bool = False,
@@ -78,28 +73,21 @@ class ClipFrameExtractionStage(CuratorStage):
         """Initialize the clip frame extraction stage.
 
         Args:
-            extraction_policies: Frame extraction policies to use.
             target_fps: Target frames per second for extraction.
             target_res: Target resolution for extracted frames.
-            decoder_mode: Backend used to decode per-clip frames.
             motion_vectors: Optional camera-sensor motion-vector export config.
             num_cpus_per_worker: Number of CPU cores to allocate per worker.
             verbose: Whether to print verbose logs.
             log_stats: Whether to log performance statistics.
 
         """
-        if motion_vectors is not None and decoder_mode != self.CAMERA_SENSOR_DECODER_MODE:
-            msg = "Camera-sensor motion-vector export requires decoder_mode='camera_sensor'"
-            raise ValueError(msg)
         if target_fps is None:
             target_fps = [2]
         if target_res is None:
             target_res = (-1, -1)
         self._timer = StageTimer(self)
-        self._extraction_policies = extraction_policies
         self._target_fps = target_fps
         self._target_res = target_res
-        self._decoder_mode = decoder_mode
         self._motion_vector_config = motion_vectors
         self._num_cpus = num_cpus_per_worker
         self._num_threads = max(1, int(num_cpus_per_worker) + 1)
@@ -124,9 +112,9 @@ class ClipFrameExtractionStage(CuratorStage):
 
         return reduce(lcm, fps)
 
-    def _make_signature(self, policy: FrameExtractionPolicy, fps: float) -> str:
+    def _make_signature(self, fps: float) -> str:
         return FrameExtractionSignature(
-            extraction_policy=policy,
+            extraction_policy=FrameExtractionPolicy.sequence,
             target_fps=fps,
         ).to_str()
 
@@ -146,27 +134,15 @@ class ClipFrameExtractionStage(CuratorStage):
             )
         return frames
 
-    def _extract_frames_default(
-        self,
-        data: bytes | npt.NDArray[np.uint8],
-        policy: FrameExtractionPolicy,
-        fps: float,
-    ) -> npt.NDArray[np.uint8]:
-        with io.BytesIO(data) as fp:
-            return extract_frames(
-                fp,
-                extraction_policy=policy,
-                sample_rate_fps=fps,
-                target_res=self._target_res,
-                num_threads=self._num_threads,
-            )
-
     def _sample_with_camera_sensor(
         self,
         data: bytes | npt.NDArray[np.uint8],
         sample_rate_fps: float,
     ) -> npt.NDArray[np.uint8]:
-        sensor = CameraSensor(bytes(data))
+        sensor = CameraSensor(
+            bytes(data),
+            decode_config=CpuVideoDecodeConfig(thread_count=self._num_threads),
+        )
         spec = self._make_sensor_sampling_spec(sensor, sample_rate_fps, stop_ns=sensor.end_ns)
         sampled_batches = list(sensor.sample(spec))
         if len(sampled_batches) != 1:
@@ -256,32 +232,25 @@ class ClipFrameExtractionStage(CuratorStage):
                 clip.decoded_motion_data = None
                 clip.errors["motion_decode"] = "no_motion_frames"
 
-    def _extract_frames_for_policy(
+    def _extract_frames(
         self,
         data: bytes | npt.NDArray[np.uint8],
-        policy: FrameExtractionPolicy,
     ) -> dict[str, npt.NDArray[np.uint8]]:
         local_frames: dict[str, npt.NDArray[np.uint8]] = {}
-        use_camera_sensor = self._decoder_mode == self.CAMERA_SENSOR_DECODER_MODE
-        if use_camera_sensor and policy is not FrameExtractionPolicy.sequence:
-            msg = f"CameraSensor clip frame extraction only supports {FrameExtractionPolicy.sequence!s}, got {policy!s}"
-            raise NotImplementedError(msg)
 
-        if not use_camera_sensor and self._use_lcm_fps():
+        # Decode-reuse optimization: for multiple integer FPS targets, sample once at the
+        # least-common-multiple rate and stride-subsample the lower rates instead of decoding
+        # the clip once per target FPS.
+        if self._use_lcm_fps():
             lcm = self.lcm_multiple(self._target_fps)
-            frames = self._extract_frames_default(data, policy, lcm)
+            frames = self._sample_with_camera_sensor(data, lcm)
             for fps in self._target_fps:
-                signature = self._make_signature(policy, fps)
                 stride = int(lcm / fps)
-                local_frames[signature] = frames[::stride]
+                local_frames[self._make_signature(fps)] = frames[::stride]
             return local_frames
 
         for fps in self._target_fps:
-            if use_camera_sensor:
-                frames = self._sample_with_camera_sensor(data, fps)
-            else:
-                frames = self._extract_frames_default(data, policy, fps)
-            local_frames[self._make_signature(policy, fps)] = frames
+            local_frames[self._make_signature(fps)] = self._sample_with_camera_sensor(data, fps)
         return local_frames
 
     def _process_video(self, video: Video) -> None:
@@ -296,10 +265,7 @@ class ClipFrameExtractionStage(CuratorStage):
                 continue
 
             try:
-                local_frames: dict[str, npt.NDArray[np.uint8]] = {}
-                for policy in self._extraction_policies:
-                    frames_by_signature = self._extract_frames_for_policy(data, policy)
-                    local_frames.update(frames_by_signature)
+                local_frames = self._extract_frames(data)
                 if self._verbose:
                     for signature, frame_array in local_frames.items():
                         logger.info(f"Extracted {len(frame_array)} frames from clip {clip.uuid} for {signature=}")

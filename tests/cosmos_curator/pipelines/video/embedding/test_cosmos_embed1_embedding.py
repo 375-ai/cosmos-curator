@@ -30,7 +30,6 @@ from cosmos_curator.pipelines.video.embedding.cosmos_embed1_stages import (
     CosmosEmbed1FrameCreationStage,
 )
 from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
-from cosmos_curator.pipelines.video.utils.decoder_utils import FrameExtractionPolicy
 
 _MATCH_CONFIDENCE_SCORE = 0.9
 
@@ -68,7 +67,7 @@ def test_generate_embedding(sample_embedding_task: SplitPipeTask, sequential_run
     """Test the Cosmos-Embed1Embedding result."""
     stages = [
         ClipTranscodingStage(encoder="libopenh264"),
-        ClipFrameExtractionStage(extraction_policies=(FrameExtractionPolicy.sequence,), target_fps=[2.0]),
+        ClipFrameExtractionStage(target_fps=[2.0]),
         CosmosEmbed1FrameCreationStage(target_fps=2.0),
         CosmosEmbed1EmbeddingStage(num_gpus_per_worker=1.0, texts_to_verify=_get_texts()),
     ]

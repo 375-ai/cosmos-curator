@@ -547,9 +547,6 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
     use_camera_sensor_motion_vectors = (
         args.motion_filter != "disable" and args.motion_vector_source == "camera_sensor_clip"
     )
-    if use_camera_sensor_motion_vectors and args.clip_extraction_decoder_mode != "camera_sensor":
-        msg = "--motion-vector-source=camera_sensor_clip requires --clip-extraction-decoder-mode=camera_sensor"
-        raise ValueError(msg)
 
     has_aesthetics = args.aesthetic_threshold is not None
     has_embeddings = args.generate_embeddings
@@ -566,7 +563,6 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 FrameExtractionConfig(
                     target_fps=frame_extraction_target_fps,
                     target_res=args.clip_extraction_target_res,
-                    decoder_mode=args.clip_extraction_decoder_mode,
                     motion_vectors=CameraSensorMotionVectorConfig(
                         target_fps=args.motion_decode_target_fps,
                         target_duration_ratio=args.motion_decode_target_duration_ratio,
@@ -604,7 +600,6 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 FrameExtractionConfig(
                     target_fps=frame_extraction_target_fps,
                     target_res=args.clip_extraction_target_res,
-                    decoder_mode=args.clip_extraction_decoder_mode,
                     cpus_per_worker=args.clip_extraction_cpus_per_worker,
                     perf_profile=args.perf_profile,
                 )
@@ -1578,8 +1573,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         default="legacy_decode",
         help=(
             "Source for motion vectors. 'legacy_decode' runs the existing motion decode stage. "
-            "'camera_sensor_clip' reuses the camera-sensor clip extraction stage and requires "
-            "--clip-extraction-decoder-mode=camera_sensor."
+            "'camera_sensor_clip' reuses the camera-sensor clip extraction stage."
         ),
     )
     parser.add_argument(
@@ -1593,12 +1587,6 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=float,
         default=3.0,
         help="Number of CPUs per worker allocated to clip frame extraction.",
-    )
-    parser.add_argument(
-        "--clip-extraction-decoder-mode",
-        choices=["extract_frames", "camera_sensor"],
-        default="extract_frames",
-        help="Decoder mode for clip frame extraction.",
     )
     parser.add_argument(
         "--aesthetic-threshold",
