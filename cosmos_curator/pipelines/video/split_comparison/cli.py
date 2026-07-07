@@ -48,7 +48,7 @@ from typing import Any
 from loguru import logger
 from pydantic import ValidationError
 
-from cosmos_curator.pipelines.video.split_comparison import store, summary
+from cosmos_curator.pipelines.video.split_comparison import report, store, summary
 from cosmos_curator.pipelines.video.split_comparison.config import DEFAULT_PROFILE_NAME, SplitComparisonConfig
 from cosmos_curator.pipelines.video.split_comparison.eval import evaluate
 from cosmos_curator.pipelines.video.split_comparison.load import DEFAULT_LANCE_VERSION
@@ -57,6 +57,81 @@ from cosmos_curator.pipelines.video.split_comparison.result_model import Issue
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Dispatch to a subcommand (``score-histogram``) or run the default measure/eval flow."""
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "score-histogram":
+        return _score_histogram_main(raw[1:])
+    return _measure_eval_main(raw)
+
+
+def _score_histogram_main(argv: Sequence[str]) -> int:
+    """Print the all-clips score distributions for a measurements root (text / JSON / PNG)."""
+    parser = argparse.ArgumentParser(
+        prog="cosmos-curator split-compare score-histogram",
+        description="Bucket the all-clips score distributions of a measurements root, with the "
+        "policy thresholds marked. Reads clip.lance / window.lance / eval.json.",
+    )
+    parser.add_argument("--measurements-path", required=True, help="Measurements root to read.")
+    parser.add_argument("--profile", default=None, help="Storage profile for reads (default: 'default').")
+    parser.add_argument(
+        "--eval-name",
+        default=None,
+        help="Read thresholds from eval/<name>/eval.json (match the run's --eval-name); default: root eval.json.",
+    )
+    parser.add_argument(
+        "--metric",
+        action="append",
+        choices=report.METRIC_NAMES,
+        dest="metrics",
+        help="Histogram(s) to show (repeatable); default: all. Choices: " + ", ".join(report.METRIC_NAMES),
+    )
+    parser.add_argument(
+        "--bins", type=int, default=report.DEFAULT_BINS, help="Histogram bin count (default: %(default)s)."
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON (buckets/counts/stats) instead of text bars.")
+    parser.add_argument("--png", metavar="PATH", help="Also write a PNG figure to PATH (requires matplotlib).")
+    parser.add_argument("--png-title", metavar="TEXT", help="Title (suptitle) for the PNG figure.")
+    args = parser.parse_args(argv)
+    if args.bins < 1:
+        sys.stderr.write("--bins must be >= 1\n")
+        return 2
+
+    profile = args.profile or DEFAULT_PROFILE_NAME
+    try:
+        histograms = report.build_histograms(
+            args.measurements_path,
+            eval_name=args.eval_name,
+            profile=profile,
+            bins=args.bins,
+            metrics=report.metrics_for(args.metrics),
+        )
+    except (OSError, ValueError) as err:
+        sys.stderr.write(f"Failed to build histograms: {err}\n")
+        return 2
+
+    if histograms and all(h.threshold is None for h in histograms):
+        # A missing/unreadable eval.json (or an --eval-name mismatch) leaves every bucket untagged;
+        # say so on stderr rather than emit an unmarked report that reads like "nothing failing".
+        sys.stderr.write(
+            "warning: no policy thresholds found (missing/unreadable eval.json or --eval-name mismatch); "
+            "buckets are not tagged passing/failing.\n"
+        )
+
+    if args.json:
+        sys.stdout.write(json.dumps(report.to_json(histograms), indent=2) + "\n")
+    else:
+        sys.stdout.write(report.render_text(histograms))
+    if args.png:
+        try:
+            report.render_png(histograms, args.png, profile=profile, title=args.png_title)
+        except (RuntimeError, OSError, ValueError) as err:
+            sys.stderr.write(f"{err}\n")
+            return 2
+        logger.info("Wrote PNG to {}", args.png)
+    return 0
+
+
+def _measure_eval_main(argv: Sequence[str]) -> int:
     """Run measure and/or eval per the skip flags; write outputs; return an exit code."""
     args = _build_parser().parse_args(argv)
     if args.skip_measure and args.skip_eval:

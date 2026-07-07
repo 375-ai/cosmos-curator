@@ -123,6 +123,7 @@ pytest-mock = "*"
 safetensors = "*"
 
 [feature.dev.pypi-dependencies]
+matplotlib = "*"
 mypy = "==2.1.0"
 openai = "*"
 pandas-stubs = "*"
