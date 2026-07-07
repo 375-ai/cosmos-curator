@@ -145,6 +145,7 @@ def test_report_metrics_happy_path(  # noqa: PLR0913
     test_input_path = "s3://bucket/input"
     test_output_path = "s3://bucket/output"
     test_vllm_sampling_temperature = 0.01
+    test_xenna_streaming_scheduler = "FRAGMENTATION_BASED"
     test_kratos_metrics_endpoint = "https://metrics.example.com"
     bearer_token = "test_token"  # noqa: S105
     test_kratos_secrets = KratosSecrets(api_key="test_api", bearer_token=bearer_token)
@@ -172,6 +173,7 @@ def test_report_metrics_happy_path(  # noqa: PLR0913
         "input_path": test_input_path,
         "output_path": test_output_path,
         "vllm_sampling_temperature": test_vllm_sampling_temperature,
+        "xenna_streaming_scheduler": test_xenna_streaming_scheduler,
     }
     expected_summary_metrics = {**test_summary_metrics, **test_caption_quality_metrics, **test_metrics_metadata}
     test_cloudevent = {"specversion": "1.0", "data": test_summary_metrics}

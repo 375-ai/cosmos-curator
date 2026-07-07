@@ -31,6 +31,7 @@ from cosmos_curator.client.nvcf_cli.ncf.launcher.nvcf_function import NvcfFuncti
 
 # Qwen's default temp is 0.000001
 DEFAULT_BENCHMARK_VLLM_SAMPLING_TEMPERATURE = 0.000001
+XENNA_STREAMING_SCHEDULER_CHOICES = ("FRAGMENTATION_BASED", "SATURATION_AWARE")
 
 
 class RetryableBenchmarkAttemptError(RuntimeError):
@@ -359,6 +360,7 @@ def nvcf_split_benchmark(  # noqa: PLR0913
     report_metrics_to_kratos: bool,
     vllm_sampling_temperature: float,
     vllm_use_inflight_batching: bool,
+    xenna_streaming_scheduler: str,
 ) -> None:
     """Run benchmark tests."""
     nvcf_function = NvcfFunction(
@@ -396,6 +398,7 @@ def nvcf_split_benchmark(  # noqa: PLR0913
             "qwen_use_fp8_weights": qwen_use_fp8_weights,
             "vllm_sampling_temperature": vllm_sampling_temperature,
             "vllm_use_inflight_batching": vllm_use_inflight_batching,
+            "xenna_streaming_scheduler": xenna_streaming_scheduler,
         }
     )
 
@@ -496,6 +499,7 @@ aws_region = {s3_secrets.aws_region}
                 "input_path": s3_input_prefix,
                 "output_path": s3_output_prefix,
                 "vllm_sampling_temperature": vllm_sampling_temperature,
+                "xenna_streaming_scheduler": xenna_streaming_scheduler,
             },
             kratos_secrets=kratos_secrets,
             kratos_metrics_endpoint=kratos_metrics_endpoint,
@@ -634,6 +638,14 @@ def _parse_args() -> argparse.Namespace:
         help="Temperature for vLLM sampling in benchmark invoke args.",
     )
     parser.add_argument(
+        "--xenna-streaming-scheduler",
+        type=str,
+        required=False,
+        default="FRAGMENTATION_BASED",
+        choices=XENNA_STREAMING_SCHEDULER_CHOICES,
+        help="Xenna streaming scheduler to use in benchmark invoke args.",
+    )
+    parser.add_argument(
         "--max-attempts",
         type=int,
         required=False,
@@ -731,6 +743,7 @@ def main() -> None:
         qwen_use_fp8_weights=args.qwen_use_fp8_weights,
         vllm_sampling_temperature=args.vllm_sampling_temperature,
         vllm_use_inflight_batching=args.vllm_use_inflight_batching,
+        xenna_streaming_scheduler=args.xenna_streaming_scheduler,
     )
 
 

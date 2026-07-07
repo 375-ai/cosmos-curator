@@ -67,6 +67,10 @@ vllm_sampling_temperature_args=()
 if [[ -n "${VLLM_SAMPLING_TEMPERATURE:-}" ]]; then
   vllm_sampling_temperature_args=(--vllm-sampling-temperature "${VLLM_SAMPLING_TEMPERATURE}")
 fi
+xenna_streaming_scheduler_args=()
+if [[ -n "${NVCF_SPLIT_BENCHMARK_XENNA_STREAMING_SCHEDULER:-}" ]]; then
+  xenna_streaming_scheduler_args=(--xenna-streaming-scheduler "${NVCF_SPLIT_BENCHMARK_XENNA_STREAMING_SCHEDULER}")
+fi
 IFS=', ' read -ra _caption_list        <<< "${NVCF_SPLIT_BENCHMARK_CAPTIONS:-${CAPTION:-1}}"
 IFS=', ' read -ra _captioning_algorithm_list <<< "${NVCF_SPLIT_BENCHMARK_MODELS:-qwen}"
 IFS=', ' read -ra _num_nodes_list      <<< "${NVCF_SPLIT_BENCHMARK_NUM_NODES:-${NUM_NODES_LIST:-4 2}}"
@@ -107,6 +111,7 @@ for captioning_algorithm in "${_captioning_algorithm_list[@]}"; do
           --gpus-per-node 8 \
           --max-concurrency 2 \
           "${vllm_sampling_temperature_args[@]}" \
+          "${xenna_streaming_scheduler_args[@]}" \
           --kratos-metrics-endpoint "${PERF_KRATOS_METRICS_ENDPOINT}" \
           --kratos-bearer-url "${PERF_KRATOS_BEARER_URL}" \
           --limit "${LIMIT_INPUT_VIDEOS}" \
