@@ -79,7 +79,7 @@ _MOCK_HOOK_PATH = "cosmos_curator.core.utils.infra.ray_cluster_utils.register_pr
 
 
 @pytest.fixture(autouse=True)
-def _clean_staging_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+def _clean_staging_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None]:
     """Ensure COSMOS_CURATOR_ARTIFACTS_STAGING_DIR is clean before each test.
 
     After the test, clean up any staging directories that were created.

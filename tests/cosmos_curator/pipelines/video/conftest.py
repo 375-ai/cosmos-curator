@@ -89,7 +89,7 @@ def sample_splitting_task(sample_video_data: bytes) -> SplitPipeTask:
 
 
 @pytest.fixture(autouse=True)
-def mock_get_tmp_dir(tmp_path: Path) -> Generator[None, None, None]:
+def mock_get_tmp_dir(tmp_path: Path) -> Generator[None]:
     """Automatically mock get_tmp_dir to use pytest's tmp_path for all tests.
 
     This prevents permission errors when tests try to create temp files in

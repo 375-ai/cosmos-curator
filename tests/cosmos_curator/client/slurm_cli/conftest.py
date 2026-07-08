@@ -21,7 +21,7 @@ import pytest
 
 
 @pytest.fixture(scope="session", autouse=True)
-def mock_connection() -> Generator[Mock, None, None]:
+def mock_connection() -> Generator[Mock]:
     """Mock fabric module before it's imported anywhere."""
     with pytest.MonkeyPatch.context() as mp:
         mock = Mock()

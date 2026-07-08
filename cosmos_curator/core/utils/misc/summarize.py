@@ -58,7 +58,7 @@ def attrs_to_df(objects: Iterable[Any], *, flatten: bool = False) -> pd.DataFram
 
 
 @contextlib.contextmanager
-def turn_off_pandas_display_limits() -> Generator[None, None, None]:
+def turn_off_pandas_display_limits() -> Generator[None]:
     """Temporarily disable pandas display limits.
 
     This context manager turns off limitations on the number of displayed rows and columns,
@@ -83,7 +83,7 @@ def turn_off_pandas_display_limits() -> Generator[None, None, None]:
 
 
 @contextlib.contextmanager
-def turn_off_numpy_display_limits() -> Generator[None, None, None]:
+def turn_off_numpy_display_limits() -> Generator[None]:
     """Context manager to temporarily set NumPy print options to print the full array."""
     original_options = np.get_printoptions()
     npmax = np.iinfo(np.int32).max

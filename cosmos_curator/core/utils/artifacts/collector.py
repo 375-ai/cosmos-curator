@@ -395,7 +395,7 @@ class _NodeCollector:
         staging_dir: str,
         chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
         **_ray_kwargs: object,
-    ) -> Generator[_FileChunk, None, None]:
+    ) -> Generator[_FileChunk]:
         """Yield ``_FileChunk`` objects for each file under *staging_dir*.
 
         This is a streaming generator method.  Ray detects the

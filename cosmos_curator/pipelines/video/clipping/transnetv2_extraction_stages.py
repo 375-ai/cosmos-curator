@@ -225,7 +225,7 @@ class TransNetV2ClipExtractionStage(CuratorStage):
 
 def _get_batches(
     frames: npt.NDArray[np.uint8],
-) -> Generator[npt.NDArray[np.uint8], None, None]:
+) -> Generator[npt.NDArray[np.uint8]]:
     """We fetch 100 frames, and pad the first and last batches accordingly with the first or last frame."""
     total_frames = len(frames)
     twentyfive: int = 25

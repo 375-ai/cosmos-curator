@@ -203,7 +203,7 @@ class CameraSensor:
         self,
         spec: SamplingSpec,
         stats: dict[str, float] | None = None,
-    ) -> Generator[CameraData, None, None]:
+    ) -> Generator[CameraData]:
         """Sample camera frames according to the provided ``SamplingSpec``.
 
         Each yielded batch follows the sampling-grid half-open interval

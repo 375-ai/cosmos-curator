@@ -218,7 +218,7 @@ def _uninstall_s3_hook(s3_client: Any, hook: Any) -> None:  # noqa: ANN401
 
 
 @contextmanager
-def _open_measured_source(args: argparse.Namespace, stats: IOStats) -> Generator[DataSource, None, None]:
+def _open_measured_source(args: argparse.Namespace, stats: IOStats) -> Generator[DataSource]:
     """Open ``args.source`` for measurement and yield a counting ``DataSource``.
 
     For ``s3://`` sources: builds a boto3 S3 client, attaches the

@@ -133,7 +133,7 @@ class NvcfFunction(NvcfHelper):
     @contextmanager
     def deploy(  # noqa: PLR0913
         self, backend: str, gpu: str, instance_type: str, deploy_config: Path, num_nodes: int, max_concurrency: int
-    ) -> Generator[None, None, None]:
+    ) -> Generator[None]:
         """Deploy function as a context manager, undeploy on context manager exit.
 
         Args:

@@ -468,7 +468,7 @@ def composite_profiling_scope(
     *,
     stage_name: str = "_root",
     label: str = "main",
-) -> Generator[argparse.Namespace, None, None]:
+) -> Generator[argparse.Namespace]:
     """Enter :func:`~cosmos_curator.core.utils.infra.profiling.profiling_scope` with a flat namespace from *settings*.
 
     Builds the flat namespace via :func:`composite_to_namespace`, then syncs ``settings.common``

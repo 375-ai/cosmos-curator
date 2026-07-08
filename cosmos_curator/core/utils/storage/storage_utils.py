@@ -1004,7 +1004,7 @@ class StorageWriter:
         *,
         mode: str = "w",
         encoding: str | None = "utf-8",
-    ) -> Generator[IO[Any], None, None]:
+    ) -> Generator[IO[Any]]:
         """Context manager: write to a file-like object, close on exit.
 
         Resolves a local path via :meth:`resolve_path`, opens it for

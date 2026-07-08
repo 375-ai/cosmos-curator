@@ -72,7 +72,7 @@ def open_file(src: DataSource, mode: Literal["rb", "wb"] = "rb") -> BinaryIO:
 
 
 @contextmanager
-def open_data_source(src: DataSource, mode: Literal["rb", "wb"] = "rb") -> Generator[BinaryIO, None, None]:
+def open_data_source(src: DataSource, mode: Literal["rb", "wb"] = "rb") -> Generator[BinaryIO]:
     """Yield a binary stream for ``src``, owning or borrowing as appropriate.
 
     For ``Path`` and ``bytes`` inputs, delegates to :func:`open_file` and

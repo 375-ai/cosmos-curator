@@ -23,9 +23,9 @@ authors = [
 ]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-# For image builds, pixi explicitly requests 3.12.13 to avoid bundling CVEs
-# For local development, accept what is still usable
-requires-python = ">=3.12,<3.13"
+# Pixi environments pin Python 3.13; package metadata still allows existing
+# Python 3.12 host-side CLI environments until compatibility actually breaks.
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "attrs",
     "click>=8.4.1",
@@ -49,6 +49,7 @@ dependencies = [
 ]
 classifiers = [
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Operating System :: OS Independent",
     "Intended Audience :: Developers",
     "Intended Audience :: Information Technology",
@@ -92,7 +93,7 @@ omit = [
 ]
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 line-length = 120
 indent-width = 4
 exclude = [
@@ -132,7 +133,7 @@ no_implicit_optional = true
 no_implicit_reexport = true
 strict_equality = true
 strict_optional = true
-python_version = '3.12'
+python_version = '3.13'
 warn_no_return = true
 warn_redundant_casts = true
 warn_return_any = true

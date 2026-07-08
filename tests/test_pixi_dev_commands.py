@@ -72,7 +72,7 @@ def test_workspace_default_feature_is_cross_platform_minimal() -> None:
         {"name": "linux-64-cuda", "platform": "linux-64", "cuda": "13.0.2", "glibc": "2.35"},
         {"name": "linux-aarch64-cuda", "platform": "linux-aarch64", "cuda": "13.0.2", "glibc": "2.35"},
     ]
-    assert pixi_config["dependencies"] == {"python": ">=3.12.13,<3.13", "pip": "*"}
+    assert pixi_config["dependencies"] == {"python": "==3.13.14", "pip": "*"}
     assert "pypi-dependencies" not in pixi_config
     assert "nvidia" not in pixi_config["workspace"]["channels"]
     assert pixi_config["feature"]["linux"]["platforms"] == ["linux-64", "linux-aarch64"]

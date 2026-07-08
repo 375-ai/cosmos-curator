@@ -91,7 +91,7 @@ def _ensure_valid_otel_provider() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _hide_greenlet() -> Generator[None, None, None]:
+def _hide_greenlet() -> Generator[None]:
     """Temporarily hide greenlet from ``sys.modules`` during each test.
 
     When the full test suite runs, earlier test files can import libraries that

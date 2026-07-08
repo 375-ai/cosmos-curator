@@ -232,7 +232,7 @@ def open_cloud_source(
     azure_client: BlobServiceClient | None = None,
     s3_profile_name: str | None = None,
     azure_profile_name: str = "default",
-) -> Generator[BinaryIO, None, None]:
+) -> Generator[BinaryIO]:
     """Open an ``s3://`` or ``az://`` URI as a seekable :class:`BinaryIO`.
 
     If a pre-built SDK client is supplied via ``s3_client`` / ``azure_client``

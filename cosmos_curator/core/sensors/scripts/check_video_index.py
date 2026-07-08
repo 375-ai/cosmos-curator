@@ -180,7 +180,7 @@ def _open_source(
     *,
     s3_profile_name: str | None,
     azure_profile_name: str,
-) -> Generator[pathlib.Path | BinaryIO, None, None]:
+) -> Generator[pathlib.Path | BinaryIO]:
     """Yield a per-phase source — a :class:`Path` locally, a fresh :class:`BinaryIO` for cloud URIs.
 
     Used per phase (FROM_HEADER then FULL_DEMUX) so each phase gets its own

@@ -93,7 +93,7 @@ def _group_samples_by_size(
     *,
     drop_small_shards: bool,
     min_clips_per_tar: int = MIN_CLIPS_PER_TAR_DEFAULT,
-) -> Generator[list[ClipSample], None, None]:
+) -> Generator[list[ClipSample]]:
     current_size = 0
     out: list[ClipSample] = []
 

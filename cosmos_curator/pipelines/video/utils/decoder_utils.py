@@ -215,7 +215,7 @@ def _make_video_stream(
 
 
 @contextmanager
-def save_stream_position(stream: str | BinaryIO) -> Generator[str | BinaryIO, None, None]:
+def save_stream_position(stream: str | BinaryIO) -> Generator[str | BinaryIO]:
     """Context manager that saves and restores stream position (no-op for string paths)."""
     if isinstance(stream, str):
         yield stream

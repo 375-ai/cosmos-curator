@@ -39,7 +39,7 @@ def split_by_chunk_size[T](
     custom_size_func: typing.Callable[[T], int] = lambda x: 1,  # noqa: ARG005
     *,
     drop_incomplete_chunk: bool = False,
-) -> Generator[list[T], None, None]:
+) -> Generator[list[T]]:
     """Split an iterable into chunks of the specified size.
 
     Args:
@@ -66,7 +66,7 @@ def split_by_chunk_size[T](
         yield out
 
 
-def split_into_n_chunks[T](iterable: Iterable[T], num_chunks: int) -> Generator[list[T], None, None]:
+def split_into_n_chunks[T](iterable: Iterable[T], num_chunks: int) -> Generator[list[T]]:
     """Split an iterable into a specified number of chunks.
 
     Args:

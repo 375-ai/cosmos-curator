@@ -275,7 +275,7 @@ class McapCameraSensor:
             metadata=self.video_metadata,
         )
 
-    def sample(self, spec: SamplingSpec) -> Generator[CameraData, None, None]:
+    def sample(self, spec: SamplingSpec) -> Generator[CameraData]:
         """Sample camera frames according to the provided ``SamplingSpec``.
 
         Each yielded batch follows the sampling-grid half-open interval

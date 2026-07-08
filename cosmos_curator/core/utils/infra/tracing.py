@@ -505,7 +505,7 @@ def traced_span(
     name: str,
     *,
     attributes: dict[str, SpanAttributeValue] | None = None,
-) -> Generator[TracedSpan, None, None]:
+) -> Generator[TracedSpan]:
     """Create an OpenTelemetry child span as a context manager.
 
     **When to use**: for a span around a **subset** of a function, or
@@ -581,7 +581,7 @@ def trace_root_anchor(
     name: str,
     *,
     attributes: dict[str, SpanAttributeValue] | None = None,
-) -> Generator[TracedSpan, None, None]:
+) -> Generator[TracedSpan]:
     """Create a short-lived root span whose context outlives the span itself.
 
     **Internal API** -- called by ``profiling_scope()`` in the pipeline

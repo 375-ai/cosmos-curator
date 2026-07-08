@@ -88,7 +88,7 @@ def _reset_otel_provider_guard() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_tracing_singleton() -> Generator[None, None, None]:
+def _reset_tracing_singleton() -> Generator[None]:
     """Reset the module-level _current_backend before each test.
 
     This prevents cross-test pollution from setup_tracing() which sets
@@ -101,7 +101,7 @@ def _reset_tracing_singleton() -> Generator[None, None, None]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_tracer_provider() -> Generator[None, None, None]:
+def _reset_tracer_provider() -> Generator[None]:
     """Reset the global OTel TracerProvider before and after each test.
 
     Ensures each test starts with a fresh SDK provider (avoiding the

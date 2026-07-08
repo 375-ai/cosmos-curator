@@ -50,7 +50,7 @@ class _FakeSensor:
     def end_ns(self) -> int:
         return int(self._ts[-1])
 
-    def sample(self, spec: SamplingSpec) -> Generator[_FakeSensorData, None, None]:
+    def sample(self, spec: SamplingSpec) -> Generator[_FakeSensorData]:
         empty = np.empty(0, dtype=np.int64)
         for window in spec.grid:
             if len(window) == 0:
@@ -87,7 +87,7 @@ class _FixedWindowSensor:
     def end_ns(self) -> int:
         return self._end_ns
 
-    def sample(self, spec: SamplingSpec) -> Generator[_FakeSensorData, None, None]:
+    def sample(self, spec: SamplingSpec) -> Generator[_FakeSensorData]:
         empty = np.empty(0, dtype=np.int64)
         for window, sensor_timestamps_ns in zip(spec.grid, self._samples, strict=True):
             if len(sensor_timestamps_ns) == 0:

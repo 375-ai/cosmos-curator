@@ -23,7 +23,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def mock_get_tmp_dir(tmp_path: Path) -> Generator[None, None, None]:
+def mock_get_tmp_dir(tmp_path: Path) -> Generator[None]:
     """Redirect ``get_tmp_dir`` to pytest's ``tmp_path``.
 
     The default ``/config/tmp`` is not writable in CI/CD environments. This

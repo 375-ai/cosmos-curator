@@ -114,7 +114,7 @@ def _resolve_source(args: argparse.Namespace) -> tuple[str, SourceFactory]:
         azure_profile_name = args.azure_profile_name
 
         @contextmanager
-        def factory() -> Generator[DataSource, None, None]:
+        def factory() -> Generator[DataSource]:
             with open_cloud_source(
                 source_str,
                 s3_profile_name=s3_profile_name,
@@ -127,7 +127,7 @@ def _resolve_source(args: argparse.Namespace) -> tuple[str, SourceFactory]:
     local_path = Path(source_str)
 
     @contextmanager
-    def local_factory() -> Generator[DataSource, None, None]:
+    def local_factory() -> Generator[DataSource]:
         yield local_path
 
     return source_str, local_factory

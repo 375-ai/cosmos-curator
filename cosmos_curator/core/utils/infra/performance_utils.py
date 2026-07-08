@@ -261,7 +261,7 @@ class StageTimer:
         )
 
     @contextlib.contextmanager
-    def time_process(self, num_samples: int = 1, source_video_duration_s: float = 0) -> Generator[None, None, None]:
+    def time_process(self, num_samples: int = 1, source_video_duration_s: float = 0) -> Generator[None]:
         """Time the process of the stage.
 
         When OTel tracing is active, creates a child span

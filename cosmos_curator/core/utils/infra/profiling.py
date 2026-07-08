@@ -903,7 +903,7 @@ class _ProfilingState:
             self._cpu.stop_on_error()
 
     @contextlib.contextmanager
-    def scope(self, label: str = "process_data") -> Generator[None, None, None]:
+    def scope(self, label: str = "process_data") -> Generator[None]:
         """Context manager that brackets a block with start/stop.
 
         Wraps the block in an OTel span ``"{stage_name}.{label}"`` so
@@ -1303,7 +1303,7 @@ def profiling_scope(
     *,
     stage_name: str = "_root",
     label: str = "main",
-) -> Generator[None, None, None]:
+) -> Generator[None]:
     r"""Context manager that profiles the wrapped block.
 
     Builds a ``ProfilingConfig`` from *args* via

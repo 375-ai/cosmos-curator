@@ -161,7 +161,7 @@ class CpuVideoDecoder:
         stream_idx: int = 0,
         config: CpuVideoDecodeConfig | None = None,
         stats: dict[str, float] | None = None,
-    ) -> Generator[Self, None, None]:
+    ) -> Generator[Self]:
         """Open a CPU decoder session that owns the underlying video source.
 
         The returned session owns the source/container/stream lifetime for the
@@ -447,7 +447,7 @@ class GpuVideoDecoder:
         stream_idx: int = 0,
         config: GpuVideoDecodeConfig | None = None,
         stats: dict[str, float] | None = None,
-    ) -> Generator["GpuVideoDecoder", None, None]:
+    ) -> Generator["GpuVideoDecoder"]:
         """Open a decoder session that owns the underlying video source."""
         with (
             open_data_source(source, mode="rb") as stream,
@@ -510,7 +510,7 @@ def open_video_container(
     stream: BinaryIO,
     stream_idx: int = 0,
     video_format: str | None = None,
-) -> Generator[tuple[InputContainer, av.video.stream.VideoStream], None, None]:
+) -> Generator[tuple[InputContainer, av.video.stream.VideoStream]]:
     """Context manager for an already-open binary stream containing video data.
 
     This provides a common pattern for opening video containers and extracting

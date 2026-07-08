@@ -99,7 +99,7 @@ def _reset_otel_provider_guard() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _ensure_valid_otel_provider() -> Generator[None, None, None]:
+def _ensure_valid_otel_provider() -> Generator[None]:
     """Ensure every test starts with a valid (non-recursive) TracerProvider.
 
     After the test, sets a fresh no-op TracerProvider to prevent

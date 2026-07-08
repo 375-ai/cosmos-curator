@@ -64,7 +64,7 @@ def make_temporary_dir(
     prefix: str | None = None,
     target_dir: pathlib.Path | None = None,
     delete: bool = True,
-) -> Generator[pathlib.Path, None, None]:
+) -> Generator[pathlib.Path]:
     """Context manager to create a temporary directory.
 
     Args:
@@ -96,7 +96,7 @@ def make_named_temporary_file(
     suffix: str | None = None,
     delete: bool = True,
     target_dir: pathlib.Path | None = None,
-) -> Generator[pathlib.Path, None, None]:
+) -> Generator[pathlib.Path]:
     """Context manager to create a named temporary file.
 
     Args:
@@ -119,7 +119,7 @@ def make_named_temporary_file(
 @contextlib.contextmanager
 def make_pipeline_temporary_dir(
     sub_dir: str | None = None,
-) -> Generator[pathlib.Path, None, None]:
+) -> Generator[pathlib.Path]:
     """Context manager to create a temporary directory for pipelines."""
     if sub_dir is not None:
         target_dir = get_tmp_dir() / pathlib.Path("ray_pipeline") / pathlib.Path(sub_dir)
@@ -134,7 +134,7 @@ def make_pipeline_temporary_dir(
 def make_pipeline_named_temporary_file(
     sub_dir: str | None = None,
     suffix: str | None = None,
-) -> Generator[pathlib.Path, None, None]:
+) -> Generator[pathlib.Path]:
     """Context manager to create a named temporary file for pipelines."""
     if sub_dir is not None:
         target_dir = get_tmp_dir() / pathlib.Path("ray_pipeline") / pathlib.Path(sub_dir)

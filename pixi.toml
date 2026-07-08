@@ -15,7 +15,7 @@ version = "1.0.0"
 PYTHONNOUSERSITE = "1"  # isolate pixi environments from user/system site-packages
 
 [dependencies]
-python = ">=3.12.13,<3.13"
+python = "==3.13.14"
 pip = "*"
 
 [feature.linux]

@@ -85,7 +85,7 @@ class ImageSensor:
         """Return the latest sensor timestamp."""
         return int(self.sensor_timestamps_ns[-1])
 
-    def sample(self, spec: SamplingSpec) -> Generator[ImageData, None, None]:
+    def sample(self, spec: SamplingSpec) -> Generator[ImageData]:
         """Yield sampled ``ImageData`` batches for each window in ``spec.grid``."""
         for window in spec.grid:
             if len(window) == 0:

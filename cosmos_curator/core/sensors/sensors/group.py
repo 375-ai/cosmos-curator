@@ -42,7 +42,7 @@ class Sensor(Protocol):  # pragma: no cover
         """Latest sensor timestamp in nanoseconds."""
         ...
 
-    def sample(self, spec: SamplingSpec) -> Generator[SensorData, None, None]:
+    def sample(self, spec: SamplingSpec) -> Generator[SensorData]:
         """Yield one ``SensorData`` per window in ``spec.grid``."""
         ...
 
@@ -122,7 +122,7 @@ class SensorGroup:
         """Maximum ``end_ns`` across all sensors."""
         return max(s.end_ns for s in self._sensors.values())
 
-    def sample(self, spec: SamplingSpec) -> Generator[AlignedFrame, None, None]:
+    def sample(self, spec: SamplingSpec) -> Generator[AlignedFrame]:
         """Yield one ``AlignedFrame`` per window in ``spec.grid``.
 
         All sensor generators are started with the same ``spec`` and advanced
