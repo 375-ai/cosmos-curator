@@ -194,13 +194,18 @@ def gpu_stage_startup(
 
 
 def gpu_stage_cleanup(stage_name: str) -> None:
-    """Clean up a stage worker.
+    """Release GPU resources at the end of a stage worker's life.
 
-    Args:
-        stage_name: The name of the stage.
-
+    Drops Python refs and flushes torch's caching allocator so the driver can
+    reclaim device memory when the worker process exits.
     """
     logger.info(f"Cleanup {stage_name} worker (pid={os.getpid()})")
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()  # type: ignore[no-untyped-call]
+        except Exception:  # noqa: BLE001
+            logger.exception(f"{stage_name}: torch CUDA cleanup failed")
     _dump_gpu_info(stage_name, "cleanup")

@@ -87,6 +87,7 @@ DEBUG TIP: Set breakpoint in vllm_caption() and step through for complete flow
 import asyncio
 import contextlib
 import json
+import os
 import secrets
 from collections import deque
 from collections.abc import Callable
@@ -141,6 +142,19 @@ from cosmos_curator.pipelines.video.utils.data_model import (
 
 if TYPE_CHECKING:
     from vllm.v1.engine.async_llm import AsyncLLM
+
+# Silence per-call transformers logger warnings (notably the transformers v5
+# ``processor_kwargs`` message that fires from vLLM's Qwen2.5-VL / VllmPrepStage
+# preprocessing every batch). These come from ``transformers.utils.logging``
+# (``logger.warning(...)``), not Python's ``warnings`` module, so
+# ``PYTHONWARNINGS`` / ``warnings.filterwarnings`` do nothing. Two layers cover
+# every actor/subprocess: the env var is read at transformers import time (so
+# vLLM's spawned ``EngineCore`` picks it up), and the explicit setter handles
+# the current interpreter where transformers is already imported above.
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+from transformers.utils.logging import set_verbosity_error as _hf_set_verbosity_error
+
+_hf_set_verbosity_error()  # type: ignore[no-untyped-call]
 
 # Add new vLLM plugins to _VLLM_PLUGINS
 _VLLM_PLUGINS = {

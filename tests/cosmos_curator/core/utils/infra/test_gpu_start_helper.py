@@ -183,8 +183,8 @@ class TestGpuStageStartupRetryLoop:
         assert fast_sleep.call_count == gpu_start_helper._START_UP_RETRIES
         # Each sleep should use the configured interval; pinning this stops a
         # silent regression to the legacy ``120s`` value.
-        for call in fast_sleep.call_args_list:
-            assert call.args == (gpu_start_helper._START_UP_RETRY_INTERVAL_S,)
+        for sleep_call in fast_sleep.call_args_list:
+            assert sleep_call.args == (gpu_start_helper._START_UP_RETRY_INTERVAL_S,)
 
     def test_eventually_clean_gpu_does_not_raise(
         self,

@@ -109,25 +109,19 @@ if pixi_utils.is_running_in_env("default"):
 
 T = TypeVar("T", bound=PipelineTask)
 
-# Minimum free-memory fraction the GPU must have at stage startup.
-# Set 0.95 so up to ~9 GiB of residual on a 184 GiB GB200 (or ~4 GiB on an
-# 80 GiB H100) is tolerated before ``GpuNotCleanError`` is raised. Was 0.98,
-# but field experience showed lingering vLLM EngineCore teardown leaves
-# ~6-8 GiB resident for several minutes after SIGKILL, which exhausted the
-# retry budget on the same placement and caused otherwise-usable GPUs to be
-# dropped from the autoscaler pool. This threshold is still well above
-# ``gpu_memory_utilization`` (0.85 for Qwen variants), so any GPU we admit
-# here still has comfortable headroom for the downstream vLLM allocator.
-_VLLM_REQUIRED_FREE_FRACTION = 0.95
+# Minimum free-memory fraction required at stage startup. 0.90 tolerates up
+# to ~18 GiB residual on a 184 GiB GB200 while keeping a 5-point margin over
+# ``gpu_memory_utilization=0.85``. Progression: 0.98 -> 0.95 -> 0.90.
+_VLLM_REQUIRED_FREE_FRACTION = 0.90
 
-# How long ``destroy()`` waits for vLLM child processes to exit after SIGTERM
-# before escalating to SIGKILL. 30 s gives vLLM v1 enough time to release the
-# model weights and call its own shutdown path even when interrupted during a
-# long model-load or torch.compile pass.
-# The cost of the larger window is bounded: it only applies to workers that
-# ignored SIGTERM. If we exceed a SIGTERM timeout, we may leak GPU memory when
-# SIGKILL is sent.
-_VLLM_SIGTERM_GRACE_S = 30.0
+# Window for vLLM's own ``LLMEngine.shutdown()`` (triggered by ``LLM.__del__``)
+# to drain VllmWorker via its internal IPC protocol - the only teardown path
+# that reliably releases the worker's ~30-50 GiB CUDA context.
+_VLLM_GRACEFUL_SHUTDOWN_S = 20.0
+
+# Safety-net SIGTERM grace before SIGKILL for children that survived vLLM's
+# internal shutdown. Anything that reaches SIGKILL here is expected to leak.
+_VLLM_SIGTERM_GRACE_S = 10.0
 
 # How often the background watchdog polls for ``VLLM::EngineCore`` subprocess
 # liveness. The watchdog exists to catch the case where EngineCore exits cleanly
@@ -644,49 +638,55 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
     def destroy(self) -> None:
         """Release vLLM and GPU resources before the actor exits.
 
-        Invoked by ``StageWorker.shutdown`` while the actor still has a live Python
-        interpreter and the right conda env. The vLLM v1 ``EngineCore`` is a separate
-        subprocess: if we let ``ray.kill()`` SIGKILL the actor without first stopping
-        EngineCore, the orphan subprocess leaks its ~168 GiB CUDA context as a ghost
-        allocation that no later actor can dislodge (the leak persists until driver
-        reset). To prevent that we:
-
-          1. Send SIGTERM to all child processes (vLLM EngineCore + IPC helpers) and
-             wait briefly for graceful exit, then SIGKILL any holdouts. This unblocks
-             any in-flight RPC the processor thread may be wedged in.
-          2. Drop our Python references to the vLLM model so the wrapper's __del__
-             chain can run.
-          3. ``gc.collect()`` + ``torch.cuda.empty_cache()`` to release the worker
-             actor's own CUDA context.
-          4. Re-dump GPU info so the post-teardown memory state is visible in the log
-             (useful for diagnosing future leaks).
-
-        Safe to call when ``stage_setup`` did not complete or was never called.
+        Order matters: drop ``self._llm`` first so vLLM's internal
+        ``LLMEngine.shutdown()`` can drain VllmWorker via IPC (the only path
+        that releases its CUDA context); SIGTERM/SIGKILL are last-resort
+        fallbacks. Safe to call when ``stage_setup`` never ran.
         """
         start = time.monotonic()
-        # Stop the watchdog FIRST: ``_terminate_vllm_subprocesses`` is about to kill
-        # EngineCore intentionally, which would otherwise trigger the watchdog to call
-        # ``os._exit(1)`` mid-teardown and abort the clean shutdown.
+        # Stop the watchdog first so it doesn't ``os._exit(1)`` mid-teardown
+        # when the intentional subprocess exits below trigger its liveness check.
         self._stop_engine_core_watchdog()
-        self._terminate_vllm_subprocesses()
         self._drop_vllm_refs()
+        self._wait_for_vllm_children_exit(_VLLM_GRACEFUL_SHUTDOWN_S)
+        self._terminate_vllm_subprocesses()
         gpu_stage_cleanup(self.__class__.__name__)
         elapsed = time.monotonic() - start
         logger.info(f"VllmCaptionStage.destroy: completed in {elapsed:.1f}s")
 
+    def _wait_for_vllm_children_exit(self, timeout: float) -> None:
+        """Wait up to ``timeout`` seconds for vLLM subprocesses to exit on their own.
+
+        Called after ``_drop_vllm_refs`` so ``LLM.__del__`` -> ``LLMEngine.shutdown()``
+        has a bounded window to terminate VllmWorker via vLLM's IPC protocol.
+        """
+        try:
+            children = psutil.Process().children(recursive=True)
+        except psutil.NoSuchProcess:
+            return
+        if not children:
+            return
+        gone, alive = psutil.wait_procs(children, timeout=timeout)
+        if not alive:
+            logger.info(
+                f"VllmCaptionStage.destroy: all {len(gone)} vLLM child(ren) exited via "
+                f"internal shutdown within {timeout:.0f}s"
+            )
+        else:
+            alive_desc = []
+            for child in alive:
+                with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                    alive_desc.append(f"pid={child.pid} name={child.name()!r}")
+            logger.info(
+                f"VllmCaptionStage.destroy: {len(gone)}/{len(children)} child(ren) exited via "
+                f"vLLM shutdown; {len(alive)} survived and will be signaled: {alive_desc}"
+            )
+
     def _terminate_vllm_subprocesses(self) -> None:
-        """SIGTERM-then-SIGKILL all child processes owned by this actor.
+        """Safety-net SIGTERM-then-SIGKILL for children that survived graceful shutdown.
 
-        Targets vLLM v1's ``VLLM::EngineCore`` (the GPU-resident subprocess that holds
-        the model weights) and any helper Python workers it spawned. SIGTERM gives
-        vLLM a chance to call ``cudaDeviceReset`` and free its context; SIGKILL is the
-        fallback for processes that ignore SIGTERM. Ordering matters: we want context
-        released cleanly so no ghost memory is left on the GPU.
-
-        The SIGTERM grace is ``_VLLM_SIGTERM_GRACE_S`` (30 s by default). See the
-        constant's comment for the rationale; the short version is "long enough for
-        EngineCore to finish a mid-load shutdown so the CUDA context is dropped before
-        ``nvidia-persistenced`` pins it as a permanent orphan."
+        Normally a no-op after ``_wait_for_vllm_children_exit``. Anything reaching
+        SIGKILL here is expected to leak its CUDA context (warned below).
         """
         try:
             me = psutil.Process()
@@ -941,7 +941,10 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
 
         Used by the ``process_data`` retry path to recycle a vLLM engine that errored
         mid-flight. Reuses the same teardown as the shutdown path so the recycled
-        actor doesn't leak GPU memory between attempts.
+        actor doesn't leak GPU memory between attempts. ``gpu_stage_cleanup`` only
+        drops Python refs and empties torch's caching allocator (no
+        ``cudaDeviceReset()``), so torch's cached CUDA state stays valid and the
+        immediate ``stage_setup`` can rebuild vLLM cleanly in the same process.
         """
         self.destroy()
         self.stage_setup()
@@ -1118,6 +1121,18 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
             raise RuntimeError(msg)
         return str(text).strip()
 
+    def _require_ready(self) -> tuple["LLM", "SamplingParams", "AutoProcessor"]:
+        """Return the vLLM trio narrowed to non-None, or raise.
+
+        Called on every tenacity retry inside ``_vllm_caption`` so a retry after
+        ``_reset()`` picks up the rebuilt engine (or fails fast if
+        ``stage_setup()`` couldn't rebuild it).
+        """
+        if self._llm is None or self._sampling_params is None or self._processor is None:
+            msg = "vLLM engine unavailable (stage_setup not run or _reset rebuild failed)"
+            raise RuntimeError(msg)
+        return self._llm, self._sampling_params, self._processor
+
     @nvtx.annotate("VllmCaptionStage")  # type: ignore[untyped-decorator]
     def process_data(self, tasks: list[T]) -> list[T]:  # noqa: C901, PLR0915
         """Process the data for the vLLM caption stage.
@@ -1166,10 +1181,6 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
             msg = "Processor not initialized, call stage_setup() first"
             raise RuntimeError(msg)
 
-        llm = self._llm
-        sampling_params = self._sampling_params
-        processor = self._processor
-
         major_size = sum(task.get_major_size() for task in tasks)
         self._timer.reinit(self, major_size)
 
@@ -1181,6 +1192,11 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
         def _vllm_caption(
             model_inputs: list[dict[str, Any]], stage2_prompts: list[str | None]
         ) -> list["VllmWindowResult"]:
+            # Re-read the trio each attempt so a retry after ``_reset()`` sees the
+            # rebuilt engine instead of the destroyed one. ``self._*`` are the only
+            # long-lived refs, so ``self._llm = None`` in ``_drop_vllm_refs`` is enough
+            # to let ``LLM.__del__`` fire during ``destroy()``'s graceful-shutdown wait.
+            llm, sampling_params, processor = self._require_ready()
             try:
                 results = vllm_caption(
                     model_inputs,
@@ -1202,7 +1218,8 @@ class VllmCaptionStage(SingleInferenceCaptionStage):
                     video = get_video_from_task(task)
                     video.errors["captioning"] = f"vLLM captioning error: {e}"
 
-                # On retry: tear down and restart vllm
+                del llm, sampling_params, processor
+                e.__traceback__ = None
                 self._reset()
                 raise
             else:
