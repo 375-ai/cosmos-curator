@@ -488,7 +488,7 @@ to prefer that prefix. To use your own FFmpeg with a redistributable image, moun
 prefix over `/opt/ffmpeg`:
 
 ```bash
-USER_FFMPEG_PREFIX=/path/to/ffmpeg-8.1.1-custom
+USER_FFMPEG_PREFIX=/path/to/ffmpeg-8.1.2-custom
 
 cosmos-curator local launch \
     --image-name cosmos-curator --image-tag slim \
@@ -707,7 +707,7 @@ For a Slurm redistributable image, such as an NVIDIA-provided image imported fro
 FFmpeg prefix visible on the cluster and append a read-only mount before submitting the job:
 
 ```bash
-USER_FFMPEG_PREFIX="${SLURM_USER_DIR}/ffmpeg-8.1.1-custom"
+USER_FFMPEG_PREFIX="${SLURM_USER_DIR}/ffmpeg-8.1.2-custom"
 export CONTAINER_MOUNTS="${CONTAINER_MOUNTS:+${CONTAINER_MOUNTS},}${USER_FFMPEG_PREFIX}:/opt/ffmpeg:ro"
 ```
 

@@ -225,7 +225,7 @@ platforms = ["linux-64", "linux-aarch64"]
 channels = ["nvidia"]
 
 [feature.cuml.dependencies]
-cuml = "==26.02"
+cuml = "==26.04"
 raft-dask = "*"
 ```
 

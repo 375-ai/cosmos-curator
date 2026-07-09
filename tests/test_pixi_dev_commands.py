@@ -26,6 +26,7 @@ substitutes for running the commands themselves. They verify that:
 """
 
 import json
+import re
 import subprocess
 import sys
 import tomllib
@@ -202,7 +203,11 @@ def test_runtime_features_are_separated_from_core() -> None:
     assert media_feature["channels"] == ["conda-forge"]
     assert "platforms" not in media_feature
     assert media_dependencies["av"] == "==17.0.0"
-    assert media_dependencies["ffmpeg"] == {"version": ">=8.1.1,<9", "build": "lgpl_*"}
+    assert media_dependencies["ffmpeg"] == {"version": "==8.1.2", "build": "lgpl_*"}, (
+        "FFmpeg must stay exactly pinned to the LGPL build in pixi.toml. "
+        "When changing this version, keep pixi.toml [feature.media.dependencies.ffmpeg], "
+        "package/cosmos_curator/default.dockerfile.jinja2 ENV FFMPEG_VERSION, and pixi.lock in sync."
+    )
     for dependency_name in ("libopencv", "opencv", "py-opencv"):
         assert media_dependencies[dependency_name]["build"] == "headless_*"
 
@@ -280,11 +285,29 @@ def test_distributable_pixi_manifest_is_generated_runtime_subset() -> None:
 
 def test_media_policy_matches_root_and_distributable_locks() -> None:
     """Verify normal and redistributable locks keep distinct media policies."""
+    pixi_config = tomllib.loads(_read_repo_file("pixi.toml"))
+    dockerfile = _read_repo_file("package/cosmos_curator/default.dockerfile.jinja2")
     root_lock = _read_repo_file("pixi.lock")
     distributable_lock = _read_repo_file("distributable/pixi.lock")
+    ffmpeg_version = pixi_config["feature"]["media"]["dependencies"]["ffmpeg"]["version"].removeprefix("==")
+    dockerfile_match = re.search(r"^ENV FFMPEG_VERSION=([^\s]+)$", dockerfile, flags=re.MULTILINE)
 
-    assert "ffmpeg-8.1.2-lgpl_" in root_lock
-    assert "ffmpeg-8.1.2-gpl_" not in root_lock
+    assert dockerfile_match is not None, (
+        "Missing package/cosmos_curator/default.dockerfile.jinja2 ENV FFMPEG_VERSION; "
+        "keep it in sync with pixi.toml [feature.media.dependencies.ffmpeg]."
+    )
+    assert dockerfile_match.group(1) == ffmpeg_version, (
+        "FFmpeg versions are out of sync: update package/cosmos_curator/default.dockerfile.jinja2 "
+        "ENV FFMPEG_VERSION to match pixi.toml [feature.media.dependencies.ffmpeg]."
+    )
+    assert f"ffmpeg-{ffmpeg_version}-lgpl_" in root_lock, (
+        "pixi.lock does not contain the LGPL FFmpeg build matching pixi.toml. "
+        "Refresh pixi.lock after updating pixi.toml [feature.media.dependencies.ffmpeg]."
+    )
+    assert f"ffmpeg-{ffmpeg_version}-gpl_" not in root_lock, (
+        "pixi.lock contains the GPL FFmpeg build; keep media FFmpeg on the LGPL build in pixi.toml "
+        "and refresh pixi.lock."
+    )
     assert "opencv_python-" not in root_lock
     assert "av-17.0.0-cp" not in root_lock
 
@@ -305,7 +328,7 @@ def test_cuml_owns_rapids_channel() -> None:
     assert features["cuml"]["platforms"] == ["linux-64-cuda", "linux-aarch64-cuda"]
     assert "system-requirements" not in features["cuml"]
     assert pixi_config["environments"]["cuml"] == ["core", "cuml", "tracing"]
-    assert features["cuml"]["dependencies"]["cuml"] == "==26.02"
+    assert features["cuml"]["dependencies"]["cuml"] == "==26.04"
     assert "raft-dask" in features["cuml"]["dependencies"]
 
 
