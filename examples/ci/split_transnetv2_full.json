@@ -38,7 +38,6 @@
         "motion_per_patch_min_256_threshold": 0.000001,
         "motion_decode_target_fps": 2.0,
         "motion_decode_target_duration_ratio": 0.5,
-        "motion_decode_cpus_per_worker": 1.0,
         "motion_score_batch_size": 64,
         "motion_score_gpus_per_worker": 0.5,
         "clip_extraction_target_res": 224,

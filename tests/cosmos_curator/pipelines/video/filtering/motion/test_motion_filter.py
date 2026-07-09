@@ -12,13 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Functional test for motion vector decoding and motion filtering stages.
+"""Functional test for CameraSensor motion-vector export and motion filtering stages.
 
-This test verifies the motion vector decoding and filtering stages using a sample video.
-The expected motion score values were obtained by running the motion filter pipeline
-on the sample video (ForBiggerBlazes.mp4) and capturing the actual values produced.
-These values serve as a regression test to ensure the motion detection algorithm
-maintains consistency across code changes.
+Motion vectors are exported by the CameraSensor clip-extraction path (the sole source after
+CVC-1078) and scored by ``MotionFilterStage`` using a sample video. The expected motion score
+values were captured from the original (now removed) PyAV decode path; asserting the CameraSensor
+path reproduces them serves as both an equivalence anchor and a regression test to ensure the
+motion detection algorithm maintains consistency across code changes.
 """
 
 from uuid import uuid4
@@ -29,13 +29,16 @@ import pytest
 from cosmos_curator.core.interfaces.pipeline_interface import run_pipeline
 from cosmos_curator.core.interfaces.runner_interface import RunnerInterface
 from cosmos_curator.core.sensors.data.camera_data import MotionVectorData, MotionVectorFrameData
+from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import (
+    CameraSensorMotionVectorConfig,
+    ClipFrameExtractionStage,
+)
 from cosmos_curator.pipelines.video.filtering.motion.motion_builders import (
     MotionFilterConfig,
     build_motion_filter_stages,
 )
 from cosmos_curator.pipelines.video.filtering.motion.motion_filter_stages import (
     MotionFilterStage,
-    MotionVectorDecodeStage,
 )
 from cosmos_curator.pipelines.video.filtering.motion.motion_vector_backend import (
     sensor_motion_vector_data_to_legacy_matrices,
@@ -76,9 +79,9 @@ def test_sensor_motion_vector_data_to_legacy_matrices_projects_each_frame() -> N
     assert legacy_matrices[1].shape == (0, 11)
 
 
-def test_motion_filter_builder_camera_sensor_source_skips_decode_stage() -> None:
-    """Camera-sensor motion source should build only the scoring/filter stage."""
-    stages = build_motion_filter_stages(MotionFilterConfig(motion_vector_source="camera_sensor_clip"))
+def test_motion_filter_builder_builds_only_filter_stage() -> None:
+    """The builder should construct only the scoring/filter stage; motion vectors arrive upstream."""
+    stages = build_motion_filter_stages(MotionFilterConfig())
 
     assert len(stages) == 1
     assert isinstance(stages[0], MotionFilterStage)
@@ -107,14 +110,21 @@ def test_motion_filter_drops_extracted_frames_from_filtered_clips() -> None:
 
 
 @pytest.fixture
-def motion_decode_stage() -> MotionVectorDecodeStage:
-    """Fixture to create a motion vector decode stage.
+def camera_sensor_motion_stage() -> ClipFrameExtractionStage:
+    """Fixture to create the CameraSensor clip-extraction stage in motion-export mode.
+
+    This is the sole motion-vector source: it populates ``clip.decoded_motion_data`` from the
+    camera-sensor decode, replacing the removed ``MotionVectorDecodeStage``.
 
     Returns:
-        MotionVectorDecodeStage: Configured instance of the decode stage
+        ClipFrameExtractionStage: Extraction stage configured to export motion vectors only.
 
     """
-    return MotionVectorDecodeStage(num_cpus_per_worker=1.0, log_stats=True)
+    return ClipFrameExtractionStage(
+        target_fps=[],
+        motion_vectors=CameraSensorMotionVectorConfig(target_fps=2.0, target_duration_ratio=0.5),
+        log_stats=True,
+    )
 
 
 @pytest.fixture
@@ -134,21 +144,21 @@ def motion_filter_stage() -> MotionFilterStage:
 
 
 @pytest.mark.env("default")
-def test_motion_vector_decode(
-    motion_decode_stage: MotionVectorDecodeStage,
+def test_camera_sensor_motion_extraction(
+    camera_sensor_motion_stage: ClipFrameExtractionStage,
     sample_filtering_task: SplitPipeTask,
     sequential_runner: RunnerInterface,
 ) -> None:
-    """Test that motion vectors can be decoded from the sample video.
+    """Test that motion vectors are exported from the sample video via the CameraSensor path.
 
     Args:
-        motion_decode_stage: The decode stage to test
+        camera_sensor_motion_stage: The CameraSensor extraction stage to test
         sample_filtering_task: Sample task with video data
         sequential_runner: Sequential runner fixture
 
     """
     result_tasks: list[SplitPipeTask] = run_pipeline(
-        [sample_filtering_task], [motion_decode_stage], runner=sequential_runner
+        [sample_filtering_task], [camera_sensor_motion_stage], runner=sequential_runner
     )
 
     # Verify there's one task returned
@@ -166,26 +176,29 @@ def test_motion_vector_decode(
     assert len(clip.decoded_motion_data.frames) > 0
 
     # Verify stage performance stats were recorded
-    assert "MotionVectorDecodeStage" in result_task.stage_perf
+    assert "ClipFrameExtractionStage" in result_task.stage_perf
 
 
 @pytest.mark.env("default")
 def test_motion_filter_calculation(
-    motion_decode_stage: MotionVectorDecodeStage,
+    camera_sensor_motion_stage: ClipFrameExtractionStage,
     motion_filter_stage: MotionFilterStage,
     sample_filtering_task: SplitPipeTask,
     sequential_runner: RunnerInterface,
 ) -> None:
     """Test that motion scores are calculated correctly and filtering works as expected.
 
+    The golden scores were captured from the (removed) legacy PyAV decode path; asserting the
+    CameraSensor path reproduces them is the durable equivalence anchor for CVC-1078.
+
     Args:
-        motion_decode_stage: The decode stage to use
+        camera_sensor_motion_stage: The CameraSensor extraction stage to use
         motion_filter_stage: The filter stage to test
         sample_filtering_task: Sample task with video data
         sequential_runner: Sequential runner fixture
 
     """
-    stages = [motion_decode_stage, motion_filter_stage]
+    stages = [camera_sensor_motion_stage, motion_filter_stage]
     tasks_after_filter: list[SplitPipeTask] = run_pipeline([sample_filtering_task], stages, runner=sequential_runner)
 
     # Verify there's one task returned
@@ -228,7 +241,7 @@ def test_motion_filter_calculation(
     ],
 )
 def test_end_to_end_motion_processing(  # noqa: PLR0913 - parametrized test with multiple fixtures
-    motion_decode_stage: MotionVectorDecodeStage,
+    camera_sensor_motion_stage: ClipFrameExtractionStage,
     sample_filtering_task: SplitPipeTask,
     sequential_runner: RunnerInterface,
     global_threshold: float,
@@ -243,7 +256,7 @@ def test_end_to_end_motion_processing(  # noqa: PLR0913 - parametrized test with
     - When actual motion values are above the thresholds, the clip should be kept
 
     Args:
-        motion_decode_stage: The decode stage fixture
+        camera_sensor_motion_stage: The CameraSensor extraction stage fixture
         sample_filtering_task: The sample task fixture
         sequential_runner: Sequential runner fixture
         global_threshold: The global mean threshold to test
@@ -253,7 +266,7 @@ def test_end_to_end_motion_processing(  # noqa: PLR0913 - parametrized test with
     """
     # Instantiate a fresh filter stage with the desired thresholds
     stages = [
-        motion_decode_stage,
+        camera_sensor_motion_stage,
         MotionFilterStage(
             score_only=False,
             global_mean_threshold=global_threshold,
@@ -262,7 +275,7 @@ def test_end_to_end_motion_processing(  # noqa: PLR0913 - parametrized test with
         ),
     ]
 
-    # Run through decode and filter stages
+    # Run through extraction and filter stages
     tasks: list[SplitPipeTask] = run_pipeline([sample_filtering_task], stages, runner=sequential_runner)
 
     # Verify the result

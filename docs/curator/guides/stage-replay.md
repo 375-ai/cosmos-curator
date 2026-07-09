@@ -39,7 +39,7 @@ cosmos-curator local launch --curator-path . -- \
   pixi run --as-is python -m cosmos_curator.pipelines.video.splitting_pipeline \
   --input-video-path /path/to/videos \
   --output-clip-path /path/to/output \
-  --stage-save VllmCaptionStage,MotionVectorDecodeStage \
+  --stage-save VllmCaptionStage,ClipFrameExtractionStage \
   --stage-save-sample-rate 1.0
 ```
 
@@ -292,9 +292,9 @@ grep -r "class \w*Stage(CuratorStage)" cosmos_curator/pipelines/
 
 **Common stage names:**
 - **Captioning**: `VllmPrepStage`, `VllmCaptionStage`, `ApiPrepStage`, `GeminiCaptionStage`, `OpenAICaptionStage`, `EnhanceCaptionStage`
-- **Filtering**: `MotionVectorDecodeStage`, `MotionFilterStage`, `AestheticsFilterStage`
+- **Filtering**: `MotionFilterStage`, `AestheticFilterStage`
 - **I/O**: `VideoDownloader`, `ClipWriterStage`
-- **Processing**: `TranscodeStage`, `SegmentStage`, `NormalizeStage`
+- **Processing**: `TranscodeStage`, `SegmentStage`, `NormalizeStage`, `ClipFrameExtractionStage`
 
 ### Method 3: Check Saved Task Directories
 
@@ -649,12 +649,12 @@ cosmos-curator local launch --curator-path . -- \
 ### Example 2: Profile Stage Performance
 
 ```bash
-# Save tasks
+# Save tasks (replay loads from tasks/<replayed stage>, so save the stage you will replay)
 cosmos-curator local launch --curator-path . -- \
   pixi run --as-is python -m cosmos_curator.pipelines.video.splitting_pipeline \
   --input-video-path /data/videos \
   --output-clip-path /data/output \
-  --stage-save MotionVectorDecodeStage \
+  --stage-save MotionFilterStage \
   --stage-save-sample-rate 0.2
 
 # Profile with different configurations
@@ -674,12 +674,12 @@ time cosmos-curator local launch --curator-path . -- \
 ### Example 3: A/B Test Filter Settings
 
 ```bash
-# Save tasks before filter stage
+# Save the tasks entering the filter stage (replay loads from tasks/MotionFilterStage)
 cosmos-curator local launch --curator-path . -- \
   pixi run --as-is python -m cosmos_curator.pipelines.video.splitting_pipeline \
   --input-video-path /data/videos \
   --output-clip-path /data/output_baseline \
-  --stage-save MotionVectorDecodeStage
+  --stage-save MotionFilterStage
 
 # Test aggressive filtering
 cosmos-curator local launch --curator-path . -- \

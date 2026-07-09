@@ -15,7 +15,6 @@
 
 """Motion Filter Stage."""
 
-import io
 from collections.abc import Callable
 
 import numpy as np
@@ -26,7 +25,6 @@ from loguru import logger
 
 import cosmos_curator.pipelines.video.filtering.motion.motion_vector_backend as motion
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
-from cosmos_curator.core.utils.data.ref_resolver import prefetch, resolve_as_ready
 from cosmos_curator.core.utils.infra.gpu_start_helper import (
     gpu_stage_cleanup,
     gpu_stage_startup,
@@ -35,92 +33,6 @@ from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.pipelines.video.utils.data_model import SplitPipeTask
 
 ScoringFunctionType = Callable[[bytes, npt.NDArray[np.uint8]], npt.NDArray[np.float32]]
-
-
-class MotionVectorDecodeStage(CuratorStage):
-    """Stage for decoding motion vector information from video files.
-
-    This class processes video files through a series of steps including decoding,
-    filtering by side length, and storing the results in the task.
-    """
-
-    def __init__(
-        self,
-        num_cpus_per_worker: float,
-        *,
-        verbose: bool = False,
-        log_stats: bool = False,
-        target_fps: float = 2.0,
-        target_duration_ratio: float = 0.5,
-    ) -> None:
-        """Stage for decoding motion vector information from video files.
-
-        Attributes:
-            num_cpus_per_worker: number of CPUs per worker.
-            target_fps: target frames per second to sample (lower is faster).
-            target_duration_ratio: ratio of video duration to sample (0.5 = 50% by default).
-            verbose: whether to log verbose information.
-            log_stats: whether to log performance statistics.
-
-        """
-        self._timer = StageTimer(self)
-        self._num_cpus_per_worker = num_cpus_per_worker
-        self._num_threads = max(1, int(num_cpus_per_worker) + 1)
-        self._target_fps = target_fps
-        self._target_duration_ratio = target_duration_ratio
-        self._verbose = verbose
-        self._log_stats = log_stats
-
-    @property
-    def resources(self) -> CuratorStageResource:
-        """Get the resource requirements for this stage.
-
-        Returns:
-            Resource configuration for the stage.
-
-        """
-        return CuratorStageResource(cpus=self._num_cpus_per_worker)
-
-    @nvtx.annotate("MotionVectorDecodeStage")  # type: ignore[untyped-decorator]
-    def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:  # noqa: C901
-        """Decode data for motion vector computation and filter by side length."""
-        for task in tasks:
-            self._timer.reinit(self, task.get_major_size())
-            video = task.video
-            prefetch([clip.encoded_data for clip in video.clips])
-            for clip, data in resolve_as_ready([(clip, clip.encoded_data) for clip in video.clips]):
-                if data is None:
-                    logger.warning(f"Clip {clip.uuid} has no encoded_data.")
-                    clip.errors["encoded_data"] = "empty"
-                    continue
-                with self._timer.time_process(), io.BytesIO(data) as fp:
-                    try:
-                        clip.decoded_motion_data = motion.decode_for_motion(
-                            fp,
-                            thread_count=int(self._num_threads),
-                            target_fps=self._target_fps,
-                            target_duration_ratio=self._target_duration_ratio,
-                        )
-                    except motion.VideoResolutionTooSmallError:
-                        if self._verbose:
-                            logger.warning(f"Clip {clip.uuid} has too small resolution.")
-                        clip.decoded_motion_data = None
-                        clip.errors["motion_decode"] = "resolution_too_small"
-                    except Exception as e:  # noqa: BLE001
-                        if self._verbose:
-                            logger.exception(f"Clip {clip.uuid} failed to decode motion data: {e}")
-                        clip.decoded_motion_data = None
-                        clip.errors["motion_decode"] = "decode_failed"
-                    else:
-                        if clip.decoded_motion_data is None or len(clip.decoded_motion_data.frames) == 0:
-                            logger.warning(f"Clip {clip.uuid} has no motion frames.")
-                            clip.decoded_motion_data = None
-                            clip.errors["motion_decode"] = "no_motion_frames"
-            if self._log_stats:
-                stage_name, stage_perf_stats = self._timer.log_stats()
-                task.stage_perf[stage_name] = stage_perf_stats
-
-        return tasks
 
 
 class MotionFilterStage(CuratorStage):

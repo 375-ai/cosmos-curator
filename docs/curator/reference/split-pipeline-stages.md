@@ -21,8 +21,8 @@ The blocks below are appended in this order:
 | 2 | Split | Always, using `--splitting-algorithm` |
 | 3 | Transcode | Always |
 | 4 | Super-resolution | `--super-resolution` |
-| 5 | Motion filter | `--motion-filter enable` or `score-only` |
-| 6 | Shared clip frame extraction | Embeddings are enabled, or `--aesthetic-threshold` is set |
+| 5 | Motion filter | `--motion-filter enable` or `score-only`. The CameraSensor clip frame extraction (block 6) is inserted just before this stage, with motion-vector export on, to feed it motion vectors. |
+| 6 | Shared clip frame extraction | Embeddings are enabled, `--aesthetic-threshold` is set, or `--motion-filter` is enabled. When motion filtering is enabled it runs early (before block 5) with motion-vector export and also serves aesthetics/embeddings, so the clip is decoded once; otherwise it runs here. |
 | 7 | Aesthetic filter | `--aesthetic-threshold` is set |
 | 8 | Artificial text filter | `--artificial-text-filter` |
 | 9 | VLM semantic filter | `--vlm-filter enable` or `score-only` |
@@ -82,10 +82,10 @@ The blocks below are appended in this order:
 
 | Item | Details |
 |---|---|
-| Stages | `MotionVectorDecodeStage` + `MotionFilterStage` |
+| Stages | `MotionFilterStage` (motion vectors exported upstream by `ClipFrameExtractionStage`) |
 | Code | [`filtering/motion/motion_filter_stages.py`](../../../cosmos_curator/pipelines/video/filtering/motion/motion_filter_stages.py), built by [`motion_builders.py`](../../../cosmos_curator/pipelines/video/filtering/motion/motion_builders.py) |
-| Main flags | `--motion-filter`, `--motion-global-mean-threshold`, `--motion-per-patch-min-256-threshold`, `--motion-decode-target-fps`, `--motion-score-gpus-per-worker` |
-| Purpose | Detects clips with too little motion. The decode stage samples motion-vector data; the score stage computes global and per-patch motion metrics and either filters clips or records scores only. |
+| Main flags | `--motion-filter`, `--motion-global-mean-threshold`, `--motion-per-patch-min-256-threshold`, `--motion-decode-target-fps`, `--motion-decode-target-duration-ratio`, `--motion-score-gpus-per-worker`, `--motion-score-batch-size` |
+| Purpose | Detects clips with too little motion. Motion vectors are exported by the CameraSensor `ClipFrameExtractionStage` (the single decode path); the score stage computes global and per-patch motion metrics and either filters clips or records scores only. |
 | Output | Sets `clip.motion_score_global_mean` and `clip.motion_score_per_patch_min_256`; in `enable` mode, low-motion clips move to `filtered_clips`. |
 
 ### Shared Clip Frame Extraction
@@ -97,7 +97,7 @@ The blocks below are appended in this order:
 | Main flags | `--clip-extraction-target-res`, `--clip-extraction-cpus-per-worker` |
 | Purpose | Decodes sampled RGB frames from the transcoded clip bytes for downstream stages that can share the same extracted frames. |
 | Output | Populates `clip.extracted_frames` with frame arrays keyed by extraction signature. |
-| Runs when | At least one downstream consumer needs shared frames. Aesthetic filtering uses 1 FPS. Embedding uses 2 FPS. If both are enabled, both signatures are extracted. |
+| Runs when | At least one downstream consumer needs shared frames. Aesthetic filtering uses 1 FPS. Embedding uses 2 FPS. If both are enabled, both signatures are extracted. When motion filtering is enabled, this stage runs early with motion-vector export on and also serves aesthetics/embeddings, so the clip is decoded once. |
 
 ### Aesthetic Filter
 

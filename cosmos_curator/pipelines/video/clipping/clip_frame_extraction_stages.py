@@ -41,6 +41,14 @@ from cosmos_curator.pipelines.video.utils.decoder_utils import (
     FrameExtractionSignature,
 )
 
+_NS_PER_SECOND = 1_000_000_000
+
+# Legacy ``decode_for_motion`` used ``max(10, ...)`` as a minimum-frame floor, so short clips were
+# still sampled across roughly their first ``min_motion_frames / target_fps`` seconds regardless of
+# ``target_duration_ratio``. Preserve that floor here so short clips are not under-sampled (which
+# would shift motion scores and make ``no_motion_frames`` drops more likely).
+_DEFAULT_MIN_MOTION_FRAMES = 10
+
 
 @attrs.define(frozen=True)
 class CameraSensorMotionVectorConfig:
@@ -48,6 +56,34 @@ class CameraSensorMotionVectorConfig:
 
     target_fps: float = 2.0
     target_duration_ratio: float = 0.5
+    min_motion_frames: int = _DEFAULT_MIN_MOTION_FRAMES
+
+
+def motion_sampling_stop_ns(
+    start_ns: int,
+    end_ns: int,
+    *,
+    target_fps: float,
+    target_duration_ratio: float,
+    min_motion_frames: int,
+) -> int:
+    """Return the exclusive stop timestamp for CameraSensor motion-vector sampling.
+
+    Mirrors legacy ``decode_for_motion`` frame budgeting: sample the first
+    ``max(min_motion_frames, round(target_fps * duration * ratio))`` frames at ``target_fps``,
+    i.e. a window of ``target_frames / target_fps`` seconds, clamped to the clip. The
+    ``min_motion_frames`` floor keeps short clips (whose ``duration * ratio`` window would otherwise
+    yield only a couple of frames) sampled across enough of the clip to match the legacy path.
+    """
+    source_duration_ns = max(0, end_ns - start_ns)
+    if source_duration_ns == 0 or target_fps <= 0:
+        return end_ns
+    duration_s = source_duration_ns / _NS_PER_SECOND
+    # The leading 0 clamps against negative min_motion_frames / target_duration_ratio so the window
+    # is never negative and the returned stop stays within [start_ns, end_ns].
+    target_frames = max(0, min_motion_frames, round(target_fps * duration_s * target_duration_ratio))
+    window_ns = round(target_frames / target_fps * _NS_PER_SECOND)
+    return min(end_ns, start_ns + window_ns)
 
 
 class ClipFrameExtractionStage(CuratorStage):
@@ -184,9 +220,13 @@ class ClipFrameExtractionStage(CuratorStage):
             bytes(data),
             decode_config=CpuVideoDecodeConfig(export_mvs=True, thread_count=self._num_threads),
         )
-        source_duration_ns = max(0, sensor.end_ns - sensor.start_ns)
-        target_duration_ns = round(source_duration_ns * motion_vector_config.target_duration_ratio)
-        stop_ns = sensor.end_ns if target_duration_ns <= 0 else min(sensor.end_ns, sensor.start_ns + target_duration_ns)
+        stop_ns = motion_sampling_stop_ns(
+            sensor.start_ns,
+            sensor.end_ns,
+            target_fps=motion_vector_config.target_fps,
+            target_duration_ratio=motion_vector_config.target_duration_ratio,
+            min_motion_frames=motion_vector_config.min_motion_frames,
+        )
         spec = self._make_sensor_sampling_spec(sensor, motion_vector_config.target_fps, stop_ns=stop_ns)
         sampled_batches = list(sensor.sample(spec))
         if len(sampled_batches) != 1:
@@ -277,9 +317,12 @@ class ClipFrameExtractionStage(CuratorStage):
             except Exception as e:  # noqa: BLE001
                 logger.exception(f"Error extracting frames from clip {clip.uuid}: {e}")
                 clip.errors["frame_extraction"] = "video_decode_failed"
-                # reset the buffer to disable further operations on this clip
+                # drop the transported buffer, but still attempt motion-vector extraction below from
+                # the in-hand bytes: frame decode and motion export are independent (as the separate
+                # ClipFrameExtractionStage/MotionVectorDecodeStage were pre-CVC-1078), so a frame
+                # failure should still record its own motion_decode outcome rather than be silently
+                # skipped.
                 clip.encoded_data.drop()
-                continue
 
             self._populate_motion_vectors_for_clip(clip, data)
 

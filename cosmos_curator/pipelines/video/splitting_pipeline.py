@@ -544,9 +544,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
-    use_camera_sensor_motion_vectors = (
-        args.motion_filter != "disable" and args.motion_vector_source == "camera_sensor_clip"
-    )
+    motion_filter_enabled = args.motion_filter != "disable"
 
     has_aesthetics = args.aesthetic_threshold is not None
     has_embeddings = args.generate_embeddings
@@ -556,17 +554,26 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
     if has_embeddings:
         frame_extraction_target_fps.append(2)
 
-    # --- Early camera-sensor frame/motion extraction (optional) ---
-    if use_camera_sensor_motion_vectors:
+    # --- Shared clip frame extraction (optional) ---
+    # A single ClipFrameExtractionStage serves both motion filtering and the aesthetics/embedding
+    # frame consumers, so a clip is decoded at most once. It is placed before the motion filter,
+    # which consumes the exported motion vectors; when motion filtering is off it still precedes the
+    # aesthetics/embedding stages. Motion vectors are exported only when motion filtering runs.
+    if has_aesthetics or has_embeddings or motion_filter_enabled:
+        motion_vectors = (
+            CameraSensorMotionVectorConfig(
+                target_fps=args.motion_decode_target_fps,
+                target_duration_ratio=args.motion_decode_target_duration_ratio,
+            )
+            if motion_filter_enabled
+            else None
+        )
         stages.extend(
             build_frame_extraction_stages(
                 FrameExtractionConfig(
                     target_fps=frame_extraction_target_fps,
                     target_res=args.clip_extraction_target_res,
-                    motion_vectors=CameraSensorMotionVectorConfig(
-                        target_fps=args.motion_decode_target_fps,
-                        target_duration_ratio=args.motion_decode_target_duration_ratio,
-                    ),
+                    motion_vectors=motion_vectors,
                     cpus_per_worker=args.clip_extraction_cpus_per_worker,
                     perf_profile=args.perf_profile,
                 )
@@ -574,33 +581,16 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         )
 
     # --- Motion filter (optional) ---
-    if args.motion_filter != "disable":
+    if motion_filter_enabled:
         stages.extend(
             build_motion_filter_stages(
                 MotionFilterConfig(
                     score_only=args.motion_filter == "score-only",
-                    motion_vector_source=args.motion_vector_source,
                     global_mean_threshold=args.motion_global_mean_threshold,
                     per_patch_min_256_threshold=args.motion_per_patch_min_256_threshold,
-                    decode_cpus_per_worker=args.motion_decode_cpus_per_worker,
-                    decode_target_fps=args.motion_decode_target_fps,
-                    decode_target_duration_ratio=args.motion_decode_target_duration_ratio,
                     score_gpus_per_worker=args.motion_score_gpus_per_worker,
                     score_batch_size=args.motion_score_batch_size,
                     verbose=args.verbose,
-                    perf_profile=args.perf_profile,
-                )
-            )
-        )
-
-    # --- Frame extraction (shared prerequisite for aesthetics and embedding) ---
-    if (has_aesthetics or has_embeddings) and not use_camera_sensor_motion_vectors:
-        stages.extend(
-            build_frame_extraction_stages(
-                FrameExtractionConfig(
-                    target_fps=frame_extraction_target_fps,
-                    target_res=args.clip_extraction_target_res,
-                    cpus_per_worker=args.clip_extraction_cpus_per_worker,
                     perf_profile=args.perf_profile,
                 )
             )
@@ -1541,19 +1531,16 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--motion-decode-target-fps",
         type=float,
         default=2.0,
-        help="Target frames per second to sample for motion vector decoding.",
+        help="Target frames per second sampled when the clip frame extraction stage exports motion vectors.",
     )
     parser.add_argument(
         "--motion-decode-target-duration-ratio",
         type=float,
         default=0.5,
-        help="Target ratio of video duration to sample for motion vector decoding (0.5 = 50%%).",
-    )
-    parser.add_argument(
-        "--motion-decode-cpus-per-worker",
-        type=float,
-        default=2.0,
-        help="Number of CPUs per worker allocated to motion vector decoding.",
+        help=(
+            "Target ratio of clip duration sampled when the clip frame extraction stage exports motion vectors "
+            "(0.5 = 50%%)."
+        ),
     )
     parser.add_argument(
         "--motion-score-batch-size",
@@ -1566,15 +1553,6 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=float,
         default=0.5,
         help="Number of GPUs per worker allocated to motion score computation. Set to 0 to use CPU instead of GPU.",
-    )
-    parser.add_argument(
-        "--motion-vector-source",
-        choices=["legacy_decode", "camera_sensor_clip"],
-        default="legacy_decode",
-        help=(
-            "Source for motion vectors. 'legacy_decode' runs the existing motion decode stage. "
-            "'camera_sensor_clip' reuses the camera-sensor clip extraction stage."
-        ),
     )
     parser.add_argument(
         "--clip-extraction-target-res",

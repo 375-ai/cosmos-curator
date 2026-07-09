@@ -222,8 +222,7 @@ Each CPU-heavy stage also exposes a `--*-cpus-per-worker` flag. Defaults are tun
 
 - `--transnetv2-frame-decode-cpus-per-worker` (default `3.0`): CPU threads per worker for video frame decoding in `ffmpeg_cpu` mode.
 - `--transcode-cpus-per-worker` (default `5.0`): CPU threads per transcode worker; the stage runs a batched ffmpeg command with one thread per batch element.
-- `--motion-decode-cpus-per-worker` (default `2.0`): CPUs per worker allocated to motion-vector decoding.
-- `--clip-extraction-cpus-per-worker` (default `3.0`): CPUs per worker allocated to clip frame extraction.
+- `--clip-extraction-cpus-per-worker` (default `3.0`): CPUs per worker allocated to clip frame extraction, which also exports the motion vectors used by motion filtering.
 - `--vllm-prepare-num-cpus-per-worker` (default `3.0`): CPUs per worker for `VllmPrepStage`.
 
 **Running on CPU-constrained hosts**

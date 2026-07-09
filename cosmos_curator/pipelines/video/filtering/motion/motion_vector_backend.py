@@ -15,16 +15,11 @@
 
 """Backend using h264 motion vectors for optical flow filtering."""
 
-import io
-from typing import cast
-
 import attrs
-import av
 import cv2
 import numpy as np
 import numpy.typing as npt
 import torch
-from numpy.lib.recfunctions import structured_to_unstructured
 from nvtx import nvtx  # type: ignore[import-untyped]
 from torch import Tensor
 
@@ -90,9 +85,9 @@ def sensor_motion_vector_data_to_legacy_matrices(
 ) -> list[npt.NDArray[np.float64]]:
     """Project sensor motion vectors into the legacy PyAV matrix shape.
 
-    This is the only adapter between ``CameraData.motion_vectors`` and the
-    existing motion filter path. The first column is ``source`` so the output
-    matches ``decode_for_motion`` matrices consumed by ``check_if_small_motion``.
+    This is the only adapter between ``CameraData.motion_vectors`` and the motion filter
+    path. The first column is ``source`` so the output matches the per-frame matrix layout
+    consumed by ``check_if_small_motion``.
     """
     matrices: list[npt.NDArray[np.float64]] = []
     for frame in motion_vectors.frames:
@@ -204,86 +199,6 @@ def motion_vectors_to_flowfield(mvs: Tensor, size: list[int], flow: Tensor | Non
     flow.index_put_((dst_b4.long(), dst_y4.long(), dst_x4.long()), delta_flat, accumulate=False)
 
     return flow
-
-
-@nvtx.annotate()  # type: ignore[untyped-decorator]
-def decode_for_motion(  # noqa: C901
-    video: io.BytesIO,
-    thread_count: int = 4,
-    target_fps: float = 2.0,
-    target_duration_ratio: float = 0.5,
-) -> DecodedData:
-    """Decode video for motion detection.
-
-    This function decodes a video stream to extract motion vectors.
-
-    Args:
-        video: Input video stream as a bytes object.
-        thread_count: Number of threads to use for decoding.
-        target_fps: Target frames per second for motion detection.
-        target_duration_ratio: Ratio of target duration to source duration.
-
-    Returns:
-        DecodedData object containing motion vectors and frame dimensions.
-
-    """
-    with cast("av.container.InputContainer", av.open(video, metadata_errors="ignore")) as input_container:
-        stream = input_container.streams.video[0]
-        ctx = stream.codec_context
-        # Set this flag to return motion vectors
-        ctx.flags2 |= av.codec.context.Flags2.export_mvs
-        ctx.thread_type = av.codec.context.ThreadType.AUTO
-        ctx.thread_count = thread_count
-        mv_data = []
-        shape = torch.Size([1, 1])
-
-        # Get video framerate and duration
-        source_fps = float(stream.average_rate) if stream.average_rate else float(stream.base_rate or 30)
-
-        # Get duration in seconds
-        duration_seconds = 0
-        if stream.duration is not None and stream.time_base is not None:
-            duration_seconds = stream.duration * int(stream.time_base)
-        if duration_seconds <= 0 and hasattr(input_container, "duration") and input_container.duration is not None:
-            duration_seconds = int(input_container.duration / int(av.time_base))
-        if duration_seconds <= 0:
-            # Default assumption if we can't determine duration
-            duration_seconds = 30
-
-        # Calculate how many frames to sample based on ratio
-        target_seconds = duration_seconds * target_duration_ratio
-        max_frames = max(10, round(target_fps * target_seconds))  # At least 10 frames regardless of ratio
-
-        # Calculate frame step to achieve target FPS
-        # If source is 30fps and target is 2fps, we sample every 15 frames
-        sample_step = max(1, round(source_fps / target_fps))
-
-        for i, frame in enumerate(input_container.decode(video=0)):
-            # Only process frames at our target step interval
-            if i % sample_step != 0:
-                continue
-
-            # Process shape info from first frame
-            if i == 0:
-                shape = torch.Size([frame.height, frame.width, 3])
-                if shape[0] < _MIN_SIDE_RESOLUTION or shape[1] < _MIN_SIDE_RESOLUTION:
-                    error_msg = f"Expected min resolution of {_MIN_SIDE_RESOLUTION}, but got a resolution of {shape}"
-                    raise VideoResolutionTooSmallError(error_msg)
-
-            # Process motion vectors
-            for sd in frame.side_data:
-                if sd.type == av.sidedata.sidedata.Type.MOTION_VECTORS:  # type: ignore[attr-defined]
-                    mv = structured_to_unstructured(
-                        sd.to_ndarray(),  # type: ignore[attr-defined]
-                    )
-                    mv_data.append(mv)
-                    break  # Skip checking other side data once we find motion vectors
-
-            # Early stopping optimization: limit based on calculated max frames
-            if len(mv_data) >= max_frames:
-                break
-
-    return DecodedData(mv_data, shape)
 
 
 @nvtx.annotate()  # type: ignore[untyped-decorator]

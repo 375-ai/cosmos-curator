@@ -31,10 +31,10 @@ from cosmos_curator.core.sensors.utils.video import CpuVideoDecodeConfig
 from cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages import (
     CameraSensorMotionVectorConfig,
     ClipFrameExtractionStage,
+    motion_sampling_stop_ns,
 )
 from cosmos_curator.pipelines.video.filtering.motion.motion_filter_stages import (
     MotionFilterStage,
-    MotionVectorDecodeStage,
 )
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
 from cosmos_curator.pipelines.video.utils.data_model import Clip, SplitPipeTask, Video
@@ -71,6 +71,87 @@ def _frame_signature(fps: float) -> str:
 
 def _stage_object(stage: CuratorStage | CuratorStageSpec) -> CuratorStage:
     return stage.stage if isinstance(stage, CuratorStageSpec) else stage
+
+
+_SEC = 1_000_000_000
+
+
+def test_camera_sensor_motion_config_defaults_match_legacy_frame_floor() -> None:
+    """The motion config should default to the legacy 10-frame floor."""
+    assert CameraSensorMotionVectorConfig().min_motion_frames == 10
+
+
+@pytest.mark.parametrize(
+    ("duration_s", "expected_window_s"),
+    [
+        # Long clips: duration*ratio dominates the 10-frame floor (matches legacy decode_for_motion).
+        (20.0, 10.0),
+        # Boundary (the equivalence fixture): duration*ratio == floor window == 5s.
+        (10.0, 5.0),
+        # Short clips: the max(10, ...) floor holds a 5s window where duration*ratio would give less.
+        (6.0, 5.0),
+        # Very short clip: floor window exceeds the clip, so the whole clip is sampled.
+        (2.0, 2.0),
+    ],
+)
+def test_motion_sampling_stop_ns_honors_frame_floor(duration_s: float, expected_window_s: float) -> None:
+    """CameraSensor motion sampling must reproduce legacy's max(10, ...) frame-floor window."""
+    start_ns = 3 * _SEC
+    end_ns = start_ns + round(duration_s * _SEC)
+
+    stop_ns = motion_sampling_stop_ns(
+        start_ns,
+        end_ns,
+        target_fps=2.0,
+        target_duration_ratio=0.5,
+        min_motion_frames=10,
+    )
+
+    assert stop_ns == start_ns + round(expected_window_s * _SEC)
+
+
+def test_motion_sampling_stop_ns_short_clip_widens_beyond_ratio_window() -> None:
+    """On a short clip the floor must sample a wider window than duration*ratio alone."""
+    start_ns = 0
+    end_ns = 6 * _SEC
+    ratio = 0.5
+
+    stop_ns = motion_sampling_stop_ns(
+        start_ns, end_ns, target_fps=2.0, target_duration_ratio=ratio, min_motion_frames=10
+    )
+
+    naive_ratio_window_ns = round((end_ns - start_ns) * ratio)  # 3s — the pre-fix behavior
+    assert stop_ns - start_ns > naive_ratio_window_ns
+
+
+def test_motion_sampling_stop_ns_zero_duration_returns_end() -> None:
+    """A zero-length clip should collapse to an empty window at the clip end."""
+    assert (
+        motion_sampling_stop_ns(5 * _SEC, 5 * _SEC, target_fps=2.0, target_duration_ratio=0.5, min_motion_frames=10)
+        == 5 * _SEC
+    )
+
+
+@pytest.mark.parametrize(
+    ("target_duration_ratio", "min_motion_frames"),
+    [(-0.5, -3), (-1.0, 0), (0.5, -10)],
+)
+def test_motion_sampling_stop_ns_never_returns_before_start(
+    target_duration_ratio: float, min_motion_frames: int
+) -> None:
+    """Negative ratio/floor inputs must clamp to a non-negative window (stop within [start, end])."""
+    start_ns = 2 * _SEC
+    end_ns = 8 * _SEC
+
+    stop_ns = motion_sampling_stop_ns(
+        start_ns,
+        end_ns,
+        target_fps=2.0,
+        target_duration_ratio=target_duration_ratio,
+        min_motion_frames=min_motion_frames,
+    )
+
+    assert start_ns <= stop_ns <= end_ns
 
 
 def _make_video_metadata(height: int = 256, width: int = 256) -> VideoMetadata:
@@ -235,8 +316,13 @@ def test_clip_frame_extraction_stage_exports_camera_sensor_motion_vectors(
     spec = captured["spec"]
     assert isinstance(spec, SamplingSpec)
     assert spec.grid.start_ns == 0
-    assert spec.grid.exclusive_end_ns == 416_666_666
-    np.testing.assert_array_equal(spec.grid.timestamps_ns, np.array([0, 333_333_333], dtype=np.int64))
+    # This 1s clip is shorter than the min_motion_frames floor window (10 frames / 3fps = 3.3s),
+    # so the whole clip is sampled (4 frames at 3fps) rather than just the first duration*ratio = 250ms.
+    assert spec.grid.exclusive_end_ns == 1_166_666_666
+    np.testing.assert_array_equal(
+        spec.grid.timestamps_ns,
+        np.array([0, 333_333_333, 666_666_666, 999_999_999], dtype=np.int64),
+    )
     extracted = clip.extracted_frames.resolve()
     assert extracted == {}
 
@@ -275,8 +361,40 @@ def test_clip_frame_extraction_stage_marks_empty_camera_sensor_motion_vectors(
     assert clip.errors["motion_decode"] == "no_motion_frames"
 
 
-def test_split_assemble_camera_sensor_motion_source_reorders_and_skips_legacy_decode() -> None:
-    """Integrated camera-sensor motion source should extract before filtering and skip legacy decode."""
+def test_clip_frame_extraction_stage_frame_failure_still_records_motion_decode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, sample_clip_data: bytes
+) -> None:
+    """A frame-decode failure must still attempt motion export and record its own motion_decode error.
+
+    The standalone MotionVectorDecodeStage set motion_decode independently pre-CVC-1078; the fused
+    extraction stage must not silently skip motion export when frame extraction fails.
+    """
+    task = _make_task(tmp_path, sample_clip_data)
+
+    class FailingCameraSensor:
+        def __init__(self, _source: bytes, **_kwargs: object) -> None:
+            msg = "corrupt clip bytes"
+            raise RuntimeError(msg)
+
+    monkeypatch.setattr(
+        "cosmos_curator.pipelines.video.clipping.clip_frame_extraction_stages.CameraSensor",
+        FailingCameraSensor,
+    )
+    stage = ClipFrameExtractionStage(
+        target_fps=[2.0],
+        motion_vectors=CameraSensorMotionVectorConfig(),
+    )
+
+    stage.process_data([task])
+
+    clip = task.video.clips[0]
+    assert clip.errors["frame_extraction"] == "video_decode_failed"
+    assert clip.errors["motion_decode"] == "decode_failed"
+    assert clip.decoded_motion_data is None
+
+
+def test_split_assemble_motion_filter_extracts_before_filtering() -> None:
+    """Motion filtering should insert a single CameraSensor extraction stage before the filter."""
     parser = _parser()
     input_path = Path.cwd() / "tmp-input"
     output_path = Path.cwd() / "tmp-output"
@@ -289,8 +407,6 @@ def test_split_assemble_camera_sensor_motion_source_reorders_and_skips_legacy_de
             "--no-generate-embeddings",
             "--motion-filter",
             "score-only",
-            "--motion-vector-source",
-            "camera_sensor_clip",
             "--motion-decode-target-fps",
             "3.0",
             "--motion-decode-target-duration-ratio",
@@ -305,11 +421,14 @@ def test_split_assemble_camera_sensor_motion_source_reorders_and_skips_legacy_de
     motion_filter_index = next(i for i, stage in enumerate(stages) if isinstance(stage, MotionFilterStage))
     extraction_index = next(i for i, stage in enumerate(stages) if isinstance(stage, ClipFrameExtractionStage))
     assert extraction_index < motion_filter_index
-    assert not any(isinstance(stage, MotionVectorDecodeStage) for stage in stages)
 
 
-def test_split_assemble_camera_sensor_motion_source_ignored_when_motion_disabled() -> None:
-    """camera_sensor_clip source should not add a motion filter when motion filtering is disabled."""
+def test_split_assemble_single_extraction_serves_motion_and_aesthetics() -> None:
+    """When motion filtering and aesthetics are both on, one extraction stage serves both, before the filter.
+
+    This guards the CVC-1078 dedup: the early CameraSensor extraction that feeds the motion filter must
+    also serve the downstream aesthetics/embedding consumers, so a clip is never decoded twice.
+    """
     parser = _parser()
     input_path = Path.cwd() / "tmp-input"
     output_path = Path.cwd() / "tmp-output"
@@ -320,13 +439,66 @@ def test_split_assemble_camera_sensor_motion_source_ignored_when_motion_disabled
             "--output-clip-path",
             output_path.as_posix(),
             "--no-generate-embeddings",
-            "--motion-vector-source",
-            "camera_sensor_clip",
+            "--motion-filter",
+            "score-only",
+            "--aesthetic-threshold",
+            "3.5",
         ]
     )
 
     stages = [_stage_object(stage) for stage in _assemble_stages(args)]
 
+    extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
+    # Exactly one extraction stage serves both the motion export and the aesthetics consumer.
+    assert len(extraction_stages) == 1
+    motion_filter_index = next(i for i, stage in enumerate(stages) if isinstance(stage, MotionFilterStage))
+    extraction_index = next(i for i, stage in enumerate(stages) if isinstance(stage, ClipFrameExtractionStage))
+    assert extraction_index < motion_filter_index
+
+
+def test_split_assemble_no_motion_filter_when_motion_disabled() -> None:
+    """No motion filter stage should be added when motion filtering is disabled (the default)."""
+    parser = _parser()
+    input_path = Path.cwd() / "tmp-input"
+    output_path = Path.cwd() / "tmp-output"
+    args = parser.parse_args(
+        [
+            "--input-video-path",
+            input_path.as_posix(),
+            "--output-clip-path",
+            output_path.as_posix(),
+            "--no-generate-embeddings",
+        ]
+    )
+
+    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+
+    assert not any(isinstance(stage, MotionFilterStage) for stage in stages)
+
+
+def test_split_assemble_extraction_without_motion_when_aesthetics_only() -> None:
+    """With motion filtering off but aesthetics on, a single extraction stage (no motion export) runs."""
+    parser = _parser()
+    input_path = Path.cwd() / "tmp-input"
+    output_path = Path.cwd() / "tmp-output"
+    args = parser.parse_args(
+        [
+            "--input-video-path",
+            input_path.as_posix(),
+            "--output-clip-path",
+            output_path.as_posix(),
+            "--no-generate-embeddings",
+            "--aesthetic-threshold",
+            "3.5",
+        ]
+    )
+
+    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+
+    extraction_stages = [stage for stage in stages if isinstance(stage, ClipFrameExtractionStage)]
+    assert len(extraction_stages) == 1
+    # Motion filtering is off, so the shared extraction must not export motion vectors.
+    assert extraction_stages[0]._motion_vector_config is None
     assert not any(isinstance(stage, MotionFilterStage) for stage in stages)
 
 
