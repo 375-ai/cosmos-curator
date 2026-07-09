@@ -12,44 +12,54 @@ ratify, alter, or defer.
 
 ## Proposed Data Model
 
-`LidarData` is a structure-of-arrays batch of LiDAR points. The batch's row
-dimension `N` is the number of alignment rows (one per `align_timestamps_ns`
-entry); points are stored flat across all rows in a single contiguous block,
-with a CSR-style `align_offsets: (N+1,) int64` array partitioning the flat
-buffer into per-row windows. `LidarData` satisfies the existing `SensorData`
-protocol ([SensorData](#ref-sensor-data)):
+`LidarData` is a structure-of-arrays batch of LiDAR points with **two
+independent batch dimensions**: `N` (alignment rows) and `P_total`
+(points). The two `SensorData`-protocol timestamp arrays sit at row
+granularity `(N,)` — matching `CameraData` / `ImuData` / `EgoTrajectory`
+— while the point payload is flat with leading dimension `P_total`. `N`
+and `P_total` are independent; there is no per-row partition of the
+points.
 
-- `align_timestamps_ns` is the reference timeline requested from the
-  `SamplingGrid`.
-- `sensor_timestamps_ns` is the source measurement time selected for each
-  alignment row.
-- Flat per-point arrays — `points_xyz`, `points_intensity`,
-  `points_timestamps_ns`, plus optional `points_ring`, `points_return_index`,
-  `points_reflectivity`, `points_ambient`, `points_validity`,
-  `points_radial_velocity` — share the leading dimension `P_total`.
-- `align_offsets: (N+1,) int64` carries the CSR-style window boundaries:
-  the points associated with alignment row `i` are
-  `points_xyz[align_offsets[i]:align_offsets[i+1]]`. When a producer's
-  natural unit is a spinning-LiDAR sweep, the windows are sweep boundaries.
-  When the producer instead queries "points near alignment instant `t_i`,"
-  the windows are time-of-interest neighborhoods. Pipelines that ignore the
-  per-row partitioning can read the flat arrays directly.
-- Optional `ego_poses` carries one rig-to-global-frame transform per
-  alignment row aligned to `align_timestamps_ns`, used by consumers that
-  need motion compensation or multi-row aggregation. The target global
-  frame is named by `LidarMetadata.ego_poses_frame` (e.g., `"world"`,
-  `"map"`, `"odom"`) and is independent of `LidarMetadata.reference_frame`,
-  which describes only the coordinate frame of `points_xyz`.
-- Optional `extrinsics` carries the static sensor-to-rig calibration.
-- `metadata` (`LidarMetadata`, required) carries motion-compensation status,
-  the reference frame, the motion-compensation reference instant (required
-  when `motion_compensated=True`), and sensor model.
+`LidarData` satisfies the existing `SensorData` protocol
+([SensorData](#ref-sensor-data)):
 
-This lets `LidarData` represent decoded source sweeps when the reference grid
-is the LiDAR's own sweep timestamps (`align_timestamps_ns ==
-sensor_timestamps_ns`) and aligned point batches when the LiDAR is resampled
-onto a camera, IMU, or arbitrary reference grid via `AlignedFrame`
-([AlignedFrame](#ref-aligned-frame)).
+- `align_timestamps_ns: (N,) int64`, strictly increasing. When
+  `motion_compensated=True`, each entry doubles as the per-row
+  motion-compensation reference instant, so a multi-sweep batch can
+  record independent reference instants per row.
+- `sensor_timestamps_ns: (N,) int64`, non-decreasing. Per-row
+  source-reported reference time.
+- Required per-point payload: `points_xyz: (P_total, 3) float32` and
+  `points_timestamps_ns: (P_total,) int64` (non-decreasing globally).
+- Optional per-point payload: `points_intensity`, `points_ring`,
+  `points_return_index`, `points_reflectivity`, `points_ambient`,
+  `points_validity`, `points_radial_velocity`, `points_sweep_index`,
+  and `points_align_index`.
+- `metadata` (`LidarMetadata`, required) carries the
+  motion-compensation flag, the reference frame of `points_xyz`, the
+  static sensor-to-rig `extrinsics`, and the sensor model.
+
+Point → alignment-row mapping is either recorded explicitly in the
+optional `points_align_index` field, or reconstructed by consumers on
+demand via the existing
+[`find_closest_indices`](#ref-find-closest-indices) helper (which
+wraps `np.searchsorted` with the necessary `np.clip` to `[0, N-1]`)
+under a nearest-alignment convention (see
+[D1](#d1-payload-shape-and-alignment-granularity)). Today
+`find_closest_indices` requires both inputs to be strictly increasing;
+`points_timestamps_ns` is only non-decreasing (LiDAR can return
+simultaneous points), so this reuse is tracked as an
+[open follow-up](#open-follow-up-questions).
+
+Rig-to-global ego pose is **not** a field on `LidarData`. It is carried by a
+sibling `SensorData` type, `EgoTrajectory` (see
+[Related Structures](#related-structures) and the
+[Tentative `LidarData`](#tentative-lidardata) sketch). See
+[D2](#d2-ego-pose-placement) for the rationale.
+
+Because both timestamp arrays sit at `(N,)`, `LidarData` slots into
+`AlignedFrame` on the existing row-matching contract with no
+validator changes.
 
 "Decoded source points" here means parsed LiDAR packets converted to Sensor
 Library field names, NumPy arrays, and SI units. It does not mean raw vendor
@@ -72,19 +82,21 @@ should follow them rather than introduce a sensor-specific batch model:
 - Boolean masks use `np.bool_`.
 - Static sensor-to-rig calibration is represented by a single `SensorExtrinsics`
   4x4 row-major `float64` matrix ([SensorExtrinsics](#ref-sensor-extrinsics)).
-- Ragged side data aligned 1:1 with the primary payload has two existing
-  precedents: tuple-of-frozen-containers ([MotionVectorData](#ref-motion-vector-data)
-  for video frames) and flat-with-offsets (no existing in-package use, but
-  the standard CSR / Apache Arrow pattern).
+- Ragged side data aligned 1:1 with the primary payload has one existing
+  precedent: tuple-of-frozen-containers ([MotionVectorData](#ref-motion-vector-data)
+  for video frames).
 
-LiDAR adopts the **flat-with-offsets** form rather than the MotionVectorData
-tuple form. The original recommendation was the tuple form for consistency
-with the camera ragged-side-data precedent, but review feedback (see
-[D1](#d1-payload-shape)) noted that not every consumer pipeline organizes
-points by sweep — many pipelines just want "points near an alignment
-timestamp," with sweep boundaries either irrelevant or absent (e.g.,
-solid-state LiDARs). Flat-with-offsets keeps the per-row partitioning
-expressible without forcing it as required structure.
+LiDAR does **not** adopt the MotionVectorData pattern. After four rounds
+of design iteration (see
+[D1](#d1-payload-shape-and-alignment-granularity) for the trail), the
+current shape is: `(N,) align_timestamps_ns` and `(N,) sensor_timestamps_ns`
+at row granularity — same as `CameraData` / `ImuData` — plus flat
+per-point arrays including `(P_total,) points_timestamps_ns`. `N` and
+`P_total` are independent; there is no per-row partition of the points.
+When `motion_compensated=True`, `align_timestamps_ns[i]` doubles as the
+per-row motion-comp reference instant, so a multi-sweep batch can record
+independent reference instants per row. Sweep semantics, when needed,
+live in an optional per-point `points_sweep_index` column.
 
 ## Reference Models Reviewed
 
@@ -108,8 +120,10 @@ This supports providing a fixed set of named per-point arrays on
 `LidarData` rather than a self-describing offset/datatype table: the
 sensor library is consumed by Python ML pipelines that benefit more from
 predictable typed access than from arbitrary-schema flexibility. It also
-supports keeping a separate explicit `points_timestamps_ns` field rather
-than relying on a single row-level timestamp.
+supports carrying a per-point capture-time array
+(`points_timestamps_ns: (P_total,) int64`) alongside the row-level
+`align_timestamps_ns` / `sensor_timestamps_ns`, rather than relying on
+a single sweep-level timestamp.
 
 ### nuScenes
 
@@ -135,8 +149,9 @@ Each range-image pixel has a per-pixel `range_image_pose` providing
 motion-compensation transforms.
 
 This is the strongest existing reference for explicit per-point timing and
-motion compensation. It supports including `points_timestamps_ns` and
-`ego_poses` in the first `LidarData`. It also supports treating range-image
+motion compensation. It supports carrying `points_timestamps_ns` per point
+and the sibling `EgoTrajectory` for rig-to-global poses adopted in
+[D2](#d2-ego-pose-placement). It also supports treating range-image
 representation as an optional later extension rather than a required first
 form: most downstream ML stacks consume unordered point lists.
 
@@ -148,9 +163,14 @@ timestamps, no ring index, no return index, no per-point motion compensation
 at the file level. KITTI is the historical minimum schema.
 
 This supports keeping `points_ring` and `points_return_index` optional
-rather than required: a `LidarData` loaded from a KITTI-style source should
-be valid with only `points_xyz`, `points_intensity`, and synthesized
-`points_timestamps_ns` populated.
+rather than required: a `LidarData` loaded from a KITTI-style source
+should be valid with only the required per-point payload
+(`points_xyz` and `points_timestamps_ns`) plus the required row-level
+`align_timestamps_ns` / `sensor_timestamps_ns`. Per-point timestamps
+are synthesized by uniform interpolation across the sweep duration
+when the source has only a sweep-level time; the row-level arrays
+carry that single sweep time (`N = 1`). Optional `points_intensity`
+maps from `reflectance`.
 
 ### Ouster SDK
 
@@ -160,11 +180,13 @@ cloud, with explicit per-pixel `t_offset_ns` fields for sub-sweep timing and
 per-pixel `signal`, `reflectivity`, `near_ir` channels
 ([Ouster SDK](#ref-ouster-sdk)). Dual returns are exposed as a separate axis.
 
-This supports including a `points_timestamps_ns` field on `LidarData` and
-treating multiple returns as a per-point `points_return_index` rather than a
+This supports carrying `points_timestamps_ns` per point (Ouster's
+`t_offset_ns` becomes part of `points_timestamps_ns` directly when the
+parser materialises the point cloud from the range image) and treating
+multiple returns as a per-point `points_return_index` rather than a
 separate batch axis. It also supports keeping additional channels
-(reflectivity, near-infrared) as optional, vendor-shaped extensions rather
-than required core fields.
+(reflectivity, near-infrared) as optional, vendor-shaped extensions
+rather than required core fields.
 
 ### PCL Point Types and PCD Format
 
@@ -191,8 +213,11 @@ This supports the structure-of-arrays approach: a community-evolved
 "canonical" lidar schema looks more like a small set of typed arrays than a
 self-describing schema, and is consumed flat-concatenated when feeding 3-D
 detectors. Combined with review feedback that not every consumer organizes
-points by sweep, this directly motivated the flat-with-offsets payload
-choice in [D1](#d1-payload-shape).
+points by sweep, this directly motivated the flat `(P_total,)` per-point
+payload choice in
+[D1](#d1-payload-shape-and-alignment-granularity) — no per-sweep
+partitioning is baked into the type; sweep semantics remain available
+via the optional `points_sweep_index` column.
 
 ### Proprietary AV SDK
 
@@ -227,8 +252,10 @@ additions:
   `reference_frame` mirrors the SDK's coordinate-frame enum (sensor / rig,
   with custom corresponding to `"world"` / `"map"`). The SDK also carries
   the **reference instant** all points were warped to; this design note
-  adds `motion_compensation_timestamp_ns` to `LidarMetadata` to preserve
-  it.
+  encodes that instant on the per-row `align_timestamps_ns` array (see
+  [D1](#d1-payload-shape-and-alignment-granularity)) rather than as a
+  separate metadata scalar, which additionally supports multi-sweep
+  batches where different rows have different reference instants.
 
 - **Multi-return (D5) confirmed.** The SDK supports up to ten returns per
   pulse via its returns table. A `uint8 return_index` covers this range.
@@ -270,11 +297,10 @@ motion-compensation, and auxiliary-per-point-data-type public types.
 The choices below shape the structure of `LidarData` and `LidarMetadata`.
 Each lists options, trade-offs, and a tentative recommendation.
 
-### D1. Payload shape
+### D1. Payload shape and alignment granularity
 
-Should the per-row ragged point data be represented as a tuple of frozen
-per-row containers, or as flat concatenated arrays with a per-row offsets
-index?
+How should the per-point data be represented, and at what granularity does
+the alignment grid live? Four rounds of iteration.
 
 **Option A — tuple of `LidarSweepData`** (mirrors `MotionVectorData`)
 
@@ -293,7 +319,7 @@ onto consumers that don't use it (e.g., solid-state LiDAR pipelines and
 pipelines that query points by time window irrespective of sweep
 boundaries).
 
-**Option B — flat + offsets**  (recommended)
+**Option B — flat per-point arrays + CSR-style `align_offsets`**
 
 ```python
 points_xyz:        npt.NDArray[np.float32]   # shape (P_total, 3)
@@ -304,41 +330,106 @@ align_offsets:     npt.NDArray[np.int64]     # shape (N+1,)
 
 Pros: vectorizes cross-row operations in single numpy calls; closer to
 how KITTI/nuScenes/Waymo serialize and how OpenPCDet/MMDetection3D batch
-for training; lower per-batch object overhead. The `align_offsets` array
-is a partition that consumers can use or ignore — pipelines that work
-with "points near an alignment timestamp" without caring about sweep
-membership can read the flat arrays directly.
+for training. The `align_offsets` array is a partition that consumers can
+use or ignore.
 
 Cons: more bookkeeping during filtering and re-batching; mutation
-patterns (drop/append points) require offset rebuilds; no existing
-precedent in the sensors package.
+patterns require offset rebuilds; `align_offsets` carries semantics no
+current consumer actually uses (we observed this only after adopting it).
 
-**Recommendation: Option B.** Rationale:
+**Option C — flat per-point arrays, no per-row partition, `(N,)` alignment grid**
 
-- Review feedback observed that not every LiDAR pipeline organizes points
-  by sweep. Some pipelines query "points near an alignment timestamp"
-  irrespective of sweep boundary; solid-state LiDAR data has no clean sweep
-  concept to begin with. The tuple-of-`LidarSweepData` form forces a
-  sweep-shaped abstraction on those consumers. The flat layout keeps
-  per-row partitioning expressible (via `align_offsets`) without making it
-  load-bearing.
-- The flat layout matches how every reviewed open AV dataset
-  (KITTI / nuScenes / Waymo) serializes points to disk and how every
-  reviewed downstream detection framework (OpenPCDet, MMDetection3D)
-  batches them internally. The Option-A → Option-B conversion that
-  detector-style consumers would otherwise have to perform is avoided.
-- Cross-row operations (range filter, intensity threshold, multi-row
-  aggregation in a common frame) become single numpy calls instead of
-  Python loops over `N` containers.
-- "Sweep" remains an interpretation of `align_offsets`, not a required
-  structure. Producers whose source data is sweep-shaped (spinning LiDARs,
-  KITTI-style file-per-sweep) populate `align_offsets` with sweep
-  boundaries. Producers whose source is solid-state or time-window-queried
-  populate it accordingly. Consumers that don't care simply ignore it.
+```python
+align_timestamps_ns:  npt.NDArray[np.int64]   # shape (N,) — alignment grid
+sensor_timestamps_ns: npt.NDArray[np.int64]   # shape (N,) — per-row source-reported time
+points_xyz:           npt.NDArray[np.float32] # shape (P_total, 3)
+points_timestamps_ns: npt.NDArray[np.int64]   # shape (P_total,) globally non-decreasing
+# N and P_total are independent. Consumers that want "points near
+# alignment row i" filter points_timestamps_ns directly.
+```
 
-Revisit if a future consumer needs strict per-row encapsulation
-(e.g., heavy per-row mutation, ragged-tensor framework integration)
-that the flat form makes awkward.
+Pros: keeps `LidarData` compatible with `AlignedFrame`'s row-matching
+protocol — the `(N,)` alignment grid lines up with other sensors' grids
+in the same bundle.
+
+Cons: initially the `(N,)` grid felt like it carried no per-point
+information — "what's the alignment timestamp of point `j`?" had no
+direct answer. Round 3 addressed this by collapsing to per-point
+alignment (Option D). Round 4 reversed that decision — see below.
+
+**Option D — per-point alignment; no `(N,)` grid at all**  (rejected on reflection)
+
+```python
+align_timestamps_ns:  npt.NDArray[np.int64]    # shape (P_total,) non-decreasing
+sensor_timestamps_ns: npt.NDArray[np.int64]    # shape (P_total,) non-decreasing
+points_xyz:           npt.NDArray[np.float32]  # shape (P_total, 3)
+```
+
+Pros: maximally simple; "what's the alignment timestamp of point `j`?"
+has an immediate answer (`align_timestamps_ns[j]`).
+
+Cons: **breaks `AlignedFrame`'s row-matching invariant.** A camera's
+`(30,)` and a lidar's `(P_total,)` `align_timestamps_ns` can't match
+`np.array_equal`, so `LidarData` and other row-shaped sensors can't
+coexist in the same bundle. Concretely blocks the primary use case:
+LiDAR-camera fusion inside an `AlignedFrame`.
+
+**Option C revisited — with alignment grid doubling as motion-comp reference instants**  (recommended)
+
+```python
+align_timestamps_ns:  npt.NDArray[np.int64]     # (N,) strictly increasing
+                                                 #   grid AND (when motion_compensated=True) per-row motion-comp
+                                                 #   reference instants
+sensor_timestamps_ns: npt.NDArray[np.int64]     # (N,) non-decreasing — per-row source-reported time
+points_xyz:           npt.NDArray[np.float32]   # (P_total, 3)
+points_timestamps_ns: npt.NDArray[np.int64]     # (P_total,) non-decreasing — per-point capture time
+```
+
+Same `(N,)` shape as Option C, but the semantic of `align_timestamps_ns`
+is enriched: when `motion_compensated=True`, `align_timestamps_ns[i]` is
+the reference instant that all points with per-point time closest to
+`align_timestamps_ns[i]` have been warped to. Different points in a batch
+can be compensated to different instants — a batch spanning 5 sweeps can
+compensate each sweep to its own midpoint, with
+`align_timestamps_ns = [midpoint_0, ..., midpoint_4]`. This makes the
+old `LidarMetadata.motion_compensation_timestamp_ns` scalar redundant —
+it is removed.
+
+**Recommendation: Option C revisited.** Rationale:
+
+- Four rounds of iteration. Round 1 (review feedback) moved from
+  Option A to Option B — sweep boundaries shouldn't be load-bearing.
+  Round 2 observed that the `align_offsets` partition was unused —
+  drop it (Option C). Round 3 collapsed to per-point alignment
+  (Option D). Round 4 reversed Round 3: the `AlignedFrame`
+  incompatibility was too expensive, and enriching Option C's
+  `align_timestamps_ns` with motion-comp reference instants restores the
+  answer to "what's each point compensated to?" without breaking the
+  bundle protocol.
+- **`AlignedFrame` integration works with zero validator changes.**
+  Both timestamp arrays are `(N,)`, matching `CameraData` / `ImuData` /
+  `EgoTrajectory`. No `isinstance` carve-outs; no new bundle abstraction.
+- **Motion-comp anchors are per-row, not per-batch.** A LiDAR batch
+  with multiple sweeps can compensate each sweep to its own reference
+  instant. More expressive than the old "one scalar for the whole batch"
+  model.
+- **Per-point ↔ align-row mapping.** The mapping can either be recorded
+  by the producer in the optional `points_align_index` field, or
+  reconstructed by consumers via the existing
+  [`find_closest_indices`](#ref-find-closest-indices) helper (which
+  wraps `np.searchsorted` with `np.clip` to `[0, N-1]`). Producers use
+  the explicit field when they applied a non-obvious policy (e.g.,
+  binning by `align_timestamps_ns ± Δ` rather than nearest); otherwise
+  the field is absent and the standard nearest-alignment convention
+  applies. Note the helper today requires strictly-increasing inputs
+  on both sides; `points_timestamps_ns` is only non-decreasing, so
+  either the helper needs a variant or the recovery must be inlined —
+  tracked as an [open follow-up](#open-follow-up-questions).
+  Consumers that don't need the mapping filter by per-point timestamps
+  directly.
+- **Sweep semantics** stay optional via `points_sweep_index`
+  ([D6](#d6-required-vs-optional-per-point-fields)) — orthogonal to the
+  alignment grid.
 
 ### D2. Ego-pose placement
 
@@ -351,21 +442,16 @@ pose live? No part of the sensors package currently carries ego pose;
 
 ```python
 ego_poses: npt.NDArray[np.float64] | None   # shape (N, 4, 4); rig-to-global
-                                            # frame named by LidarMetadata.ego_poses_frame
 ```
-
-`ego_poses` is interpreted as the rig-to-global-frame trajectory and lives
-in a global frame named by `LidarMetadata.ego_poses_frame` (e.g.,
-`"world"`, `"map"`, `"odom"`). This frame is independent of
-`LidarMetadata.reference_frame`, which describes the frame of
-`points_xyz`; the two can be set independently.
 
 Pros: localizes the change to LiDAR; doesn't disturb `CameraData` or
 `AlignedFrame`; consumers fetch pose directly from the LiDAR object.
 
-Cons: ego pose is logically a rig property, not a LiDAR property; if
+Cons: ego pose is logically a rig property, not a LiDAR property. If
 other sensors (radar, etc.) later need ego pose at sweep/scan time, the
-field will need to be lifted up, requiring a refactor.
+field will need to be lifted up, requiring a refactor. Also conflates
+two independent frame names on `LidarMetadata` (the frame of `points_xyz`
+and the global frame `ego_poses` targets).
 
 **Option B — add `ego_poses` to `AlignedFrame`**
 
@@ -384,14 +470,14 @@ shared across all sensors; couples `AlignedFrame` semantics to
 "trajectory of a rig," which may not always be defined (e.g., static
 captures).
 
-**Option C — add an `EgoTrajectory` type satisfying `SensorData`**
+**Option C — add an `EgoTrajectory` type satisfying `SensorData`**  (recommended)
 
 ```python
 @attrs.define(hash=False, frozen=True)
 class EgoTrajectory:
     align_timestamps_ns: npt.NDArray[np.int64]
     sensor_timestamps_ns: npt.NDArray[np.int64]
-    poses: npt.NDArray[np.float64]   # shape (N, 4, 4)
+    poses: npt.NDArray[np.float64]   # shape (N, 4, 4) rig-to-global
     frame: str   # e.g., "world", "map", "odom"
 ```
 
@@ -399,31 +485,40 @@ Then carry it inside `AlignedFrame.sensor_data` keyed by id (e.g.,
 `"ego"`):
 
 ```python
-frame.sensor_data["ego"]   # an EgoTrajectory
+frame.sensor_data["ego"]         # an EgoTrajectory
 frame.sensor_data["lidar_top"]   # a LidarData
 ```
 
 Pros: ego pose participates in the same alignment guarantees as every
 other stream; no `AlignedFrame` schema change; cleanly handles multiple
 trajectory sources (e.g., ground-truth GPS+IMU vs. SLAM estimate) by
-using different keys.
+using different keys. `LidarData` stays focused on the lidar payload;
+`LidarMetadata.reference_frame` is the only frame name on the lidar side.
 
 Cons: changes the "what counts as a sensor?" mental model;
 `SensorData`-as-trajectory is a slight overload.
 
-**Recommendation: Option A for the first cut, with Option C as the migration
-target.** Rationale:
+**Recommendation: Option C.** Rationale:
 
-- Option A makes LiDAR self-contained for the first implementation, with no
-  cross-class refactoring.
-- If a second sensor needs ego pose, or if a non-aligned LiDAR consumer needs
-  it, the field can be lifted to a sibling `EgoTrajectory` (Option C) with a
-  thin shim. Option A is forward-compatible with Option C.
-- Option B is rejected for the first cut because it modifies the shared
-  bundle for a single-sensor need.
+- Option C is the right end-state. Earlier drafts staged through Option A
+  first as a transitional shape on `LidarData`, but on reflection there is
+  no real benefit to that staging: Option A is a strict subset of Option C,
+  and migrating later would touch every consumer that reads ego pose. Better
+  to write consumers against the final shape from the start.
+- Option C cleanly handles ego pose for any future sensor that needs it
+  (radar, additional LiDAR with independent timing, etc.) without any
+  per-sensor refactoring — they all read `frame.sensor_data["ego"]`.
+- Option C supports multiple trajectory sources by using different keys
+  (e.g., `"ego_gnss_imu"` and `"ego_slam"`), and each trajectory satisfies
+  the `SensorData` alignment guarantees just like a sensor stream.
+- Option B is rejected because it modifies the shared `AlignedFrame` class
+  for what is conceptually an "additional sensor stream" — Option C
+  achieves the same sharing without the schema change.
 
-Revisit at the point a second sensor (radar, second LiDAR with independent
-timing, etc.) needs ego pose.
+`EgoTrajectory.poses` is in row-major homogeneous-transform form
+(`(N, 4, 4) float64`, last row `[0, 0, 0, 1]` within tolerance). The
+quaternion+translation alternative is captured in
+[Open Follow-Up Questions](#open-follow-up-questions).
 
 ### D3. Motion-compensation contract
 
@@ -439,16 +534,19 @@ A `LidarMetadata` field captures the contract:
 @attrs.define(hash=False, frozen=True)
 class LidarMetadata:
     motion_compensated: bool
-    reference_frame: str           # "sensor", "rig", "world", "map", ... — frame of points_xyz
-    sensor_model: str | None
-    motion_compensation_timestamp_ns: int | None   # required when motion_compensated=True
-    ego_poses_frame: str | None    # "world", "map", "odom", ... — required when ego_poses is non-None
+    reference_frame: str                              # frame of points_xyz: "sensor", "rig", "world", "map", ...
+    extrinsics: SensorExtrinsics | None = None        # static sensor-to-rig calibration (batch-level metadata)
+    sensor_model: str | None = None
+    # When motion_compensated=True, the per-row motion-comp reference instants
+    # live on LidarData.align_timestamps_ns[i]; there is no separate scalar
+    # field for the batch's compensation timestamp.
 ```
 
 Pros: supports both pipelines; doesn't force a costly transform at
 parse time when the consumer doesn't need it; makes the contract
-explicit and validatable. Matches the reviewed proprietary AV SDK
-one-for-one (a compensated flag plus a reference timestamp).
+explicit and validatable. The per-row motion-comp reference instants
+live on `LidarData.align_timestamps_ns`, so a batch spanning multiple
+sweeps can record independent reference instants per row.
 
 Cons: consumers must check the flag and apply or skip the transform
 themselves; a misconfigured producer can mislead downstream stages.
@@ -479,9 +577,15 @@ aggregation each consumer reimplements compensation.
 - The flag plus `reference_frame` together let validators reject
   inconsistent payloads (e.g., `motion_compensated=True` with
   `reference_frame="sensor"` is a contradiction).
-- `motion_compensation_timestamp_ns` records the instant all points were
-  warped to. It is required when `motion_compensated=True` and is the only
-  way a consumer can correctly compose this batch with a downstream pose.
+- When `motion_compensated=True`, the reference instant for each row is
+  stored in `LidarData.align_timestamps_ns[i]` (see
+  [D1](#d1-payload-shape-and-alignment-granularity)). Individual points
+  can therefore be compensated to different instants: a batch spanning
+  multiple sweeps records the per-sweep reference instants as successive
+  entries in `align_timestamps_ns`. Consumers resolve "which reference
+  instant is point `j` compensated to?" via
+  [`find_closest_indices`](#ref-find-closest-indices) on
+  `align_timestamps_ns` — no dedicated per-point index column.
 
 ### D4. Range-image representation
 
@@ -551,11 +655,15 @@ per-point arrays are flat with leading dimension `P_total` (see D1).
 **Required (proposed):**
 
 - `points_xyz: (P_total, 3) float32`
-- `points_intensity: (P_total,) float32` (or `uint16`; see below)
 - `points_timestamps_ns: (P_total,) int64`
+
+(`align_timestamps_ns` and `sensor_timestamps_ns` are also required
+per-batch but live at row granularity `(N,)` — see
+[D1](#d1-payload-shape-and-alignment-granularity) for the shape.)
 
 **Optional generic:**
 
+- `points_intensity: (P_total,) float32` (or `uint16`; see below)
 - `points_ring: (P_total,) uint16`
 - `points_return_index: (P_total,) uint8`
 - `points_reflectivity: (P_total,) uint16`
@@ -566,17 +674,30 @@ per-point arrays are flat with leading dimension `P_total` (see D1).
 - `points_radial_velocity: (P_total,) float32` m/s (Doppler-capable / FMCW
   lidars only; mirrors the per-point radial-velocity channel in the
   reviewed proprietary AV SDK)
+- `points_sweep_index: (P_total,) uint16` (producer-defined sweep id per
+  point; absent when the producer doesn't track sweep boundaries; sized
+  for fleets with many short sweeps in a single batch)
+- `points_align_index: (P_total,) uint16` (producer-authoritative
+  point → align-row mapping; each entry is an index into
+  `align_timestamps_ns`; absent when the producer expects consumers to
+  compute the mapping via `np.searchsorted`)
 
 **Recommendation as listed.** Rationale:
 
 - `points_xyz` is universally required.
-- `points_intensity` is present in every reviewed reference (KITTI,
-  nuScenes, Waymo, Ouster, ROS conventions); making it required reduces
-  consumer branching.
-- `points_timestamps_ns` is required because the motion-compensation
-  contract in D3 needs them; if the source provides only a row-level
-  timestamp, a parser should populate this field by interpolation from row
-  start/end and document the choice.
+- `points_timestamps_ns` is required. Motion-compensation math, per-point
+  time-window queries, and per-point ↔ alignment-row recovery all depend
+  on it. If a source provides only sweep-level timing, the parser
+  synthesises per-point times (uniform interpolation is acceptable) and
+  documents the synthesis.
+- `points_intensity` is common but not universal: post-processed
+  CAD-style clouds, depth-camera-derived clouds, and some specialty
+  sensors omit it. Keeping it optional admits those sources without
+  forcing parsers to synthesize placeholder values.
+- `points_sweep_index` is the first-class home for "which producer-defined
+  sweep did this point come from?" — the only sweep-shaped semantic that
+  survived the D1 iterations and is cheap to populate for sweep-shaped
+  producers.
 - `points_ring` and `points_return_index` are sensor-specific; KITTI lacks
   both. Keeping them optional allows loading minimal-schema sources.
 - `points_reflectivity` (calibrated reflectance) is distinct from raw
@@ -595,93 +716,185 @@ footprint becomes a constraint.
 
 ## Tentative `LidarData`
 
-This section reflects the recommendations above (D1=B flat-with-offsets,
-D2=A, D3=A, D4=A, D5=A, D6 as listed). It is tentative and will be updated
-as decisions are ratified.
+This section reflects the recommendations above (D1 = Option C revisited
+with alignment grid doubling as motion-comp reference instants, D2 = C
+`EgoTrajectory` sibling, D3=A, D4=A, D5=A, D6 as listed). It is tentative
+and will be updated as decisions are ratified.
 
 ```python
 @attrs.define(hash=False, frozen=True)
 class LidarMetadata:
-    motion_compensated:               bool
-    reference_frame:                  str            # "sensor", "rig", "world", "map", ...
-    sensor_model:                     str | None = None
-    motion_compensation_timestamp_ns: int | None = None   # required when motion_compensated=True
-    ego_poses_frame:                  str | None = None   # "world" | "map" | "odom" | ... — required when ego_poses is non-None
+    motion_compensated: bool
+    reference_frame: str                                # frame of points_xyz
+    extrinsics: SensorExtrinsics | None = None          # static sensor-to-rig calibration
+    sensor_model: str | None = None
+    # When motion_compensated=True, per-row motion-comp reference instants
+    # live on LidarData.align_timestamps_ns[i]. No dedicated scalar field.
 
 
 @attrs.define(hash=False, frozen=True)
 class LidarData:
     __hash__ = None
 
-    # Batch-level (length N = number of alignment rows).
-    align_timestamps_ns:  npt.NDArray[np.int64]                # (N,)
-    sensor_timestamps_ns: npt.NDArray[np.int64]                # (N,)
-    align_offsets:        npt.NDArray[np.int64]                # (N+1,)
+    # SensorData protocol — row-level dual timestamps (length N).
+    align_timestamps_ns:  npt.NDArray[np.int64]                # (N,) strictly increasing
+                                                                #   grid AND (when motion_compensated=True) per-row
+                                                                #   motion-comp reference instants
+    sensor_timestamps_ns: npt.NDArray[np.int64]                # (N,) non-decreasing — per-row source-reported time
 
-    # Flat per-point (length P_total = align_offsets[-1]).
-    points_xyz:                 npt.NDArray[np.float32]        # (P_total, 3)
-    points_intensity:           npt.NDArray[np.float32]        # (P_total,)
-    points_timestamps_ns:       npt.NDArray[np.int64]          # (P_total,)
+    # Required per-point payload (length P_total; independent of N).
+    points_xyz:           npt.NDArray[np.float32]              # (P_total, 3)
+    points_timestamps_ns: npt.NDArray[np.int64]                # (P_total,) non-decreasing — per-point capture time
 
-    metadata: LidarMetadata
+    metadata: LidarMetadata                                    # carries extrinsics + frame + comp state
 
-    # Optional flat per-point.
-    points_ring:            npt.NDArray[np.uint16]  | None = None   # (P_total,)
-    points_return_index:    npt.NDArray[np.uint8]   | None = None   # (P_total,)
-    points_reflectivity:    npt.NDArray[np.uint16]  | None = None   # (P_total,)
-    points_ambient:         npt.NDArray[np.uint16]  | None = None   # (P_total,)
-    points_validity:        npt.NDArray[np.bool_]   | None = None   # (P_total,)
-    points_radial_velocity: npt.NDArray[np.float32] | None = None   # (P_total,)
+    # Optional per-point payload.
+    points_intensity:       npt.NDArray[np.float32] | None = None
+    points_ring:            npt.NDArray[np.uint16]  | None = None
+    points_return_index:    npt.NDArray[np.uint8]   | None = None
+    points_reflectivity:    npt.NDArray[np.uint16]  | None = None
+    points_ambient:         npt.NDArray[np.uint16]  | None = None
+    points_validity:        npt.NDArray[np.bool_]   | None = None
+    points_radial_velocity: npt.NDArray[np.float32] | None = None
+    points_sweep_index:     npt.NDArray[np.uint16]  | None = None   # producer-defined sweep id per point
+    points_align_index:     npt.NDArray[np.uint16]  | None = None   # index into align_timestamps_ns (producer-authoritative)
 
-    # Optional batch-level.
-    ego_poses:  npt.NDArray[np.float64] | None = None    # (N, 4, 4)
-    extrinsics: SensorExtrinsics       | None = None
+
+@attrs.define(hash=False, frozen=True)
+class EgoTrajectory:                                           # satisfies SensorData
+    __hash__ = None
+    align_timestamps_ns:  npt.NDArray[np.int64]                # (N,) strictly increasing
+    sensor_timestamps_ns: npt.NDArray[np.int64]                # (N,) non-decreasing
+    poses:                npt.NDArray[np.float64]              # (N, 4, 4) rig-to-global
+    frame:                str                                  # "world" | "map" | "odom" | ...
 ```
 
-Points belonging to alignment row `i` are
-`points_xyz[align_offsets[i]:align_offsets[i+1]]` (and similarly for every
-other `points_*` array). When a producer's natural unit is a spinning-LiDAR
-sweep, `align_offsets` carries sweep boundaries. When the producer instead
-queries "points near alignment instant `t_i`," `align_offsets` carries
-time-window boundaries. Pipelines that ignore the per-row partitioning can
-operate on the flat arrays directly.
+Notes:
+
+- `LidarData` has two batch dimensions: `N` (alignment rows) and
+  `P_total` (points). They are independent — the alignment grid is not
+  a partition of the points, and `P_total` need not be a multiple of
+  `N` in any way.
+- **Per-point ↔ alignment-row mapping.** When the producer applied a
+  non-obvious mapping (e.g., binning by `align_timestamps_ns ± Δ` rather
+  than nearest), it can be recorded explicitly in the optional
+  `points_align_index` field. When absent, consumers reconstruct the
+  mapping on demand via
+  `np.searchsorted(align_timestamps_ns, points_timestamps_ns)` under a
+  nearest-alignment convention. Producers document which path they took.
+- **`AlignedFrame` integration is direct.** Both `LidarData` and
+  `EgoTrajectory` expose `(N,) align_timestamps_ns` and `sensor_timestamps_ns`,
+  matching the existing protocol; no validator changes are needed.
+- Multiple trajectories (e.g., ground-truth GPS+IMU and SLAM estimate)
+  coexist inside a bundle under different `EgoTrajectory` keys
+  (`"ego_gnss_imu"`, `"ego_slam"`).
 
 ### Required Fields (`LidarData`)
 
 | Field | dtype | shape | unit | Required | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `align_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Reference timestamps requested from the `SamplingGrid`; strictly increasing. |
-| `sensor_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Source reference timestamps selected for each alignment row; non-decreasing; may repeat under supersampling. |
-| `align_offsets` | `np.int64` | `(N+1,)` | — | yes | CSR-style window boundaries: points for alignment row `i` are `points_xyz[align_offsets[i]:align_offsets[i+1]]`. `align_offsets[0] == 0`; `align_offsets[N] == P_total`; non-decreasing. Empty rows are allowed (`align_offsets[i] == align_offsets[i+1]`). |
+| `align_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Strictly increasing. When `motion_compensated=True`, each entry is also the reference instant that all points nearest to it (by `points_timestamps_ns`) have been warped to. |
+| `sensor_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Per-row source-reported reference time. Non-decreasing; may repeat under supersampling. |
 | `points_xyz` | `np.float32` | `(P_total, 3)` | m | yes | Point coordinates in the frame declared by `LidarMetadata.reference_frame`. |
-| `points_intensity` | `np.float32` | `(P_total,)` | sensor-defined | yes | Return strength; sensor calibration determines absolute units. |
-| `points_timestamps_ns` | `np.int64` | `(P_total,)` | ns | yes | Per-point capture time. Non-decreasing within each per-row window. |
-| `metadata` | `LidarMetadata` | — | — | yes | Carries `motion_compensated` flag, `reference_frame` (frame of `points_xyz`), `motion_compensation_timestamp_ns`, `sensor_model`, and `ego_poses_frame` (global frame of `ego_poses`, required when `ego_poses` is non-`None`). |
+| `points_timestamps_ns` | `np.int64` | `(P_total,)` | ns | yes | Per-point capture time. Non-decreasing globally across the batch. |
+| `metadata` | `LidarMetadata` | — | — | yes | Carries `motion_compensated`, `reference_frame` (frame of `points_xyz`), `extrinsics` (static sensor-to-rig calibration), and `sensor_model`. |
 
 ### Optional Fields (`LidarData`)
 
 | Field | dtype | shape | unit | Notes |
 | --- | --- | --- | --- | --- |
+| `points_intensity` | `np.float32` | `(P_total,)` | sensor-defined | Return strength; sensor calibration determines absolute units. Absent for sources that don't report intensity. |
 | `points_ring` | `np.uint16` | `(P_total,)` | — | Laser/ring index for spinning sensors; absent for solid-state. Sized for sensors with more than 256 channels (e.g., next-generation Ouster / Hesai). |
 | `points_return_index` | `np.uint8` | `(P_total,)` | — | 0 = first return, 1 = second, etc. Absent if only first returns retained. |
-| `points_reflectivity` | `np.uint16` | `(P_total,)` | sensor-defined | Calibrated reflectance distinct from raw `intensity`. |
+| `points_reflectivity` | `np.uint16` | `(P_total,)` | sensor-defined | Calibrated reflectance distinct from raw `points_intensity`. |
 | `points_ambient` | `np.uint16` | `(P_total,)` | sensor-defined | Near-infrared ambient channel (Ouster-style sensors). |
 | `points_validity` | `np.bool_` | `(P_total,)` | — | `False` marks points the source flagged invalid / blocked / filtered. |
 | `points_radial_velocity` | `np.float32` | `(P_total,)` | m/s | Per-point radial velocity from FMCW / Doppler lidars. |
-| `ego_poses` | `np.float64` | `(N, 4, 4)` | — | Rig-to-global-frame transform at each alignment row's reference time. The target global frame is named by `LidarMetadata.ego_poses_frame` and is independent of `LidarMetadata.reference_frame` (which describes the frame of `points_xyz`, not of the rig trajectory). Consumers interpolate to per-point times using `points_timestamps_ns`. |
-| `extrinsics` | `SensorExtrinsics` | `(4, 4)` | — | Static sensor-to-rig calibration; one matrix shared across the batch. |
+| `points_sweep_index` | `np.uint16` | `(P_total,)` | — | Producer-defined sweep / scan id per point. Absent when the producer doesn't track sweep boundaries. Sized for fleets with many short sweeps in a single batch. |
+| `points_align_index` | `np.uint16` | `(P_total,)` | — | Producer-authoritative point → alignment-row mapping; each entry is an index into `align_timestamps_ns` (must be in `[0, N)`). Absent when consumers should compute the mapping via `np.searchsorted` and `np.clip`. |
+
+### Required Fields (`EgoTrajectory`)
+
+| Field | dtype | shape | unit | Required | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `align_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Same `SensorData` protocol requirement as `LidarData`. |
+| `sensor_timestamps_ns` | `np.int64` | `(N,)` | ns | yes | Same `SensorData` protocol requirement as `LidarData`. |
+| `poses` | `np.float64` | `(N, 4, 4)` | — | yes | Rig-to-global transform at each alignment row's reference time. Last row of each `(4, 4)` equals `[0, 0, 0, 1]` within tolerance. |
+| `frame` | `str` | — | — | yes | Name of the target global frame (e.g., `"world"`, `"map"`, `"odom"`). |
 
 ## Timestamp Semantics
 
-`align_timestamps_ns` is the reference timeline requested by the
-`SamplingGrid` at the sweep level. It is the timestamp downstream
-`AlignedFrame` consumers use to compare rows across sensors.
+`LidarData` carries three timestamp arrays:
 
-`sensor_timestamps_ns` is the selected source measurement timestamp for each
-alignment row — typically the start, midpoint, or end of the sweep (when
-points are sweep-organized) or the query instant (when points are
-window-organized). Parsers should document which convention they use and
-preserve it consistently across all rows in a batch.
+- **`align_timestamps_ns: (N,)`** — the alignment grid, strictly
+  increasing. Satisfies the `SensorData` protocol at row granularity.
+  When `motion_compensated=True`, each `align_timestamps_ns[i]` is also
+  the reference instant that points nearest to it (by
+  `points_timestamps_ns`) have been warped to. Different rows can carry
+  independent reference instants — a batch spanning multiple sweeps
+  records the per-sweep motion-comp anchors as successive entries.
+- **`sensor_timestamps_ns: (N,)`** — per-row source-reported reference
+  time. Non-decreasing. Typically the sweep start / midpoint / query
+  instant, producer's choice; parsers document the convention.
+- **`points_timestamps_ns: (P_total,)`** — per-point capture time.
+  Non-decreasing globally across the batch. This is what makes
+  per-point-time-window queries and motion-comp math possible.
+
+**Recovering "which alignment row is point `j` associated with?"** is a
+consumer-side operation, not a stored field. The intended primitive is
+the existing sensor-library helper
+[`find_closest_indices`](#ref-find-closest-indices), which wraps
+`np.searchsorted` with the necessary `np.clip` to `[0, N-1]`:
+
+```python
+# Nearest-align policy (typical for motion-comp):
+align_idx = find_closest_indices(lidar.align_timestamps_ns,
+                                 lidar.points_timestamps_ns)  # (P_total,)
+```
+
+Caveat: `find_closest_indices` today requires both inputs to be
+strictly increasing, while `points_timestamps_ns` is only
+non-decreasing (LiDAR can return simultaneous points). Reusing it
+verbatim requires relaxing the grid-side check, exposing a variant
+that skips it, or inlining the equivalent `searchsorted` + `np.clip`
++ nearest pick. This is tracked as an
+[open follow-up](#open-follow-up-questions). The inlined form is:
+
+```python
+# Same math as find_closest_indices, tolerant of non-strictly-increasing grid:
+prev = np.searchsorted(lidar.align_timestamps_ns,
+                       lidar.points_timestamps_ns, side="right") - 1
+prev = np.clip(prev, 0, len(lidar.align_timestamps_ns) - 1)
+nxt  = np.clip(prev + 1, 0, len(lidar.align_timestamps_ns) - 1)
+dp = np.abs(lidar.points_timestamps_ns - lidar.align_timestamps_ns[prev])
+dn = np.abs(lidar.align_timestamps_ns[nxt] - lidar.points_timestamps_ns)
+align_idx = np.where(dn < dp, nxt, prev)   # (P_total,) int — nearest align row per point
+```
+
+The producer's motion-compensation policy (which alignment row each point
+was actually warped to) should be documented by the parser so consumers
+know which recovery rule to use — nearest-align is the recommended
+default.
+
+**Parsers ship identity by default** — `align_timestamps_ns` at parser
+output typically records the natural alignment moments of the source
+(sweep midpoints, camera frame times, etc.). A separate downstream
+grid-binning helper (see [Related Structures](#related-structures)) can
+map an existing batch onto a coarser or different `align_timestamps_ns`
+grid when a consumer needs it; the helper rewrites the `(N,)` timestamp
+arrays but never touches `points_timestamps_ns`.
+
+**Grid-binning interacts with motion compensation.** When
+`motion_compensated=True`, each `align_timestamps_ns[i]` is not just a
+label — it is the physical reference instant that points nearest to
+row `i` have already been warped to. Silently re-labelling those
+entries would invalidate the compensation anchors while leaving
+`points_xyz` untouched. The grid-binning helper must therefore either
+(a) require `motion_compensated=False` on input (parser-native batches,
+the common case), or (b) accept a pose source (typically an
+`EgoTrajectory`) and re-warp `points_xyz` onto the new anchors before
+rewriting `align_timestamps_ns`. Pure label-only re-binning of a
+compensated batch is not a supported operation.
 
 `LidarData` deliberately does not carry a `pts_stream` (producer-native
 presentation timestamp) array analogous to `CameraData.pts_stream`. In all
@@ -693,19 +906,10 @@ motivates `pts_stream` on `CameraData` does not arise. Re-add the field if
 a future LiDAR source format uses a non-ns native time domain where
 lossless re-seek would otherwise be impossible.
 
-`points_timestamps_ns` is the per-point capture time, in absolute ns matching
-the batch's `sensor_timestamps_ns` time base. Non-decreasing within each
-per-row window (i.e., within
-`points_timestamps_ns[align_offsets[i]:align_offsets[i+1]]`); the array as a
-whole is not required to be globally non-decreasing because adjacent rows
-may overlap in time. The relation between row-level `sensor_timestamps_ns[i]`
-and per-point times in row `i` is sensor- and parser-specific: typically
-`sensor_timestamps_ns[i]` is the sweep start or midpoint, and the per-row
-window covers a ~100 ms range for spinning sensors.
-
-If a source provides only a row-level timestamp, the parser should
-synthesize `points_timestamps_ns` (uniform interpolation across the row's
-duration is acceptable) and document the synthesis.
+If a source provides only a sweep-level timestamp and no per-point timing,
+the parser should synthesize `points_timestamps_ns` (uniform interpolation
+across an estimated capture duration is acceptable) and document the
+synthesis.
 
 ## Coordinate Frames
 
@@ -722,8 +926,8 @@ Recommended defaults at the Sensor Library API boundary:
 
 - Right-handed frames.
 - SI units: meters for `xyz`, seconds (via ns timestamps) for time.
-- Static sensor-to-rig calibration in `LidarData.extrinsics`.
-- Time-varying rig-to-global pose (if available) in `LidarData.ego_poses`; the target global frame is named by `LidarMetadata.ego_poses_frame` and is independent of `LidarMetadata.reference_frame`.
+- Static sensor-to-rig calibration in `LidarMetadata.extrinsics` (batch-level metadata).
+- Time-varying rig-to-global pose (if available) in a sibling `EgoTrajectory` carried inside the same bundle (both `LidarData` and `EgoTrajectory` expose `(N,)` alignment, so they can sit in the same `AlignedFrame`); the target global frame is named by `EgoTrajectory.frame` and is independent of `LidarMetadata.reference_frame`.
 - Frame conventions (axis direction, rotation order) follow ROS REP 103 where
   applicable ([REP 103](#ref-ros-rep-103)).
 
@@ -735,8 +939,8 @@ The valid combinations of `motion_compensated` and `reference_frame` are:
 | `False` | `"rig"` | Each point in the rig frame at its own capture time, obtained from sensor-frame coordinates via the static `extrinsics`. Cloud is time-sheared because the rig frame itself moves with the car. No ego trajectory required. |
 | `False` | `"world"` / `"map"` | **Invalid** — rejected by validators. Reaching a fixed global frame requires per-point `T_world_rig(t_capture)` lookup, which is mathematically equivalent to motion compensation; producers should declare `True` and record the chosen anchor instant. |
 | `True` | `"sensor"` | **Invalid** — rejected by validators. A single-instant snapshot of a moving frame is ill-defined; producers should target `"rig"` or a global frame instead. |
-| `True` | `"rig"` | All points motion-compensated into the rig frame at `motion_compensation_timestamp_ns`. |
-| `True` | `"world"` / `"map"` | All points motion-compensated into a global frame; `motion_compensation_timestamp_ns` records the producer's chosen anchor instant. |
+| `True` | `"rig"` | Points motion-compensated into the rig frame. When `N == 1`, `align_timestamps_ns[0]` is the single reference instant. When `N > 1`, different points are compensated to different instants — point `j` was warped to whichever `align_timestamps_ns[i]` its per-point time is nearest to. |
+| `True` | `"world"` / `"map"` | Same as above, but the target frame is a fixed global frame. Per-row reference instants live in `align_timestamps_ns`. |
 
 ## Validation Constraints
 
@@ -745,27 +949,31 @@ tables. Non-timestamp fields use these constraints:
 
 | Field | Constraint |
 | --- | --- |
-| all `LidarData` row-indexed arrays | Same leading length `N` as `align_timestamps_ns` (applies to `sensor_timestamps_ns` and `ego_poses`). |
-| `align_offsets` | `np.int64`, shape `(N+1,)`, non-decreasing, `align_offsets[0] == 0`, `align_offsets[N] == P_total` (matches the length of every `points_*` array). Empty windows allowed. |
-| all `LidarData` point-indexed arrays | Same leading length `P_total` (applies to `points_xyz`, `points_intensity`, `points_timestamps_ns`, and every present optional `points_*` field). |
-| `points_xyz` | `np.float32`, shape `(P_total, 3)`, finite values (no NaN/Inf). |
-| `points_intensity` | `np.float32`, shape `(P_total,)`, finite values. |
-| `points_timestamps_ns` | `np.int64`, shape `(P_total,)`, non-decreasing within each per-row window `[align_offsets[i]:align_offsets[i+1]]`. The array is not required to be globally non-decreasing. |
-| `points_ring` | Optional `np.uint16`, shape `(P_total,)`. |
-| `points_return_index` | Optional `np.uint8`, shape `(P_total,)`. |
-| `points_reflectivity` | Optional `np.uint16`, shape `(P_total,)`. |
-| `points_ambient` | Optional `np.uint16`, shape `(P_total,)`. |
-| `points_validity` | Optional `np.bool_`, shape `(P_total,)`. |
-| `points_radial_velocity` | Optional `np.float32`, shape `(P_total,)`, finite values. |
-| `ego_poses` | Optional `np.float64`, shape `(N, 4, 4)`, last row of each `(4, 4)` equals `[0, 0, 0, 1]` within tolerance. The target global frame is named by `LidarMetadata.ego_poses_frame`; it is independent of `LidarMetadata.reference_frame`. |
-| `extrinsics` | Optional `SensorExtrinsics`; existing 4x4 `float64` validators apply ([SensorExtrinsics](#ref-sensor-extrinsics)). |
-| `LidarMetadata` | `motion_compensated=True` requires `reference_frame != "sensor"` and a non-`None` `motion_compensation_timestamp_ns`. `motion_compensated=False` requires `reference_frame in {"sensor", "rig"}` — `"world"` / `"map"` are rejected because reaching a fixed global frame is mathematically equivalent to motion compensation and should be declared as such. A non-`None` `ego_poses` array on `LidarData` requires a non-`None` `ego_poses_frame` on `LidarMetadata`. |
+| `LidarData` row-level arrays | Both `align_timestamps_ns` and `sensor_timestamps_ns` share the leading length `N`. |
+| `LidarData` per-point arrays | All share the leading length `P_total` (applies to `points_xyz`, `points_timestamps_ns`, and every present optional `points_*` field). `P_total` is independent of `N`. |
+| `LidarData.align_timestamps_ns` | `np.int64`, shape `(N,)`, strictly increasing. |
+| `LidarData.sensor_timestamps_ns` | `np.int64`, shape `(N,)`, non-decreasing. |
+| `LidarData.points_xyz` | `np.float32`, shape `(P_total, 3)`, finite values (no NaN/Inf). |
+| `LidarData.points_timestamps_ns` | `np.int64`, shape `(P_total,)`, non-decreasing globally across the batch. |
+| `LidarData.points_intensity` | Optional `np.float32`, shape `(P_total,)`, finite values. |
+| `LidarData.points_ring` | Optional `np.uint16`, shape `(P_total,)`. |
+| `LidarData.points_return_index` | Optional `np.uint8`, shape `(P_total,)`. |
+| `LidarData.points_reflectivity` | Optional `np.uint16`, shape `(P_total,)`. |
+| `LidarData.points_ambient` | Optional `np.uint16`, shape `(P_total,)`. |
+| `LidarData.points_validity` | Optional `np.bool_`, shape `(P_total,)`. |
+| `LidarData.points_radial_velocity` | Optional `np.float32`, shape `(P_total,)`, finite values. |
+| `LidarData.points_sweep_index` | Optional `np.uint16`, shape `(P_total,)`. No ordering or contiguity constraint; sweep ids can repeat and can appear out-of-order. |
+| `LidarData.points_align_index` | Optional `np.uint16`, shape `(P_total,)`. Every entry must satisfy `0 <= v < N`. No ordering or contiguity constraint across points. |
+| `LidarMetadata.extrinsics` | Optional `SensorExtrinsics`; existing 4x4 `float64` validators apply ([SensorExtrinsics](#ref-sensor-extrinsics)). |
+| `LidarMetadata` cross-field | `motion_compensated=True` requires `reference_frame != "sensor"`. `motion_compensated=False` requires `reference_frame in {"sensor", "rig"}` — `"world"` / `"map"` are rejected because reaching a fixed global frame is mathematically equivalent to motion compensation and should be declared as such. |
+| `EgoTrajectory.poses` | `np.float64`, shape `(N, 4, 4)`, last row of each `(4, 4)` equals `[0, 0, 0, 1]` within tolerance. `N` matches the length of `align_timestamps_ns`. |
+| `EgoTrajectory.frame` | Non-empty `str`; typically `"world"`, `"map"`, or `"odom"`. |
 
 Follow the existing pattern from `CameraData`: attach shared length-match
-validation to the last required field so that `align_offsets`, every
-required `points_*` array, and every present optional `points_*` array have
-been bound by the time the validator runs; expose read-only views via
-`as_readonly_view` without mutating caller-owned arrays.
+validation to the last required field so that every required `points_*`
+array and every present optional `points_*` array have been bound by the
+time the validator runs; expose read-only views via `as_readonly_view`
+without mutating caller-owned arrays.
 
 Per-point `xyz` finite-value validation rejects NaN and Inf to keep the
 contract simple. Sources that emit "no return" placeholders (some Velodyne
@@ -784,13 +992,36 @@ A future `RangeImageData` sibling payload may be added as an optional field
 on `LidarData` for sensors and consumers that need to preserve the
 range-image topology. See [D4](#d4-range-image-representation).
 
-A future `EgoTrajectory` `SensorData` type may absorb the `ego_poses` field
-once a second sensor needs rig pose. See [D2](#d2-ego-pose-placement).
+`EgoTrajectory` is part of this design (not a future addition). It is a
+`SensorData`-compliant container for the rig-to-global trajectory with
+the usual `(N,)` shape. See [D2](#d2-ego-pose-placement). `LidarData` and
+`EgoTrajectory` both expose `(N,)` alignment arrays, so they sit in the
+same `AlignedFrame` cleanly — no bundle changes required. Other future
+sensors (radar, additional LiDARs at the same `(N,)` granularity) read
+`frame.sensor_data["ego"]` without any per-sensor refactor; multiple
+trajectory sources coexist under different keys (e.g., `"ego_gnss_imu"`
+and `"ego_slam"`).
 
 A future motion-compensation helper (transform a
 `motion_compensated=False, reference_frame="sensor"` `LidarData` into a
-`motion_compensated=True, reference_frame="rig"` one) belongs alongside the
-data class but is not part of the data class itself.
+`motion_compensated=True, reference_frame="rig"` one, using an
+`EgoTrajectory` from the same `AlignedFrame`) belongs alongside the data
+classes but is not part of them.
+
+A future **grid-binning / re-alignment helper** (map an existing
+`LidarData`'s `align_timestamps_ns` onto a different target grid — for
+example, a camera's frame times) also belongs alongside the data
+classes. Parsers ship the source's natural alignment moments; consumers
+that need a different alignment invoke this helper explicitly. For a
+`motion_compensated=False` batch, the helper produces a new `LidarData`
+with re-labelled `align_timestamps_ns` and `sensor_timestamps_ns` at
+the new `N`; `points_timestamps_ns` and the flat per-point payload
+are never touched. For a `motion_compensated=True` batch, the same
+re-labelling would silently invalidate the compensation anchors stored
+in `align_timestamps_ns[i]` — so the helper must either reject such
+input or additionally re-warp `points_xyz` onto the new anchors using
+an `EgoTrajectory`, which turns it into a re-compensation operation
+rather than a pure label rewrite.
 
 Do not introduce a separate `RawLidarData` or `UndecodedLidarPayload` type
 until concretely needed; matches the precedent from
@@ -802,12 +1033,16 @@ Proposed; not yet implemented. The implementation will add:
 
 1. `cosmos_curator/core/sensors/data/lidar_data.py`, with attrs-based
    `LidarData` and `LidarMetadata` classes matching this design note.
-2. Shared validation helpers in
-   `cosmos_curator/core/sensors/utils/validation.py` for any
-   LiDAR-specific patterns (e.g., finite `float32` arrays, non-decreasing
-   `int64` within per-row windows, CSR-style offset arrays, 4x4
-   transform-batch validators) not already present.
-3. Tests under `tests/cosmos_curator/core/sensors/data/test_lidar_data.py`.
+2. `cosmos_curator/core/sensors/data/ego_trajectory.py` (or a similar path
+   under `core/sensors/data/`), with the `EgoTrajectory` `SensorData`
+   class matching the sketch above.
+3. Shared validation helpers in
+   `cosmos_curator/core/sensors/utils/validation.py` for any LiDAR- or
+   trajectory-specific patterns (e.g., finite `float32` arrays,
+   globally-non-decreasing `int64` arrays, 4x4 transform-batch validators)
+   not already present.
+4. Tests under `tests/cosmos_curator/core/sensors/data/test_lidar_data.py`
+   and `test_ego_trajectory.py`.
 
 ## Open Follow-Up Questions
 
@@ -815,10 +1050,11 @@ Proposed; not yet implemented. The implementation will add:
   vendor SDK (Ouster, Velodyne), a proprietary AV SDK, or a static dataset
   reader (KITTI, nuScenes, Waymo)? The choice affects which timestamp
   conventions and which optional fields are exercised first.
-- When `points_timestamps_ns` is synthesized from a row-level timestamp, is
-  uniform interpolation across the row's duration acceptable to downstream
-  consumers, or do they require sensor-model-specific timing tables?
-- Should `ego_poses` use a quaternion+translation representation
+- When per-point timestamps must be synthesized from a sweep-level
+  timestamp, is uniform interpolation across an estimated capture duration
+  acceptable to downstream consumers, or do they require
+  sensor-model-specific timing tables?
+- Should `EgoTrajectory.poses` use a quaternion+translation representation
   (`(N, 7) float64`) instead of `(N, 4, 4) float64`? Quaternion form is
   smaller and avoids non-orthonormal `R` matrices but requires conversion
   before composition.
@@ -837,39 +1073,31 @@ Proposed; not yet implemented. The implementation will add:
   thereof) from return **index** explicitly. Either pick one canonical
   ordering and document it, or add a per-batch field declaring which
   convention the producer used.
-- Should `LidarData.extrinsics` carry the nominal (as-designed) transform,
-  the calibrated (corrected) transform, or both? Some calibration systems
-  (including the reviewed proprietary AV SDK) separate a nominal
-  sensor-to-rig transform from a calibrated one; the current single-matrix
-  slot has to pick one (likely the calibrated one when available) and loses
-  the nominal fallback.
+- Should `LidarMetadata.extrinsics` carry the nominal (as-designed)
+  transform, the calibrated (corrected) transform, or both? Some
+  calibration systems (including the reviewed proprietary AV SDK) separate
+  a nominal sensor-to-rig transform from a calibrated one; the current
+  single-matrix slot has to pick one (likely the calibrated one when
+  available) and loses the nominal fallback.
 - Validity policy: keep "drop invalid points at parser time" as the default,
   or require parsers to populate the `points_validity` mask when the source
   carries per-point invalid / blockage flags? The latter preserves more
   information for blockage / weather analysis but enlarges the per-batch
   payload.
-- Are empty per-row windows (`align_offsets[i] == align_offsets[i+1]`)
-  semantically meaningful (e.g., a sensor-dropout row that the alignment
-  grid still wants to represent), or should the parser fill them with
-  synthesized placeholder points? Default recommendation: allow empty
-  windows; consumers that need points-per-row guarantees should validate
-  upstream.
-- May per-row windows overlap in time (i.e., a point's
-  `points_timestamps_ns[j]` falls inside multiple windows when comparing
-  against `align_timestamps_ns`)? With CSR offsets the point belongs to
-  exactly one window by construction, but a producer choosing
-  `align_offsets` for "nearest sweep to each alignment timestamp" could
-  legitimately route the same physical point into different rows on
-  different runs. Document the producer's policy explicitly rather than
-  enforcing one in the data class.
-- For producers that have no natural per-row partition (e.g., a single
-  "bag of points near alignment instant `t_0`" query), is the canonical
-  shape `N == 1`, `align_offsets == [0, P_total]`? Or should `LidarData`
-  also accept `N == 0` for empty batches?
-- Should a sweep-aware helper (e.g., a lightweight `LidarSweepView`
-  iterator providing zero-copy per-row slices) be added alongside
-  `LidarData` for the subset of consumers that do want per-sweep access?
-  This would not change `LidarData` itself.
+- Reusing [`find_closest_indices`](#ref-find-closest-indices) for the
+  point → align-row recovery: the helper requires strictly increasing
+  inputs on both sides, but `points_timestamps_ns` is only
+  non-decreasing (LiDAR can return simultaneous points). Options:
+  relax the grid-side check in place, add a variant that accepts a
+  non-strictly-increasing grid, or leave the helper untouched and
+  inline the equivalent `searchsorted` + `np.clip` + nearest pick at
+  the `LidarData` recovery call sites. Pick before the implementation
+  MR so the parser and any downstream helpers agree on one primitive.
+- Should `EgoTrajectory.frame` use the same vocabulary as
+  `LidarMetadata.reference_frame` (`"sensor"` / `"rig"` / `"world"` /
+  `"map"`) or a different set (e.g., adding `"odom"`)? They serve
+  different purposes — points' frame vs trajectory's target frame — so
+  the natural sets aren't necessarily the same.
 
 ## References
 
@@ -888,6 +1116,10 @@ Proposed; not yet implemented. The implementation will add:
   `docs/curator/design/sensor-library-imu-data.md`
 - <a id="ref-validation-helpers"></a>Sensor validation helpers:
   `cosmos_curator/core/sensors/utils/validation.py`
+- <a id="ref-find-closest-indices"></a>`find_closest_indices` helper
+  (searchsorted + clip nearest-index primitive used elsewhere in the
+  sensor library):
+  `cosmos_curator/core/sensors/sampling/sampler.py`
 - <a id="ref-ros-pointcloud2"></a>ROS 2 `sensor_msgs/msg/PointCloud2`:
   <https://docs.ros.org/en/jazzy/p/sensor_msgs/msg/PointCloud2.html>
 - <a id="ref-ros-rep-103"></a>ROS REP 103: Standard Units of Measure and
