@@ -32,9 +32,9 @@ helm repo update
 ```
 
 ### Set Chart Version
-The latest version is `2.2.2`. Set this as an environment variable:
+The latest version is `2.3.0`. Set this as an environment variable:
 ```bash
-export CHART_VERSION=2.2.2
+export CHART_VERSION=2.3.0
 ```
 
 ## Deployment
@@ -184,6 +184,28 @@ persistence:
 To keep PVCs for manual cleanup or re-use between deployments, set `whenDeleted: Retain`.
 
 
+
+### Structured Logging
+
+The chart exposes two logging knobs, written to the curator ConfigMap and propagated
+to head and worker pods through the statefulset's `envFrom`:
+
+```yaml
+logging:
+  format: json          # "text" (default) | "json"
+  rayBackendJson: false # opt-in JSON for Ray's C++ backend/system logs
+```
+
+- `format: json` emits structured JSON application logs (Ray driver/workers, the
+  launcher scripts, and the pre-`ray.init` fallback) using a single flat, Ray-aligned
+  schema. `format: text` (default) leaves output human-readable and unchanged.
+- `rayBackendJson: true` additionally emits Ray's C++ backend logs (raylet, GCS, ...)
+  as JSON by setting `RAY_BACKEND_LOG_JSON=1`. It is independent of `format` and never
+  auto-set by curator/xenna code.
+
+For the full field schema, Elasticsearch / log-shipper guidance, the
+`log_to_driver` trade-off, and non-Helm (local Docker / Slurm) usage, see the
+**[Observability Guide](../../docs/curator/guides/observability.md#structured-logging)**.
 
 ### Metrics and Monitoring
 

@@ -44,6 +44,8 @@ import loguru
 import ray
 from loguru import logger
 
+from cosmos_xenna.utils import python_log
+
 # Pre-shutdown hooks run in LIFO order before ray.shutdown().
 # Module-level list -- populated via register_pre_shutdown_hook().
 # Return type is ``object`` so hooks can return any value (discarded).
@@ -79,12 +81,19 @@ def init_or_connect_to_cluster() -> None:
     )
 
     tracing_hook = os.environ.get("XENNA_RAY_TRACING_HOOK")
-    tracing_kwarg: dict[str, Any] = {"_tracing_startup_hook": tracing_hook} if tracing_hook else {}
-    ray.init(
-        ignore_reinit_error=True,
-        log_to_driver=True,
-        **tracing_kwarg,
-    )
+    ray_init_kwargs: dict[str, Any] = {"ignore_reinit_error": True}
+    if tracing_hook:
+        ray_init_kwargs["_tracing_startup_hook"] = tracing_hook
+    # Enable Ray structured (JSON) logging when PYTHON_LOG_FORMAT=json; no-op otherwise.
+    # ``apply_ray_logging_config`` only exists in cosmos-xenna builds that ship the
+    # structured-logging support. Older/released xenna (e.g. the pinned PyPI wheel)
+    # lacks it, so fall back to Ray's default ``log_to_driver=True`` there rather than
+    # crashing. Text mode never needs the helper, and JSON mode requires the newer
+    # xenna anyway, so this keeps curator forward/backward compatible during rollout.
+    apply_ray_logging_config = getattr(python_log, "apply_ray_logging_config", None)
+    if apply_ray_logging_config is not None:
+        ray_init_kwargs["log_to_driver"] = apply_ray_logging_config(ray_init_kwargs, log_to_driver=True)
+    ray.init(**ray_init_kwargs)
 
 
 def register_pre_shutdown_hook(hook: Callable[[], object]) -> None:

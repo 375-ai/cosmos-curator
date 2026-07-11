@@ -14,6 +14,8 @@
 # limitations under the License.
 """Key interfaces for defining a stage in the curation pipeline."""
 
+import os
+
 import attrs
 import ray
 
@@ -157,9 +159,19 @@ class CuratorStage(Stage[PipelineTask, PipelineTask]):
 
         class _PixiRuntimeEnv(RuntimeEnv):
             def to_ray_runtime_env(self) -> ray.runtime_env.RuntimeEnv:
+                # Curator stages override to_ray_runtime_env to build a PixiRuntimeEnv,
+                # which bypasses the base class's logging env-var forwarding. Replicate
+                # that forwarding here so worker actors configure structured logging
+                # identically to the driver. Only forward in JSON mode (a no-op in the
+                # default text mode) and never override anything a stage set explicitly.
+                env_vars = dict(self.extra_env_vars)
+                if os.getenv("PYTHON_LOG_FORMAT", "").strip().lower() == "json":
+                    for name in ("PYTHON_LOG", "PYTHON_LOG_FORMAT", "CURATOR_RUN_ID"):
+                        if (value := os.getenv(name)) is not None:
+                            env_vars.setdefault(name, value)
                 return PixiRuntimeEnv(
                     self.conda.name if self.conda else "",
-                    env_vars=self.extra_env_vars,
+                    env_vars=env_vars,
                 )
 
         if self.conda_env_name is not None:

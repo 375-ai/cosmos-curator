@@ -160,6 +160,7 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
 
     env_keys = _container_env_keys(srun_cmd)
     assert "COSMOS_CURATOR_RAY_SLURM_JOB" in env_keys
+    assert "PYTHONPATH" in env_keys
     assert "PIXI_CACHE_DIR" in env_keys
     assert "RATTLER_CACHE_DIR" in env_keys
     assert "UV_CACHE_DIR" in env_keys
@@ -174,6 +175,7 @@ def test_slurm_shell_command_uses_srun_and_live_source_mounts(  # noqa: PLR0915
     assert "EXTRA" in env_keys
     assert "HOST_ONLY" in env_keys
     assert subprocess_env["COSMOS_CURATOR_RAY_SLURM_JOB"] == "True"
+    assert subprocess_env["PYTHONPATH"] == "/opt/cosmos-curator"
     assert subprocess_env["PIXI_CACHE_DIR"] == "/cache/rattler/cache"
     assert subprocess_env["RATTLER_CACHE_DIR"] == "/cache/rattler/cache"
     assert subprocess_env["UV_CACHE_DIR"] == "/cache/rattler/cache/uv-cache"

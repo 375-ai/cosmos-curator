@@ -1003,12 +1003,18 @@ def _run_in_process(
     for additional info
     """
     # Create the script dynamically
-    sfile = pathlib.Path(tempfile.gettempdir()) / f"{_validate_request_id(request_id)}.py"
+    validated_request_id = _validate_request_id(request_id)
+    sfile = pathlib.Path(tempfile.gettempdir()) / f"{validated_request_id}.py"
     with sfile.open("w") as sf:
         sf.write(f"""
 import sys
 import pickle
 import os
+
+# Tag all pipeline logs with the NVCF request id before any cosmos import so that
+# loguru/Ray structured logging (CURATOR_RUN_ID) carries it. setdefault keeps an
+# externally provided value if one is already set.
+os.environ.setdefault("CURATOR_RUN_ID", {validated_request_id!r})
 
 # Set up sys.path
 sys.path = pickle.loads({pickle.dumps(sys.path)!r})

@@ -247,6 +247,7 @@ def test_normal_slim_dockerfile_copies_root_lock_without_installing_envs(
 
     assert "COPY --chown=1000:1000 pixi.toml pixi.lock conda-pypi-map.json" in contents
     assert 'ENV COSMOS_CURATOR_SLIM_ENVS="default,model-download"' in contents
+    assert "ENV PYTHONPATH=/opt/cosmos-curator" in contents
     assert "pixi install attempt" not in contents
     assert "AS ffmpeg-builder" not in contents
     assert "/opt/ffmpeg" not in contents

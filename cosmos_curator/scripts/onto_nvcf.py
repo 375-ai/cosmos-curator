@@ -33,8 +33,10 @@ from pathlib import Path
 
 import requests
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+from cosmos_curator.core.utils.misc.json_logging import configure_stdlib_logging
+
+# Configure logging (text by default; JSON when PYTHON_LOG_FORMAT=json)
+configure_stdlib_logging(text_format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger: logging.Logger = logging.getLogger(__name__)
 
 # Extract Ray ports from environment variables or use defaults

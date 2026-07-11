@@ -599,5 +599,6 @@ COPY --chown=1000:1000 {{code_path}} {{code_dir_str}}/{{code_path}}
 EXPOSE 8000 6379
 
 WORKDIR {{code_dir_str}}
+ENV PYTHONPATH={{code_dir_str}}
 
 CMD ["pixi", "run", "--as-is", "python", "cosmos_curator/scripts/onto_nvcf.py", "--helm", "True"]

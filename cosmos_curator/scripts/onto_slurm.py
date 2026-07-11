@@ -62,6 +62,8 @@ from typing import Self, TextIO
 import attrs
 import tenacity
 
+from cosmos_curator.core.utils.misc.json_logging import configure_stdlib_logging
+
 logger = logging.getLogger(__name__)
 
 # Default values for Ray configuration
@@ -457,7 +459,7 @@ def main() -> None:
 
     """
     host = hostname()
-    logging.basicConfig(level=logging.INFO, format=f"%(asctime)s - {host} - %(levelname)s - %(message)s")
+    configure_stdlib_logging(text_format=f"%(asctime)s - {host} - %(levelname)s - %(message)s")
     slurm_env = SlurmEnv.from_env()
     ray_config = RayConfig.from_env()
     display_nvidia_smi()

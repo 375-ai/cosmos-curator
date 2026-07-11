@@ -451,9 +451,18 @@ class VllmAsyncCaptionStage(SingleInferenceCaptionStage, ContinuousInterface):  
 
         class _PixiRuntimeEnv(RuntimeEnv):
             def to_ray_runtime_env(self) -> ray.runtime_env.RuntimeEnv:
+                # This override bypasses the xenna base class's logging env-var
+                # forwarding, so replicate it here (mirrors CuratorStage.env_info).
+                # Only forward in JSON mode; a no-op in the default text mode. Use
+                # setdefault so the stage's own vLLM env vars are never overridden.
+                env_vars = dict(self.extra_env_vars)
+                if os.getenv("PYTHON_LOG_FORMAT", "").strip().lower() == "json":
+                    for name in ("PYTHON_LOG", "PYTHON_LOG_FORMAT", "CURATOR_RUN_ID"):
+                        if (value := os.getenv(name)) is not None:
+                            env_vars.setdefault(name, value)
                 return PixiRuntimeEnv(
                     self.conda.name if self.conda else "",
-                    env_vars=self.extra_env_vars,
+                    env_vars=env_vars,
                 )
 
         # Empty string effectively unsets stale vars: vLLM's envs.py

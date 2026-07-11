@@ -74,6 +74,21 @@ persistence:
     whenDeleted: Delete
     whenScaled: Retain
 
+# Structured logging configuration.
+logging:
+  # Log output format for curator, cosmos-xenna, and Ray.
+  #   "text" (default) -> human-readable logs (unchanged behavior).
+  #   "json"           -> structured JSON logs integrated with Ray's structured
+  #                       logging. See charts/cosmos-curator/README.md ("Structured
+  #                       Logging") for the field schema and the log_to_driver=False
+  #                       trade-off (worker logs move to per-node Ray log files).
+  format: text
+  # Opt-in JSON formatting for Ray's own C++ backend/system logs (raylet, GCS, object
+  # store, dashboard agent) by exporting RAY_BACKEND_LOG_JSON=1. Independent of
+  # `format` (which controls Python application logs). Default false leaves Ray's
+  # backend logs in their native glog text format.
+  rayBackendJson: false
+
 # Optional custom environment variables
 customEnvVars: {}
 

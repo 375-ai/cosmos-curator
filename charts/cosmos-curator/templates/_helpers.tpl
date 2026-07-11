@@ -40,3 +40,12 @@ Selector labels
 app.kubernetes.io/name: {{ include "curator-ray.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+Source package root inside the curator image. This is baked into the image, so it
+is intentionally not a values.yaml knob: it must stay in sync with the dockerfile
+WORKDIR/ENV PYTHONPATH and CONTAINER_PATHS_CODE_DIR (cosmos_curator/core/utils/environment.py).
+*/}}
+{{- define "curator-ray.codeDir" -}}
+/opt/cosmos-curator
+{{- end }}

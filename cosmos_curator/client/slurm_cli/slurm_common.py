@@ -83,6 +83,16 @@ _SLURM_ENV_VARS_TO_FORWARD = (
     "SLURM_NTASKS_PER_NODE",
     "SLURMD_NODENAME",
 )
+# Structured-logging toggles forwarded from the launching environment into the
+# container (when set) so the Ray head and workers log identically.
+_LOG_ENV_VARS_TO_FORWARD = (
+    "PYTHON_LOG",
+    "PYTHON_LOG_FORMAT",
+    "PYTHON_LOG_TO_DRIVER",
+    "PYTHON_LOG_RAY_LEVEL",
+    "RAY_BACKEND_LOG_JSON",
+    "CURATOR_RUN_ID",
+)
 
 
 @dataclass
@@ -453,6 +463,10 @@ def _get_srun_environment(
     env = _get_clean_subprocess_environment()
     container_env = {
         SLURM_RAY_ENV_VAR_NAME: "True",
+        # Bootstrap scripts are executed by file path before cosmos_curator is
+        # installed in the Pixi environments. Make the source package importable
+        # without changing their existing invocation or mutating sys.path.
+        "PYTHONPATH": str(CONTAINER_PATHS_CODE_DIR),
         "COSMOS_S3_PROFILE_PATH": str(_CONTAINER_S3_CREDS_PATH),
         "COSMOS_AZURE_PROFILE_PATH": str(_CONTAINER_AZURE_CREDS_PATH),
         "NVCF_REQUEST_STATUS": "false",
@@ -478,6 +492,9 @@ def _get_srun_environment(
     if opts.pixi_envs is not None:
         env["COSMOS_CURATOR_SLIM_ENVS"] = ",".join(opts.pixi_envs)
         container_env_keys.append("COSMOS_CURATOR_SLIM_ENVS")
+
+    # Forward structured-logging toggles present in the launching environment.
+    container_env_keys.extend(name for name in _LOG_ENV_VARS_TO_FORWARD if name in env)
 
     if include_slurm_env:
         container_env_keys.extend(_SLURM_ENV_VARS_TO_FORWARD)

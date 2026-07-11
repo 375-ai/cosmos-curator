@@ -9,6 +9,12 @@
     - [Distributed Tracing (OpenTelemetry)](#distributed-tracing-opentelemetry)
       - [Instrumenting Custom Stage Code](#instrumenting-custom-stage-code)
     - [Output and Post-processing](#output-and-post-processing)
+  - [Structured Logging](#structured-logging)
+    - [Enabling](#enabling)
+    - [Field schema](#field-schema)
+    - [Elasticsearch / log-shipper recommendations](#elasticsearch--log-shipper-recommendations)
+    - [Worker log forwarding (`log_to_driver`)](#worker-log-forwarding-log_to_driver)
+    - [Ray backend (C++) logs](#ray-backend-c-logs)
   - [Performance Metrics](#performance-metrics)
   - [Grafana Dashboard](#grafana-dashboard)
   - [Deployment](#deployment)
@@ -291,6 +297,100 @@ For the full deep-dive -- backend internals, dynamic subclass architecture,
 LIFO nesting, `profiling_scope` driver setup, file naming convention,
 artifact delivery flow, profile merging scripts, and error handling --
 see the **[Profiling Guide](profiling.md)**.
+
+## Structured Logging
+
+Cosmos Curator, cosmos-xenna, and Ray share a single logging toggle,
+`PYTHON_LOG_FORMAT`, with two values:
+
+- `text` (default): human-readable logs, unchanged from prior behavior.
+- `json`: structured JSON logs, integrated with Ray's structured logging.
+
+`PYTHON_LOG` still controls levels (RUST_LOG-style, e.g.
+`PYTHON_LOG=debug,myapp.db=warning`), independent of the format.
+
+### Enabling
+
+On **k8s / NVCF** (Helm), set it in the chart — the value is written to the curator
+ConfigMap and reaches every pod through the statefulset's `envFrom`, so head and
+worker pods stay consistent:
+
+```yaml
+logging:
+  format: json
+```
+
+For **local Docker / Slurm**, export the variable before launching; it is forwarded
+into the container automatically:
+
+```bash
+export PYTHON_LOG_FORMAT=json
+```
+
+See the [Helm chart README](../../../charts/cosmos-curator/README.md#structured-logging)
+for the chart values.
+
+### Field schema
+
+In JSON mode every source — the Ray driver/workers, the pre-`ray.init` fallback,
+and the launcher scripts (`onto_nvcf.py` / `onto_slurm.py`) — emits the **same flat
+schema**, so a single log-shipper mapping parses them all. Ray lines additionally
+carry Ray's job/worker context:
+
+| Field | Source | Meaning |
+| --- | --- | --- |
+| `timestamp_ns` | emit time | Integer epoch nanoseconds (primary sort key). Derived from `time.time()`, so effective precision is OS/float-bounded (typically ~µs); pair with `seq` for tiebreaking. |
+| `asctime` | emit time | Human-readable emit time |
+| `levelname`, `message`, `name` | stdlib/Ray | Level, message, logger name |
+| `funcName`, `lineno`, `process` | stdlib/Ray | Call site + process id |
+| `pod` | `POD_NAME` → `SLURMD_NODENAME` → hostname | Emitting node/instance (k8s pod name; SLURM node name or hostname off-k8s) |
+| `replica` | trailing `-N` of `POD_NAME` | k8s/NVCF StatefulSet replica ordinal; `""` off-k8s (SLURM/local) |
+| `pid` | `os.getpid()` | Process id |
+| `run_id` | `CURATOR_RUN_ID` env | Run/request id (NVCF request id on NVCF) |
+| `seq` | per-process counter | Gap-free monotonic tiebreaker |
+| `job_id`, `worker_id`, `node_id`, `task_*` | Ray | Ray context (Ray lines only) |
+
+All identity/order fields (`pod`, `replica`, `pid`, `run_id`, `seq`) are top-level in
+every source, and Ray's `JSONFormatter` surfaces them alongside its own context. The
+logger `name` is requested from Ray via `additional_log_standard_attrs=["name"]` so
+Ray lines match the fallback/launcher schema (older Ray without that parameter simply
+omits `name`).
+
+### Elasticsearch / log-shipper recommendations
+
+- Remap the index `@timestamp` from `timestamp_ns` (emit time) rather than the
+  ingest time — it is consistent across launcher, driver, and worker logs.
+- Use `seq` as a tiebreaker when sorting records whose timestamps collide within a
+  process (it is monotonic and gap-free per process, reset per process).
+
+### Worker log forwarding (`log_to_driver`)
+
+By default JSON mode leaves `ray.init(..., log_to_driver=True)` unchanged, so
+per-worker/actor logs are forwarded to the driver's stdout just like in text mode —
+you see the full pipeline output in one place. Note that Ray prefixes forwarded worker
+lines with an `(ActorClass pid=…, ip=…)` tag, so those particular lines are *not* pure
+JSON (the JSON payload follows the prefix).
+
+For a **stdout-scraping k8s deployment** that wants the driver stream to stay pure,
+single-schema JSON, set `PYTHON_LOG_TO_DRIVER=false`: worker logs are then written only
+as structured lines to the **per-node Ray log files** (`/tmp/ray/session_*/logs/…`),
+which the log pipeline must ship separately. Do **not** use this for local Docker /
+NVCF runs where stdout is the only log sink — worker logs would otherwise be invisible.
+
+Ray's own root JSON threshold can be tuned with `PYTHON_LOG_RAY_LEVEL` (defaults to the
+`PYTHON_LOG` level; TRACE is clamped to DEBUG).
+
+### Ray backend (C++) logs
+
+`log_to_driver` and `PYTHON_LOG_TO_DRIVER` only govern *routing* of Python worker
+logs to the driver; they do not change any log's format. Ray's own C++ backend/system
+components (raylet, GCS, object store, dashboard agent) are a separate stream whose
+format is controlled by `RAY_BACKEND_LOG_JSON`. This is **opt-in and independent of
+`PYTHON_LOG_FORMAT`**: enabling JSON application logs does not automatically switch the
+backend logs. To emit backend logs as JSON, set `logging.rayBackendJson: true` in the
+chart (writes `RAY_BACKEND_LOG_JSON=1` to the curator ConfigMap) or export
+`RAY_BACKEND_LOG_JSON=1` yourself. Ray reads this env var natively; the curator/xenna
+code never sets or overrides it.
 
 ## Performance Metrics
 

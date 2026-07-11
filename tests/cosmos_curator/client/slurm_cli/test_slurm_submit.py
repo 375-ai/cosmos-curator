@@ -286,6 +286,7 @@ def test_submit_uses_shared_defaults_for_container_runtime(
 
     env_vars = dict(entry.split("=", 1) for entry in job_spec.container.environment)
     assert env_vars["COSMOS_CURATOR_RAY_SLURM_JOB"] == "True"
+    assert env_vars["PYTHONPATH"] == "/opt/cosmos-curator"
     assert env_vars["PIXI_CACHE_DIR"] == "/cache/rattler/cache"
     assert env_vars["UV_CACHE_DIR"] == "/cache/rattler/cache/uv-cache"
     assert env_vars["TORCH_HOME"] == "/cache/torch"
