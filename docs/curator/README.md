@@ -1,6 +1,6 @@
-# Cosmos Curator Curator Docs
+# Cosmos Curator Docs
 
-This directory collects documentation for the curator pipeline layer. It is organized by the dominant purpose of each document:
+This directory collects documentation for Cosmos Curator. It is organized by the dominant purpose of each document:
 
 - **Guides** teach workflows and debugging tasks.
 - **Reference** documents current behavior, APIs, output formats, and operational contracts.
@@ -29,6 +29,8 @@ This directory collects documentation for the curator pipeline layer. It is orga
 
 ## Design
 
+- [Cosmos Curator Next](design/curator-next.md) - agent-friendly toolkit direction centered on reusable components and
+  maintained reference recipes.
 - [Captioning Approaches](design/captioning-approaches.md) - comparison of captioning architectures.
 - [Deprecation and Default Changes](design/deprecation.md) - proposed cleanup of legacy features and large-run defaults.
 - [Multi-Camera Design](design/multicam.md) - multi-camera data model and implementation plan.
