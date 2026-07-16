@@ -78,11 +78,12 @@ def synthetic_video() -> io.BytesIO:
     return buffer
 
 
-def test_video_metadata_string_dict_round_trip() -> None:
+@pytest.mark.parametrize("has_bframes", [False, True])
+def test_video_metadata_string_dict_round_trip(has_bframes: bool) -> None:  # noqa: FBT001
     """VideoMetadata should round-trip through the string-only wire format."""
     metadata = VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=2,
+        has_bframes=has_bframes,
         codec_profile="High",
         container_format="mp4",
         height=1080,
@@ -97,7 +98,28 @@ def test_video_metadata_string_dict_round_trip() -> None:
     assert payload["avg_frame_rate_numerator"] == "30000"
     assert payload["avg_frame_rate_denominator"] == "1001"
     assert payload["version"] == VIDEO_METADATA_VERSION
+    assert payload["has_bframes"] == str(has_bframes)
     assert VideoMetadata.from_string_dict(payload) == metadata
+
+
+def test_video_metadata_from_string_dict_raises_on_invalid_has_bframes() -> None:
+    """A has_bframes value other than 'True'/'False' is rejected, not silently False."""
+    metadata = VideoMetadata(
+        codec_name="h264",
+        has_bframes=True,
+        codec_profile="High",
+        container_format="mp4",
+        height=16,
+        width=16,
+        avg_frame_rate=Fraction(30, 1),
+        pix_fmt="yuv420p",
+        bit_rate_bps=1234,
+    )
+    payload = metadata.to_string_dict()
+    payload["has_bframes"] = "yes"
+
+    with pytest.raises(ValueError, match="invalid VideoMetadata payload"):
+        VideoMetadata.from_string_dict(payload)
 
 
 def test_video_metadata_from_string_dict_raises_on_missing_keys() -> None:
@@ -110,7 +132,7 @@ def test_video_metadata_from_string_dict_raises_on_version_mismatch() -> None:
     """VideoMetadata deserialization should reject unsupported payload versions."""
     metadata = VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="Main",
         container_format="mp4",
         height=16,
@@ -121,7 +143,7 @@ def test_video_metadata_from_string_dict_raises_on_version_mismatch() -> None:
     )
 
     payload = metadata.to_string_dict()
-    payload["version"] = "2"
+    payload["version"] = "999"
 
     with pytest.raises(ValueError, match="unsupported VideoMetadata payload version"):
         VideoMetadata.from_string_dict(payload)
@@ -131,7 +153,7 @@ def test_video_metadata_from_string_dict_raises_on_invalid_fraction() -> None:
     """VideoMetadata deserialization should reject invalid frame-rate fractions."""
     metadata = VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="Main",
         container_format="mp4",
         height=16,
@@ -166,6 +188,7 @@ def test_make_index_and_metadata_zero_denominator_average_rate_defaults_to_zero(
         codec_context=SimpleNamespace(
             name="h264",
             max_b_frames=0,
+            has_b_frames=0,
             profile="Main",
             pix_fmt="yuv420p",
         ),
@@ -224,7 +247,7 @@ def test_make_index_and_metadata_raises_when_no_packets_exist() -> None:
         average_rate=Fraction(30, 1),
         width=16,
         height=16,
-        codec_context=SimpleNamespace(name="h264", max_b_frames=0, profile="Main", pix_fmt="yuv420p"),
+        codec_context=SimpleNamespace(name="h264", max_b_frames=0, has_b_frames=0, profile="Main", pix_fmt="yuv420p"),
     )
     container = SimpleNamespace(format=SimpleNamespace(name="mp4"))
 
@@ -253,7 +276,7 @@ def test_make_index_and_metadata_raises_when_no_keyframes_exist() -> None:
         average_rate=Fraction(30, 1),
         width=16,
         height=16,
-        codec_context=SimpleNamespace(name="h264", max_b_frames=0, profile="Main", pix_fmt="yuv420p"),
+        codec_context=SimpleNamespace(name="h264", max_b_frames=0, has_b_frames=0, profile="Main", pix_fmt="yuv420p"),
     )
     container = SimpleNamespace(format=SimpleNamespace(name="mp4"))
     demux_result = (
@@ -294,7 +317,7 @@ def test_make_index_and_metadata_from_header_uses_header_entries() -> None:
         width=16,
         height=16,
         index_entries=entries,
-        codec_context=SimpleNamespace(name="h264", max_b_frames=0, profile="Main", pix_fmt="yuv420p"),
+        codec_context=SimpleNamespace(name="h264", max_b_frames=0, has_b_frames=0, profile="Main", pix_fmt="yuv420p"),
     )
     container = SimpleNamespace(format=SimpleNamespace(name="mp4"))
 
@@ -326,7 +349,7 @@ def test_make_index_and_metadata_from_header_falls_back_to_full_demux() -> None:
         average_rate=Fraction(30, 1),
         width=16,
         height=16,
-        codec_context=SimpleNamespace(name="h264", max_b_frames=0, profile="Main", pix_fmt="yuv420p"),
+        codec_context=SimpleNamespace(name="h264", max_b_frames=0, has_b_frames=0, profile="Main", pix_fmt="yuv420p"),
     )
     container = SimpleNamespace(format=SimpleNamespace(name="mp4"))
     demux_result = (
@@ -368,7 +391,7 @@ def test_make_index_and_metadata_from_header_can_disable_fallback() -> None:
         average_rate=Fraction(30, 1),
         width=16,
         height=16,
-        codec_context=SimpleNamespace(name="h264", max_b_frames=0, profile="Main", pix_fmt="yuv420p"),
+        codec_context=SimpleNamespace(name="h264", max_b_frames=0, has_b_frames=0, profile="Main", pix_fmt="yuv420p"),
     )
     container = SimpleNamespace(format=SimpleNamespace(name="mp4"))
 
@@ -793,7 +816,7 @@ def test_video_metadata_raises_on_non_positive_dimensions(height: int, width: in
     with pytest.raises(ValueError, match="must be > 0"):
         VideoMetadata(
             codec_name="h264",
-            codec_max_bframes=0,
+            has_bframes=False,
             codec_profile="Main",
             container_format="mp4",
             height=height,

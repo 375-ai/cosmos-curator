@@ -800,7 +800,7 @@ def make_index_and_metadata(
 
         metadata = VideoMetadata(
             codec_name=video_stream.codec_context.name,
-            codec_max_bframes=video_stream.codec_context.max_b_frames,
+            has_bframes=bool(video_stream.codec_context.has_b_frames),
             codec_profile=video_stream.codec_context.profile or "",
             container_format=container.format.name,
             height=video_stream.height,

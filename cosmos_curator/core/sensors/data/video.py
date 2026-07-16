@@ -25,7 +25,7 @@ import numpy.typing as npt
 from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
 from cosmos_curator.core.sensors.utils.validation import bool_array, int64_array, strictly_increasing_int64_array
 
-VIDEO_METADATA_VERSION = "1"
+VIDEO_METADATA_VERSION = "2"
 
 
 def _is_ndarray_field(attr: attrs.Attribute) -> bool:  # type: ignore[type-arg]
@@ -293,6 +293,18 @@ class VideoIndex:
         return cached
 
 
+def _parse_serialized_bool(value: str, *, field: str) -> bool:
+    """Parse a serialized boolean, rejecting anything but ``"True"`` / ``"False"``.
+
+    Keeps the deserialization error surface consistent with the numeric fields,
+    which raise on invalid input rather than silently coercing.
+    """
+    if value not in ("True", "False"):
+        msg = f"invalid {field} value: {value!r} (expected 'True' or 'False')"
+        raise ValueError(msg)
+    return value == "True"
+
+
 @attrs.define(frozen=True)
 class VideoMetadata:
     """Scalar properties of a video stream.
@@ -304,15 +316,14 @@ class VideoMetadata:
     Attributes:
         codec_name: video codec name as reported by libavcodec
             (e.g., ``'h264'``, ``'hevc'``, ``'vp9'``, ``'av1'``).
-        codec_max_bframes: maximum number of consecutive B-frames between I and
-            P frames that the encoder was configured to generate.  This is a
-            codec setting, not a count of B-frames actually present in the
-            stream.  ``0`` means the encoder was configured for no B-frames;
-            the stream may still contain B-frames if the header is inaccurate.
+        has_bframes: whether the stream's header signals B-frames (the decoder
+            frame-reordering buffer is non-empty).  Set by libavcodec on decode,
+            so it reliably indicates whether B-frames are present without scanning
+            the stream.
         codec_profile: human-readable codec profile string as reported by
             libavcodec (e.g., ``'High'``, ``'Main'``, ``'Baseline'`` for
             H.264; ``'Main'``, ``'High'`` for HEVC).  Together with
-            ``codec_max_bframes``, indicates whether B-frames are structurally
+            ``has_bframes``, indicates whether B-frames are structurally
             possible for this stream.  Empty string if not set.
         container_format: container format name as reported by libavformat
             (e.g., ``'mp4'``, ``'matroska,webm'``).
@@ -337,7 +348,7 @@ class VideoMetadata:
     """
 
     codec_name: str
-    codec_max_bframes: int
+    has_bframes: bool
     codec_profile: str
     container_format: str
     height: int = attrs.field(validator=attrs.validators.gt(0))
@@ -360,7 +371,7 @@ class VideoMetadata:
         required = {
             "version",
             "codec_name",
-            "codec_max_bframes",
+            "has_bframes",
             "codec_profile",
             "container_format",
             "height",
@@ -385,9 +396,10 @@ class VideoMetadata:
                 int(data["avg_frame_rate_numerator"]),
                 int(data["avg_frame_rate_denominator"]),
             )
+            has_bframes = _parse_serialized_bool(data["has_bframes"], field="has_bframes")
             return cls(
                 codec_name=data["codec_name"],
-                codec_max_bframes=int(data["codec_max_bframes"]),
+                has_bframes=has_bframes,
                 codec_profile=data["codec_profile"],
                 container_format=data["container_format"],
                 height=int(data["height"]),
@@ -405,7 +417,7 @@ class VideoMetadata:
         return {
             "version": VIDEO_METADATA_VERSION,
             "codec_name": self.codec_name,
-            "codec_max_bframes": str(self.codec_max_bframes),
+            "has_bframes": str(self.has_bframes),
             "codec_profile": self.codec_profile,
             "container_format": self.container_format,
             "height": str(self.height),

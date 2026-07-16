@@ -68,7 +68,7 @@ def _make_video_index_and_metadata(  # noqa: PLR0913
     )
     metadata = VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="",
         container_format="mp4",
         height=height,
@@ -1268,7 +1268,7 @@ def test_camera_sensor_public_properties(
     assert sensor.max_gap_ns == 0
     np.testing.assert_array_equal(sensor.timestamps_ns, np.array([100, 300], dtype=np.int64))
     assert sensor.codec_name == "h264"
-    assert sensor.codec_max_bframes == 0
+    assert sensor.has_bframes is False
 
 
 def test_camera_sensor_sample_supports_gpu_decode_config(

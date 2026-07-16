@@ -157,31 +157,19 @@ class CameraSensor:
         return self._video_metadata.codec_name
 
     @property
-    def codec_max_bframes(self) -> int:
-        """Get the max number of consecutive B-frames between I and P frames.
+    def has_bframes(self) -> bool:
+        """Whether the stream's header signals B-frames.
 
-        This counts the maximum number of consecutive B-frames between I and P
-        frames that the encoder was configured to generate.
-
-        This is not how many B-frames are in the stream. It is possible that the
-        encoder was configured to generate B-frames, but did not generate any.
+        Reads the decoder frame-reordering signal (reliable on decode) — a header
+        read, not a count of B-frames actually emitted. B-frames complicate
+        frame-accurate seeking and GPU decode scheduling; this is also what the
+        sensor's index strategy branches on. See :attr:`VideoMetadata.has_bframes`.
 
         Returns:
-            Maximum number of B-frames the encoder was configured to generate.
-
-        Note:
-            For authoritative B-frame detection, the entire video must be
-            read and analyzed. It may be possible to perform this analysis
-            without decoding the entire video, but not without reading the
-            entire video.
-
-            This is not practical at scale.
-
-            The authoritative way to detect B-frames is to read the entire
-            video and analyze the NAL units.
+            True if the stream's header signals B-frames.
 
         """
-        return self._video_metadata.codec_max_bframes
+        return self._video_metadata.has_bframes
 
     def _get_empty_camera_data(self) -> CameraData:
         """Return a cached empty batch preserving the expected frame shape."""

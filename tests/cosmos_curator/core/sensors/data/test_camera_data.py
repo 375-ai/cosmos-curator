@@ -31,7 +31,7 @@ def _make_metadata() -> VideoMetadata:
     """Build minimal VideoMetadata for CameraData tests."""
     return VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="Main",
         container_format="mp4",
         height=1,

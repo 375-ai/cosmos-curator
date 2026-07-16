@@ -183,7 +183,7 @@ def cmd_sol(args: argparse.Namespace) -> None:
     print(
         f"  {len(index)} frames  |  {duration_s:.2f} s  |  {float(metadata.avg_frame_rate):.3f} fps"
         f"  |  {metadata.width}x{metadata.height}  |  {metadata.bit_rate_bps // 1000} kbps"
-        f"  |  codec={metadata.codec_name} {metadata.codec_profile}  |  max_bframes={metadata.codec_max_bframes}"
+        f"  |  codec={metadata.codec_name} {metadata.codec_profile}  |  has_bframes={metadata.has_bframes}"
         f"  |  pix_fmt={metadata.pix_fmt}"
     )
 
@@ -263,7 +263,7 @@ def cmd_kf_chunked(args: argparse.Namespace) -> None:  # noqa: PLR0915
     print(
         f"  {len(index)} frames  |  {duration_s:.2f} s  |  {float(metadata.avg_frame_rate):.3f} fps"
         f"  |  {metadata.width}x{metadata.height}  |  {metadata.bit_rate_bps // 1000} kbps"
-        f"  |  codec={metadata.codec_name} {metadata.codec_profile}  |  max_bframes={metadata.codec_max_bframes}"
+        f"  |  codec={metadata.codec_name} {metadata.codec_profile}  |  has_bframes={metadata.has_bframes}"
         f"  |  pix_fmt={metadata.pix_fmt}  |  {n_gops} GOPs"
     )
 
@@ -481,7 +481,7 @@ def cmd_sensor(args: argparse.Namespace) -> None:  # noqa: PLR0915
             f"  {len(index)} frames  |  {video_duration_s:.2f} s  |  {float(video_meta.avg_frame_rate):.3f} fps"
             f"  |  {video_meta.width}x{video_meta.height}  |  {video_meta.bit_rate_bps // 1000} kbps"
             f"  |  codec={video_meta.codec_name} {video_meta.codec_profile}"
-            f"  |  max_bframes={video_meta.codec_max_bframes}"
+            f"  |  has_bframes={video_meta.has_bframes}"
             f"  |  pix_fmt={video_meta.pix_fmt}  |  {n_gops} GOPs"
         )
         print(f"\nsegment-duration : {args.segment_duration:.1f} s  ({segment_ns} ns)")

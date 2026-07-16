@@ -38,7 +38,7 @@ def _make_metadata(*, width: int = 2, height: int = 2) -> VideoMetadata:
     """Build minimal VideoMetadata for McapCameraSensor tests."""
     return VideoMetadata(
         codec_name="rgb8",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="",
         container_format="mcap",
         height=height,

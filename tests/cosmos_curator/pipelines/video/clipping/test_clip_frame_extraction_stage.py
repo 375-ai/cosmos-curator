@@ -157,7 +157,7 @@ def test_motion_sampling_stop_ns_never_returns_before_start(
 def _make_video_metadata(height: int = 256, width: int = 256) -> VideoMetadata:
     return VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="High",
         container_format="mp4",
         height=height,

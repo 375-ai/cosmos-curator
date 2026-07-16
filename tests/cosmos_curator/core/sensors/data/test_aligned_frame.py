@@ -40,7 +40,7 @@ def _make_camera_data() -> CameraData:
     """Build a minimal CameraData instance for AlignedFrame tests."""
     metadata = VideoMetadata(
         codec_name="h264",
-        codec_max_bframes=0,
+        has_bframes=False,
         codec_profile="Main",
         container_format="mp4",
         height=1,
