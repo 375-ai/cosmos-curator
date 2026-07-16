@@ -23,6 +23,8 @@
 # - Modifications from vendored original:
 #   1. Removed `from __future__ import annotations` (project convention — Python 3.12 native hints).
 #   2. Extracted `cut_videos` from nested function inside `generation_loop` to module level.
+#   3. Replaced removed torchvision.io video I/O (`VideoReader`, `write_video`) with PyAV / mediapy;
+#      torchvision 0.26 removed video decoding/encoding (moved to TorchCodec). `read_image` is retained.
 """
 SeedVR2 long-video inference via sliding windows + overlap stitching.
 
@@ -41,7 +43,7 @@ Design goals:
 - Write failures to a single log (failures.log); do not crash the whole batch for partial failures.
 
 Decoding:
-- Uses torchvision.io.VideoReader in streaming mode to build windows in frame-space.
+- Uses PyAV to sequentially decode frames and build windows in frame-space.
   This avoids seek-based decoding misalignment that can cause overlap "ghosting".
 
 Stitching:
@@ -90,7 +92,7 @@ from data.image.transforms.divisible_crop import DivisibleCrop  # noqa: E402
 from data.image.transforms.na_resize import NaResize  # noqa: E402
 from data.video.transforms.rearrange import Rearrange  # noqa: E402
 from einops import rearrange  # noqa: E402
-from torchvision.io import VideoReader, read_image, write_video  # noqa: E402
+from torchvision.io import read_image  # noqa: E402
 from torchvision.transforms import Compose, Lambda, Normalize  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
@@ -170,6 +172,19 @@ def _stitch_segments(segments: List[torch.Tensor], overlap_frames: int, *, blend
     return out
 
 
+def _decode_frames_hwc_u8(path: str) -> Iterable[torch.Tensor]:
+    """Yield decoded RGB frames as HWC uint8 tensors, in presentation order."""
+    with av.open(path) as container:
+        if not container.streams.video:
+            # Fail fast on invalid/corrupt input rather than emitting an empty
+            # window that surfaces as a less actionable error further downstream.
+            raise ValueError(f"decode_failed: no video stream in {path}")
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        for frame in container.decode(stream):
+            yield torch.from_numpy(frame.to_ndarray(format="rgb24"))
+
+
 def _iter_windows_by_streaming(
     path: str,
     *,
@@ -185,11 +200,11 @@ def _iter_windows_by_streaming(
     overlap_frames = max(0, int(overlap_frames))
     stride = max(1, int(window_frames - overlap_frames))
 
-    vr = VideoReader(path, "video")
+    frame_iter = _decode_frames_hwc_u8(path)
     buf: List[torch.Tensor] = []
 
     def _stack(frames_hwc: List[torch.Tensor]) -> torch.Tensor:
-        # VideoReader returns HWC uint8; convert to TCHW uint8.
+        # PyAV yields HWC uint8; convert to TCHW uint8.
         if not frames_hwc:
             return torch.empty((0, 3, 1, 1), dtype=torch.uint8)
         f0 = frames_hwc[0]
@@ -198,11 +213,11 @@ def _iter_windows_by_streaming(
         elif f0.ndim == 3 and f0.shape[0] in (1, 3, 4):  # CHW
             frames_chw = [f[:3].contiguous() for f in frames_hwc]
         else:
-            raise ValueError(f"Unexpected frame tensor shape from VideoReader: {tuple(f0.shape)}")
+            raise ValueError(f"Unexpected decoded frame tensor shape: {tuple(f0.shape)}")
         return torch.stack(frames_chw, dim=0)
 
-    for item in vr:
-        buf.append(item["data"])
+    for frame in frame_iter:
+        buf.append(frame)
         if len(buf) >= window_frames:
             break
 
@@ -219,8 +234,8 @@ def _iter_windows_by_streaming(
     while True:
         prefix = buf[-overlap_keep:] if overlap_keep > 0 else []
         new_frames: List[torch.Tensor] = []
-        for item in vr:
-            new_frames.append(item["data"])
+        for frame in frame_iter:
+            new_frames.append(frame)
             if len(new_frames) >= stride:
                 break
         if not new_frames:
@@ -241,10 +256,9 @@ def _write_output(sample_tchw_01: torch.Tensor, filename: str, fps: float):
     if sample.shape[0] == 1:
         mediapy.write_image(filename, sample.squeeze(0))
     else:
-        try:
-            mediapy.write_video(filename, sample, fps=float(fps))
-        except Exception:
-            write_video(filename, torch.from_numpy(sample), fps=float(fps))
+        # mediapy is the sanctioned video writer (it shells out to ffmpeg on PATH);
+        # let failures propagate since SR fails fast per video.
+        mediapy.write_video(filename, sample, fps=float(fps))
 
 
 def _safe_stem(path: str) -> str:
@@ -441,6 +455,63 @@ def _write_video_streaming_from_segments_u8(
         container.close()
 
 
+def _install_torchvision_video_shim() -> None:
+    """Make ``torchvision.io.video.read_video`` importable under torchvision 0.26.
+
+    The upstream SeedVR variant scripts (``inference_seedvr2_*.py``) do
+    ``from torchvision.io.video import read_video`` at import time, but torchvision
+    0.26 removed the video I/O module (migrated to TorchCodec). Our windowed pipeline
+    never calls the variant's own ``generation_loop`` decode path (we decode via PyAV
+    in ``_iter_windows_by_streaming`` / the Curator adapter), so we only need that
+    import to resolve. Register a PyAV-backed ``read_video`` shim when the real module
+    is gone; if a torchvision that still ships the module is ever used, do nothing.
+    """
+    try:
+        import torchvision.io.video  # noqa: F401, PLC0415
+
+        return
+    except ImportError:
+        pass
+
+    import importlib.machinery  # noqa: PLC0415
+    import types  # noqa: PLC0415
+
+    import torchvision.io  # noqa: PLC0415
+
+    def read_video(
+        filename: str,
+        *_args: object,
+        output_format: str = "THWC",
+        **_kwargs: object,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        fmt = str(output_format).upper()
+        frames: List[torch.Tensor] = []
+        fps = 0.0
+        with av.open(str(filename)) as container:
+            if container.streams.video:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                rate = stream.average_rate or stream.base_rate
+                fps = float(rate) if rate else 0.0
+                frames = [torch.from_numpy(f.to_ndarray(format="rgb24")) for f in container.decode(stream)]
+        if frames:
+            vframes = torch.stack(frames, dim=0)  # THWC uint8
+            if fmt == "TCHW":
+                vframes = vframes.permute(0, 3, 1, 2).contiguous()
+        else:
+            shape = (0, 3, 1, 1) if fmt == "TCHW" else (0, 1, 1, 3)
+            vframes = torch.empty(shape, dtype=torch.uint8)
+        aframes = torch.empty((0,), dtype=torch.float32)
+        return vframes, aframes, {"video_fps": fps}
+
+    video_mod = types.ModuleType("torchvision.io.video")
+    video_mod.read_video = read_video  # type: ignore[attr-defined]
+    video_mod.__spec__ = importlib.machinery.ModuleSpec("torchvision.io.video", None)
+    sys.modules["torchvision.io.video"] = video_mod
+    torchvision.io.video = video_mod  # type: ignore[attr-defined]
+    logger.info("Installed torchvision.io.video shim (PyAV-backed read_video) for torchvision 0.26")
+
+
 def _resolve_variant_module(variant: str):
     mapping = {
         "seedvr2_3b": ("projects.inference_seedvr2_3b", "inference_seedvr2_3b.py"),
@@ -449,6 +520,10 @@ def _resolve_variant_module(variant: str):
     }
     if variant not in mapping:
         raise ValueError(f"Unknown --variant: {variant}. Choose one of: {', '.join(mapping.keys())}")
+
+    # Upstream variant scripts import torchvision.io.video.read_video at module load; torchvision
+    # 0.26 removed it. Install the PyAV-backed shim before importing them so load doesn't fail.
+    _install_torchvision_video_shim()
 
     module_name, rel_py = mapping[variant]
     this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -629,20 +704,6 @@ def generation_loop(
     def _infer_fps(src_path: str, out_fps: float | None) -> float:
         if out_fps is not None:
             return float(out_fps)
-        try:
-            vr = VideoReader(src_path, "video")
-            md = vr.get_metadata()
-            fps = None
-            if isinstance(md, dict):
-                v = md.get("video", None)
-                if isinstance(v, dict):
-                    fps = v.get("fps", None)
-            if isinstance(fps, (list, tuple)) and fps:
-                fps = fps[0]
-            if fps is not None and float(fps) > 0:
-                return float(fps)
-        except Exception:
-            pass
         try:
             with av.open(src_path) as c:
                 if c.streams.video:

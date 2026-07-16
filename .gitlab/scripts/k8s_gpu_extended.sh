@@ -46,6 +46,63 @@ if [ "${SCENARIO}" = "split_openai" ]; then
     rm -f "${CI_PROJECT_DIR}/cosmos_curator_config.yaml"
 fi
 
+# The SeedVR2 super-resolution scenario needs both the `seedvr` pixi env and the
+# SeedVR source repo (SEEDVR_ROOT). The slim image bakes neither -- the Dockerfile
+# only provisions them for non-slim builds (default.dockerfile.jinja2 wraps the
+# SeedVR COPY + ENV in `{% if not slim %}`). Materialise both at runtime so the SR
+# stage can import + run, and fast-fail on the torchvision.io video I/O import
+# regression before the (expensive) SeedVR2 diffusion pass.
+if [ "${SCENARIO}" = "split_super_resolution" ]; then
+    echo "=== Provisioning seedvr env + SeedVR source for ${SCENARIO} ==="
+    pixi install --frozen -e seedvr
+    WHEEL_DIR="${CI_PROJECT_DIR}/cosmos-xenna/target/wheels" \
+        bash "${CI_PROJECT_DIR}/.gitlab/scripts/install_local_xenna_into_pixi.sh" seedvr
+
+    # Run the seedvr post-install (flash-attn precompiled wheel). The Dockerfile does
+    # this for non-slim builds; the slim CI image solves the env at runtime and would
+    # otherwise miss flash_attn, which SeedVR's DiT imports at model-build time.
+    pixi run --as-is -e seedvr bash \
+        "${REPO_ROOT}/package/cosmos_curator/envs/seedvr/post_install.sh"
+
+    # Mirror the Dockerfile's SeedVR provisioning: fetch the pinned commit, drop in
+    # our color_fix.py, and export SEEDVR_ROOT. Download via the pixi Python
+    # interpreter rather than curl, which the slim image intentionally omits.
+    SEEDVR_COMMIT="e4de8c2"
+    export SEEDVR_ROOT="${CI_PROJECT_DIR}/SeedVR"
+    if [ ! -d "${SEEDVR_ROOT}" ]; then
+        SEEDVR_COMMIT="${SEEDVR_COMMIT}" SEEDVR_ROOT="${SEEDVR_ROOT}" pixi run --as-is python - <<'PY'
+import io
+import os
+import tarfile
+import urllib.request
+
+commit = os.environ["SEEDVR_COMMIT"]
+dest = os.environ["SEEDVR_ROOT"]
+url = f"https://github.com/ByteDance-Seed/SeedVR/archive/{commit}.tar.gz"
+parent = os.path.dirname(dest) or "."
+with urllib.request.urlopen(url, timeout=300) as resp:  # noqa: S310
+    data = resp.read()
+with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+    tar.extractall(parent)  # noqa: S202
+extracted = next(
+    os.path.join(parent, name)
+    for name in os.listdir(parent)
+    if name.startswith("SeedVR-")
+)
+os.rename(extracted, dest)
+print(f"SeedVR source extracted to {dest}")
+PY
+    fi
+    cp "${REPO_ROOT}/cosmos_curator/pipelines/video/super_resolution/color_fix.py" \
+        "${SEEDVR_ROOT}/projects/video_diffusion_sr/color_fix.py"
+
+    echo "=== Import regression guard (seedvr env) for ${SCENARIO} ==="
+    # Invoke pytest as a module: bare `pytest` is a pixi *task* defined only in the
+    # `dev` env, so `pixi run -e seedvr pytest` fails with "task not available".
+    PIXI_ENVIRONMENT_NAME=seedvr pixi run --as-is -e seedvr \
+        python -m pytest -m env "${REPO_ROOT}/tests/cosmos_curator/pipelines/video/super_resolution/"
+fi
+
 # Per-scenario output path so concurrent matrix pods never collide.
 K8S_OUTPUT_PATH="${S3_OUTPUT_PATH}/k8s-gpu-extended/${SCENARIO}"
 
