@@ -735,8 +735,9 @@ client_wheel_smoke:
     # --use-local-xenna-build. The slim build skips this on purpose because
     # slim images install pixi envs at runtime from the lockfile, which still
     # pins the PyPI-released cosmos-xenna; the slim consumers (k8s_gpu_tests,
-    # gpu_tests) instead install the wheel into their pixi envs at test time
-    # via .gitlab/scripts/install_local_xenna_into_pixi.sh.
+    # gpu_tests, slurm_end_to_end, nvcf_split_benchmark) instead install the
+    # wheel into their pixi envs at test time via
+    # .gitlab/scripts/install_local_xenna_into_pixi.sh.
     - |
       ARCH="$(uname -m)"
       shopt -s nullglob
@@ -994,6 +995,11 @@ gpu_tests:
     expire_in: 1 week
 
 # Run end-to-end pipelines on SLURM cluster
+#
+# `build_xenna_wheels` is `optional: true` so the job runs unchanged when
+# the 'use-local-xenna-build' MR label is absent. When the artifact is
+# present, ci_run_end_to_end.sh overrides the pixi-installed cosmos-xenna
+# with the locally-built wheel before the pipelines run.
 slurm_end_to_end:
   stage: end-to-end
   id_tokens:
@@ -1003,6 +1009,9 @@ slurm_end_to_end:
     - job: resolve_version
       artifacts: true
     - job: build_deploy_curator_slim
+    - job: build_xenna_wheels
+      optional: true
+      artifacts: true
   rules: *slurm_nvcf_e2e_rules
   tags:
     - ${SLURM_RUNNER_TAG}

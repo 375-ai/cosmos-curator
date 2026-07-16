@@ -28,6 +28,16 @@ export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-us-west-2}"
 export MODEL_WEIGHTS_PREFIX="${MODEL_WEIGHTS_PREFIX:-/config/models}"
 export PYTHONUNBUFFERED=1
 
+# If the CI job downloaded a locally-built cosmos-xenna wheel artifact (via
+# the optional build_xenna_wheels matrix job, gated by the
+# 'use-local-xenna-build' MR label), install it over the pixi-resolved
+# cosmos-xenna in the default env. No-op when the helper or artifact is
+# absent, so this stays safe for end-user copies of this example.
+if [[ -x /config/project/.gitlab/scripts/install_local_xenna_into_pixi.sh ]]; then
+  WHEEL_DIR="/config/project/cosmos-xenna/target/wheels" \
+    bash /config/project/.gitlab/scripts/install_local_xenna_into_pixi.sh default
+fi
+
 run_split() {
   log "Running split pipeline -> ${SLURM_E2E_OUTPUT_CLIP_PATH}"
   python -m cosmos_curator.pipelines.video.run_pipeline split \
