@@ -551,6 +551,12 @@ RUN cd {{code_dir_str}} && \
 COPY --chown=1000:1000 --from=wheels-builder /opt/seedvr-artifacts/SeedVR {{code_dir_str}}/SeedVR
 COPY cosmos_curator/pipelines/video/super_resolution/color_fix.py \
      {{code_dir_str}}/SeedVR/projects/video_diffusion_sr/color_fix.py
+# SeedVR2 setup() symlinks $SEEDVR_ROOT/ckpts -> the mounted weights at runtime.
+# `local launch` runs as the host uid (not the image's 1000), so make just the
+# SeedVR dir writable to allow creating that symlink entry. Use the sticky bit
+# (1777, like /tmp) so any uid can create entries but only the owner can delete/
+# rename them -- the 1000-owned source files stay tamper-proof (they are read-only).
+RUN chmod 1777 {{code_dir_str}}/SeedVR
 ENV SEEDVR_ROOT={{code_dir_str}}/SeedVR
 {% endif %}
 

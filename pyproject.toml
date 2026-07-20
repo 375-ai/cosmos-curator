@@ -169,13 +169,19 @@ follow_imports = "skip"
 
 [[tool.mypy.overrides]]
 module = [
+    "diffusers",
+    "diffusers.*",
     "lance",
     "lance.fragment",
     "ngcbase.errors",
     "ngcsdk",
+    "pyarrow",
+    "pyarrow.*",
     "registry.api.image",
     "registry.api.models",
     "vllm",
     "vllm.*",
+    "vllm_omni",
+    "vllm_omni.*",
 ]
 ignore_missing_imports = true

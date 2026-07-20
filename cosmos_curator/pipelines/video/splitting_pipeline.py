@@ -50,6 +50,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     is_path_nested,
     verify_path,
 )
+from cosmos_curator.models.style_transfer import style_transfer_variants
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode, resolve_preprocess_mode
 from cosmos_curator.pipelines.pipeline_args import (
     add_common_args,
@@ -124,6 +125,13 @@ from cosmos_curator.pipelines.video.read_write.read_write_builders import (
 )
 from cosmos_curator.pipelines.video.read_write.summary_writers import (
     write_split_summary,
+)
+from cosmos_curator.pipelines.video.style_transfer.style_transfer_builders import (
+    STYLE_TRANSFER_CONTROL_PRESETS,
+    STYLE_TRANSFER_CONTROLS,
+    STYLE_TRANSFER_RESOLUTIONS,
+    StyleTransferConfig,
+    build_style_transfer_stages,
 )
 from cosmos_curator.pipelines.video.super_resolution.super_resolution_builders import (
     SuperResolutionConfig,
@@ -1009,6 +1017,40 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
+    # --- Style transfer (optional) ---
+    # Placed last (before Output) so it restyles only clips that survived
+    # filtering. Output is a sidecar (clip.style_transfer_video), so downstream
+    # stages keep operating on the original clip.
+    if args.style_transfer:
+        if not args.style_transfer_prompt:
+            msg = "--style-transfer requires --style-transfer-prompt to be set."
+            raise ValueError(msg)
+        stages.extend(
+            build_style_transfer_stages(
+                StyleTransferConfig(
+                    model_variant=args.style_transfer_model,
+                    prompt=args.style_transfer_prompt,
+                    negative_prompt=args.style_transfer_negative_prompt,
+                    control=args.style_transfer_control,
+                    control_guidance=args.style_transfer_control_guidance,
+                    edge_preset=args.style_transfer_edge_preset,
+                    blur_preset=args.style_transfer_blur_preset,
+                    precompute_control=args.style_transfer_precompute_control,
+                    guardrails=args.style_transfer_enable_guardrails,
+                    guidance=args.style_transfer_guidance,
+                    seed=args.style_transfer_seed,
+                    resolution=args.style_transfer_resolution,
+                    fps=args.style_transfer_fps,
+                    num_video_frames_per_chunk=args.style_transfer_chunk_frames,
+                    num_conditional_frames=args.style_transfer_conditional_frames,
+                    num_gpus=args.style_transfer_num_gpus,
+                    num_workers_per_node=args.style_transfer_num_workers_per_node,
+                    verbose=args.verbose,
+                    perf_profile=args.perf_profile,
+                )
+            )
+        )
+
     # --- Output (always) ---
     stages.extend(
         build_output_stages(
@@ -1494,6 +1536,120 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         "--sr-out-fps", type=float, default=None, help="Output FPS for SR (None = preserve source FPS)."
     )
     parser.add_argument("--sr-tmp-dir", type=str, default=None, help="Temp directory for SR window segment files.")
+
+    # --- Style transfer (Cosmos3 Generator Transfer) ---
+    parser.add_argument(
+        "--style-transfer",
+        action="store_true",
+        default=False,
+        help="Enable Cosmos3 video style transfer on clips (emits a style_transfer/<uuid>.mp4 sidecar).",
+    )
+    parser.add_argument(
+        "--style-transfer-model",
+        type=str,
+        default="cosmos3_nano",
+        choices=style_transfer_variants(),
+        help="Style-transfer model variant (cosmos3_nano=1 GPU, cosmos3_super=4+ GPUs).",
+    )
+    parser.add_argument(
+        "--style-transfer-prompt",
+        type=str,
+        default="",
+        help="Text prompt describing the target style (required when --style-transfer is set).",
+    )
+    parser.add_argument(
+        "--style-transfer-negative-prompt",
+        type=str,
+        default="",
+        help="Negative prompt (what to avoid) for style transfer.",
+    )
+    parser.add_argument(
+        "--style-transfer-control",
+        type=str,
+        default="edge",
+        choices=list(STYLE_TRANSFER_CONTROLS),
+        help="Spatial control signal the transfer follows (edge=Canny outlines, blur=downscale/upscale).",
+    )
+    parser.add_argument(
+        "--style-transfer-control-guidance",
+        type=float,
+        default=1.5,
+        help="Global CFG scale across the control stream(s).",
+    )
+    parser.add_argument(
+        "--style-transfer-edge-preset",
+        type=str,
+        default="medium",
+        choices=list(STYLE_TRANSFER_CONTROL_PRESETS),
+        help="Canny edge threshold preset (used when --style-transfer-control edge).",
+    )
+    parser.add_argument(
+        "--style-transfer-blur-preset",
+        type=str,
+        default="medium",
+        choices=list(STYLE_TRANSFER_CONTROL_PRESETS),
+        help="Blur strength preset (used when --style-transfer-control blur).",
+    )
+    parser.add_argument(
+        "--style-transfer-precompute-control",
+        action="store_true",
+        default=False,
+        help="Extract the edge/blur control on the host instead of letting vLLM-Omni derive it from the clip.",
+    )
+    parser.add_argument(
+        "--style-transfer-enable-guardrails",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Cosmos3 text/video safety guardrails (off by default). Requires the cosmos-guardrail "
+            "package, which is not in any env, so enabling them on the current build fails; opt in once it is "
+            "available (the NVIDIA Open Model License expects guardrails on)."
+        ),
+    )
+    parser.add_argument(
+        "--style-transfer-guidance",
+        type=float,
+        default=3.0,
+        help="Prompt classifier-free guidance scale for style transfer.",
+    )
+    parser.add_argument("--style-transfer-seed", type=int, default=2026, help="Random seed for style transfer.")
+    parser.add_argument(
+        "--style-transfer-resolution",
+        type=str,
+        default="720",
+        choices=list(STYLE_TRANSFER_RESOLUTIONS),
+        help="Cosmos3 output resolution bucket; the source aspect is scaled to it.",
+    )
+    parser.add_argument(
+        "--style-transfer-fps",
+        type=int,
+        default=None,
+        help="Output FPS for style transfer (None = preserve source FPS).",
+    )
+    parser.add_argument(
+        "--style-transfer-chunk-frames",
+        type=int,
+        default=93,
+        help="num_video_frames_per_chunk: frames per internal generation chunk (93 = Cosmos3 tuned default).",
+    )
+    parser.add_argument(
+        "--style-transfer-conditional-frames",
+        type=int,
+        default=1,
+        help="num_conditional_frames: overlap frames carried between chunks for continuity.",
+    )
+    parser.add_argument(
+        "--style-transfer-num-gpus",
+        type=int,
+        default=1,
+        help="GPUs for the transfer engine (cosmos3_super is clamped up to 4).",
+    )
+    parser.add_argument(
+        "--style-transfer-num-workers-per-node",
+        type=int,
+        default=0,
+        help="Style-transfer workers per node (0 = auto: scale by available GPUs).",
+    )
 
     parser.add_argument(
         "--motion-filter",

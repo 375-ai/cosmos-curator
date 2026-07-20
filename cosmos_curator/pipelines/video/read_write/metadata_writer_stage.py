@@ -338,6 +338,11 @@ class ClipWriterStage(CuratorStage):
         return ClipWriterStage._get_output_path(output_path, "sam3_tracked")
 
     @staticmethod
+    def get_output_path_style_transfer(output_path: str) -> str:
+        """Get path to store per-clip restyled ``style_transfer/<uuid>.mp4`` files."""
+        return ClipWriterStage._get_output_path(output_path, "style_transfer")
+
+    @staticmethod
     def get_video_uuid(input_video_path: str) -> uuid.UUID:
         """Get a UUID for the video based on its input path."""
         return uuid.uuid5(uuid.NAMESPACE_URL, f"{input_video_path}")
@@ -442,6 +447,12 @@ class ClipWriterStage(CuratorStage):
                     # is empty), so ``is not None`` is the canonical "did SAM3 run?" signal.
                     if any(clip.sam3_instances is not None for clip in video.clips):
                         futures_clips += [executor.submit(self._write_clip_sam3, clip) for clip in video.clips]
+                    # StyleTransferStage populates style_transfer_video only when it runs; the
+                    # resolve() inside the writer no-ops for clips without it.
+                    if any(clip.style_transfer_video.resolve() is not None for clip in video.clips):
+                        futures_clips += [
+                            executor.submit(self._write_clip_style_transfer, clip) for clip in video.clips
+                        ]
                     futures_clips += [
                         executor.submit(self._write_clip_metadata, clip, video.metadata) for clip in video.clips
                     ]
@@ -782,6 +793,42 @@ class ClipWriterStage(CuratorStage):
                 "mp4",
             )
             self._write_data(annotated, dest, f"sam3 tracked {clip.uuid}", source_video)
+
+        return clip_stats
+
+    def _write_clip_style_transfer(self, clip: Clip) -> ClipStats:
+        """Write the per-clip restyled ``style_transfer/<uuid>.mp4`` plus its provenance JSON.
+
+        Emits ``style_transfer/<uuid>.mp4`` (StyleTransferStage output) and, alongside
+        it, ``style_transfer/<uuid>.json`` recording the generation params / source
+        linkage / output size. Silently no-ops when the clip has no style-transfer data
+        (i.e. ``StyleTransferStage`` was not run).
+        """
+        clip_stats = ClipStats()
+        if self._dry_run:
+            return clip_stats
+
+        restyled = clip.style_transfer_video.resolve()
+        if restyled is not None and self._upload_clips:
+            dest = self._get_clip_uri(
+                clip.uuid,
+                self.get_output_path_style_transfer(self._output_path),
+                "mp4",
+            )
+            self._write_data(restyled, dest, f"style transfer {clip.uuid}", clip.source_video)
+
+        if clip.style_transfer_metadata is not None:
+            json_dest = self._get_clip_uri(
+                clip.uuid,
+                self.get_output_path_style_transfer(self._output_path),
+                "json",
+            )
+            self._write_json_data(
+                clip.style_transfer_metadata,
+                json_dest,
+                f"style transfer meta {clip.uuid}",
+                clip.source_video,
+            )
 
         return clip_stats
 

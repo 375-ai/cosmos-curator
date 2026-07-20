@@ -28,7 +28,7 @@ azure-identity = "*"
 azure-storage-blob = "*"
 cattrs = "*"
 easydict = "*"
-fastapi = ">=0.115,<0.137" # vLLM 0.23 requires fastapi[standard]<0.137
+fastapi = ">=0.115,<0.137" # vLLM 0.24 requires fastapi[standard]<0.137
 huggingface_hub = "*"
 jinja2 = "*"
 loguru = "*"
@@ -166,7 +166,12 @@ PyNvVideoCodec = ">=2.0.4,<2.1" # not available on conda-forge - pinned for ffmp
 timm = "*" # conda-forge package pulls in torchvision, which is behind
 torch = "==2.11.0"
 torchvision = "==0.26.0"
-vllm = "==0.23.0" # not available on conda-forge
+vllm = "==0.24.0" # not available on conda-forge
+# Cosmos3 Generator Transfer (StyleTransferStage) runs IN-PROCESS via vLLM-Omni's
+# offline `Omni` API; the 0.24 line carries the transfer-control video-to-video path
+# and hard-requires the matching vllm==0.24 above. Lives in runtime (not a dedicated
+# env) so the style-transfer stage runs in default alongside the other GPU stages.
+vllm-omni = "==0.24.0" # not available on conda-forge
 paddlepaddle = { version = "==3.2.*", index = "https://www.paddlepaddle.org.cn/packages/stable/cpu/"} # CPU-only; no CUDA runtime conflict with torch (unlike paddlepaddle-gpu)
 paddleocr = "==2.10.*"
 
@@ -230,7 +235,7 @@ pyasn1 = ">=0.6.3" # CVE remediation: pyasn1 0.6.3+ (cuml env; same floor as cor
 pylance = ">=0.39.0" # conda-forge package is too old
 
 [feature.transformers.dependencies]
-transformers = ">=5.11.0,<6.0.0" # vLLM 0.23 + native Cosmos3 support require recent Transformers v5
+transformers = ">=5.11.0,<6.0.0" # vLLM 0.24 + native Cosmos3 support require recent Transformers v5
 
 [feature.transformers.pypi-dependencies]
 # sentence-transformers pulls torch; keep torch's CUDA bindings on the 13.0 line.

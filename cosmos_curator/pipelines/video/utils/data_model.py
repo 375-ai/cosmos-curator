@@ -500,6 +500,16 @@ class Clip:
     # Re-encoded mp4 bytes with boxes/masks/ids/trails drawn on top (produced by AnnotatedVideoWriterStage).
     # Wrapped in LazyData for zero-copy inter-stage transport via PEP 574.
     sam3_annotated_video: LazyData[npt.NDArray[np.uint8]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
+    # Restyled mp4 bytes produced by StyleTransferStage (Cosmos3 Generator Transfer).
+    # Kept separate from encoded_data so downstream stages see the original clip and
+    # the writer emits a sidecar style_transfer/<uuid>.mp4. Wrapped in LazyData for
+    # zero-copy inter-stage transport via PEP 574.
+    style_transfer_video: LazyData[npt.NDArray[np.uint8]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
+    # Provenance dict for the restyle (StyleTransferStage): generation params, source
+    # linkage, and output size. Serialized by the writer as a sidecar
+    # style_transfer/<uuid>.json for later debugging/comparison. None when the stage
+    # did not run.
+    style_transfer_metadata: dict[str, Any] | None = None
 
     def get_all_captions(self) -> list[str]:
         """Get all captions from the clip's windows.
@@ -572,6 +582,7 @@ class Clip:
         if self.pts_ns is not None:
             total_size += self.pts_ns.nbytes
         total_size += self.sam3_annotated_video.nbytes
+        total_size += self.style_transfer_video.nbytes
         for window in self.windows:
             total_size += window.get_major_size()
         return total_size
