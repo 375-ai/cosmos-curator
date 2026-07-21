@@ -43,6 +43,8 @@ This directory collects documentation for Cosmos Curator. It is organized by the
 - [Split Comparison — Module Architecture](design/split-comparison.md) - module DAG and architecture for the Lance-based split-output comparison.
 - [Sensor Library Design](design/sensor-library.md) - sensor data model and API direction.
 - [Efficient Sparse Video Decode](design/sensor-library-efficient-video-decode.md) - efficient decode strategy for sampled video.
+- [Data Integrity Design](design/data-integrity-design.md) - architecture, v1 API, and phased delivery plan for the sensor data-integrity framework.
+- [Data Integrity Metrics](design/data-integrity-metrics.md) - initial metric catalog for sensor data-integrity checks.
 - [Orca Agentic Curation](design/orca.md) - agentic orchestration direction for large-scale curation.
 - [Schema-Validated Pipeline Configs](design/pipeline-configs.md) - Ray Data config input contract and implementation plan.
 - [Slim Image Design](design/slim-image.md) - slim container image design and rollout plan.
