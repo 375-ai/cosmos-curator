@@ -25,6 +25,7 @@ aligned when profiling mutates that namespace.
 
 import argparse
 import contextlib
+import json
 import types
 from collections.abc import Collection, Generator
 from typing import TYPE_CHECKING, Any, Self, Union, cast, get_args, get_origin
@@ -33,6 +34,7 @@ import attrs
 from attrs import NOTHING, validators
 
 from cosmos_curator.core.utils.environment import MODEL_WEIGHTS_PREFIX
+from cosmos_curator.core.utils.infra.metrics_push import DEFAULT_DROP_METRIC_NAMES_REGEX
 from cosmos_curator.core.utils.infra.profiling import profiling_scope
 
 if TYPE_CHECKING:
@@ -210,12 +212,18 @@ _EXECUTION_MODES = frozenset(("AUTO", "BATCH", "STREAMING"))
 _STREAMING_SCHEDULERS = frozenset(("FRAGMENTATION_BASED", "SATURATION_AWARE"))
 
 # Dest names registered by :func:`add_profiling_args` only (subset of this class).
+# Note: ``otlp_metrics_push*`` fields are intentionally NOT included here -- in-pipeline
+# OTLP metrics scraping has negligible overhead and is not a sampled profiling backend.
+# Those flags are still registered by :func:`add_common_args`, which exposes the full
+# settings surface.
 PROFILING_CLI_FIELDS: frozenset[str] = frozenset(
     {
         "perf_profile",
         "profile_tracing",
         "profile_tracing_sampling",
         "profile_tracing_otlp_endpoint",
+        "otlp_run_attributes",
+        "otlp_run_attributes_map",
         "profile_cpu",
         "profile_memory",
         "profile_gpu",
@@ -336,6 +344,66 @@ class CommonPipelineSettings:
             default="",
         ),
     )
+    otlp_metrics_push: bool = attrs.field(
+        validator=validators.instance_of(bool),
+        metadata=cli(
+            help=(
+                "Enable the in-pipeline OTLP metrics scraper. A background thread on the "
+                "driver polls each Ray node's Prometheus /metrics endpoint on a configurable "
+                "interval and pushes the data as OTLP HTTP metrics (NOT Prometheus "
+                "remote-write). Requires --otlp-metrics-push-endpoint (or "
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT / OTEL_EXPORTER_OTLP_ENDPOINT). "
+                "Negligible runtime overhead -- not a sampled profiling backend."
+            ),
+            default=False,
+            arg_type=None,
+            action="store_true",
+        ),
+    )
+    otlp_metrics_push_endpoint: str = attrs.field(
+        validator=validators.instance_of(str),
+        metadata=cli(
+            help=(
+                "OTLP HTTP collector endpoint for the in-pipeline metrics scraper "
+                "(e.g. http://localhost:4318). Empty (default) falls back to "
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT, then OTEL_EXPORTER_OTLP_ENDPOINT. "
+                "When none is set, --otlp-metrics-push is a no-op."
+            ),
+            default="",
+        ),
+    )
+    otlp_metrics_push_interval: int = attrs.field(
+        validator=validators.and_(validators.instance_of(int), validators.ge(1)),
+        metadata=cli(
+            help=("Scrape + push interval in seconds when --otlp-metrics-push is enabled. Default: 30."),
+            default=30,
+        ),
+    )
+    otlp_metrics_push_drop_regex: str = attrs.field(
+        validator=validators.instance_of(str),
+        metadata=cli(
+            help=(
+                "Regex matched against each OTel metric name (after the `_total` suffix is "
+                "stripped from counters). Matching metrics are dropped before export to "
+                "reduce backend cardinality. Default mirrors the helm chart's "
+                "`metric_relabel_configs` drop list (Ray scheduler/GCS/pull-manager noise). "
+                "Pass an empty string to disable filtering."
+            ),
+            default=DEFAULT_DROP_METRIC_NAMES_REGEX,
+        ),
+    )
+    otlp_run_attributes: bool = attrs.field(
+        validator=validators.instance_of(bool),
+        metadata=cli(
+            help=(
+                "Attach run metadata (user, Slurm job id, host, etc.) to OTLP traces and "
+                "in-pipeline metrics push. Use --no-otlp-run-attributes to omit."
+            ),
+            default=True,
+            arg_type=None,
+            action=argparse.BooleanOptionalAction,
+        ),
+    )
     profile_cpu: bool = attrs.field(
         validator=validators.instance_of(bool),
         metadata=cli(
@@ -411,6 +479,22 @@ class CommonPipelineSettings:
                 "Default: '_root' (driver process typically has no CUDA context)."
             ),
             default="_root",
+        ),
+    )
+    otlp_run_attributes_map: dict[str, str] = attrs.field(
+        factory=dict,
+        validator=validators.deep_mapping(
+            validators.instance_of(str),
+            validators.instance_of(str),
+            validators.instance_of(dict),
+        ),
+        metadata=cli(
+            help=(
+                "Optional JSON object of literal run-attribute labels to attach to OTLP traces "
+                'and metrics push (e.g. \'{"customer":"nvidia","nspect_id":"..."}\').'
+            ),
+            default={},
+            arg_type=json.loads,
         ),
     )
 

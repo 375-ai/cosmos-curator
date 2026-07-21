@@ -170,6 +170,21 @@ metrics:
         scrape_interval: 30s
         sample_limit: 10000
         label_limit: 30
+        # SCRAPE-SIDE drop list applied by the OTel-collector sidecar /
+        # ServiceMonitor when the helm chart deploys an external Prom
+        # scraper of Ray's /metrics endpoint.  The driver-side push
+        # path (local / Slurm / NVCF deployments) applies an
+        # equivalent filter in code at:
+        #   cosmos_curator/core/utils/infra/metrics_push.py
+        #   ::DEFAULT_DROP_METRIC_NAMES_REGEX
+        # Keep both lists in sync so chart-scraped and driver-pushed
+        # exports produce the same series set for the same Ray
+        # cluster.  Note: regex here is anchored to the prom sample
+        # name (e.g. `_bucket` suffix for histogram buckets); the
+        # driver-side regex is anchored to the OTel metric name
+        # (after `_total` is stripped and histograms are merged to
+        # their family name) -- the two encode the same intent in
+        # their respective domains.
         metric_relabel_configs:
           - source_labels:
               - __name__

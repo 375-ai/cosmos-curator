@@ -359,6 +359,25 @@ class TestBuildProfilingConfig:
         assert config is not None
         assert config.profile_dir == "/output/clips/profile"
 
+    def test_otlp_run_attributes_map_is_captured(self) -> None:
+        """A provided map is copied into the profiling config."""
+        args = argparse.Namespace(
+            profile_cpu=True,
+            profile_memory=False,
+            profile_gpu=False,
+            profile_tracing=False,
+            perf_profile=False,
+            output_clip_path="/output/clips",
+            otlp_run_attributes_map={"customer": "nvidia", "nspect_id": "NSPECT-KU24-CGN6"},
+        )
+        config = _apply_profiling_config(args)
+
+        assert config is not None
+        assert config.otlp_run_attributes_map == {
+            "customer": "nvidia",
+            "nspect_id": "NSPECT-KU24-CGN6",
+        }
+
 
 class TestProfilingWrapper:
     """Verify profiling_wrapper swaps the class and preserves identity."""

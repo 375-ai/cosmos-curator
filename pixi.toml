@@ -303,6 +303,10 @@ opentelemetry-instrumentation-urllib3 = ">=0.44b0"
 opentelemetry-instrumentation-threading = ">=0.44b0"
 opentelemetry-instrumentation-logging = ">=0.44b0"
 opentelemetry-instrumentation-fastapi = ">=0.44b0"
+# Used by metrics_push to parse Ray's Prometheus text exposition.
+# Already pulled in transitively by Ray; promoted to a first-party
+# dep so the in-pipeline scraper does not rely on a transitive path.
+prometheus-client = ">=0.21.1"
 wrapt = ">=1.14"
 
 # Stage instrumentation backends (CPU profiling, memory profiling).

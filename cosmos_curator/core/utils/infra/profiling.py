@@ -55,6 +55,7 @@ Internal helpers:
 
 import argparse
 import contextlib
+import json
 import os
 import pathlib
 import tempfile
@@ -67,6 +68,8 @@ from loguru import logger
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, PipelineTask
 from cosmos_curator.core.utils.artifacts.delivery import ArtifactDelivery
+from cosmos_curator.core.utils.infra.metrics_push import DEFAULT_DROP_METRIC_NAMES_REGEX
+from cosmos_curator.core.utils.infra.run_attributes import ENV_OTLP_RUN_ATTRIBUTES_VALUES
 from cosmos_curator.core.utils.infra.tracing import (
     TracedSpan,
     artifact_id,
@@ -173,6 +176,18 @@ class ProfilingConfig:
             OTLP -- only the local file exporter is active.  Set via
             ``--profile-tracing-otlp-endpoint`` or the standard
             ``OTEL_EXPORTER_OTLP_ENDPOINT`` env var.
+        otlp_metrics_push_enabled: Enable driver-side OTLP metrics
+            scraping/push.
+        otlp_metrics_push_endpoint: Optional OTLP HTTP endpoint
+            override for metrics push.
+        otlp_metrics_push_interval: Scrape interval (seconds) for
+            the metrics push loop.
+        otlp_metrics_push_drop_regex: Regex used to drop noisy Ray
+            metrics before OTLP export.
+        otlp_run_attributes: Attach run metadata (Slurm/user/host)
+            to OTLP traces and pushed metrics labels.
+        otlp_run_attributes_map: Optional literal run-attribute labels
+            to add to OTLP traces and pushed metrics labels.
         staging_dir: Base staging directory for profiling and trace
             artifacts.  Empty string means "use env var or create a
             temp dir".  Populated by ``_apply_profiling_config()``
@@ -204,6 +219,12 @@ class ProfilingConfig:
     tracing_enabled: bool = False
     tracing_sampling: float = 0.01
     tracing_otlp_endpoint: str = ""
+    otlp_metrics_push_enabled: bool = False
+    otlp_metrics_push_endpoint: str = ""
+    otlp_metrics_push_interval: int = 30
+    otlp_metrics_push_drop_regex: str = DEFAULT_DROP_METRIC_NAMES_REGEX
+    otlp_run_attributes: bool = True
+    otlp_run_attributes_map: dict[str, str] = attrs.field(factory=dict)
     staging_dir: str = ""
     traceparent: str = ""
     cpu_exclude: frozenset[str] = frozenset()
@@ -1216,9 +1237,13 @@ def _apply_profiling_config(args: argparse.Namespace) -> ProfilingConfig | None:
     mem = getattr(args, "profile_memory", False)
     gpu = getattr(args, "profile_gpu", False)
     tracing = getattr(args, "profile_tracing", False)
+    # OTLP metrics push is not a sampled profiling backend; it lives on
+    # ProfilingConfig purely as a transport carrier and must not flip
+    # ``--perf-profile`` on its own.
+    metrics_push = getattr(args, "otlp_metrics_push", False)
 
     any_profiling = cpu or mem or gpu or tracing
-    if not any_profiling and not getattr(args, "perf_profile", False):
+    if not any_profiling and not metrics_push and not getattr(args, "perf_profile", False):
         return None
 
     # Discover the pipeline output directory from common args attributes
@@ -1243,6 +1268,13 @@ def _apply_profiling_config(args: argparse.Namespace) -> ProfilingConfig | None:
         )
         args.perf_profile = True
 
+    run_attributes_map = getattr(args, "otlp_run_attributes_map", {})
+    if not isinstance(run_attributes_map, dict):
+        run_attributes_map = {}
+    normalized_run_attributes_map = {
+        str(k): str(v) for k, v in run_attributes_map.items() if isinstance(k, str) and k and isinstance(v, str) and v
+    }
+
     return ProfilingConfig(
         profile_dir=profile_dir,
         s3_profile_name=getattr(args, "output_s3_profile_name", "default"),
@@ -1252,6 +1284,16 @@ def _apply_profiling_config(args: argparse.Namespace) -> ProfilingConfig | None:
         tracing_enabled=tracing,
         tracing_sampling=getattr(args, "profile_tracing_sampling", 0.01),
         tracing_otlp_endpoint=getattr(args, "profile_tracing_otlp_endpoint", ""),
+        otlp_metrics_push_enabled=metrics_push,
+        otlp_metrics_push_endpoint=getattr(args, "otlp_metrics_push_endpoint", ""),
+        otlp_metrics_push_interval=getattr(args, "otlp_metrics_push_interval", 30),
+        otlp_metrics_push_drop_regex=getattr(
+            args,
+            "otlp_metrics_push_drop_regex",
+            DEFAULT_DROP_METRIC_NAMES_REGEX,
+        ),
+        otlp_run_attributes=getattr(args, "otlp_run_attributes", True),
+        otlp_run_attributes_map=normalized_run_attributes_map,
         staging_dir=os.environ.get("COSMOS_CURATOR_ARTIFACTS_STAGING_DIR", ""),
         traceparent=os.environ.get("COSMOS_CURATOR_TRACEPARENT", ""),
         cpu_exclude=_parse_exclude(getattr(args, "profile_cpu_exclude", None)),
@@ -1260,7 +1302,12 @@ def _apply_profiling_config(args: argparse.Namespace) -> ProfilingConfig | None:
     )
 
 
-def _register_flush_hooks(config: ProfilingConfig, *, has_profiling: bool, state: "_ProfilingState") -> None:
+def _register_flush_hooks(  # noqa: C901
+    config: ProfilingConfig,
+    *,
+    has_profiling: bool,
+    state: "_ProfilingState",
+) -> None:
     """Register pre-shutdown hooks that flush artifacts before collection.
 
     Called from :func:`profiling_scope` after ``ArtifactDelivery``
@@ -1295,6 +1342,68 @@ def _register_flush_hooks(config: ProfilingConfig, *, has_profiling: bool, state
                 logger.warning(f"[otel] {process_tag()}: Failed to flush driver traces: {e}")
 
         register_pre_shutdown_hook(_flush_driver_traces)
+
+    if config.otlp_metrics_push_enabled:
+        # Register LAST so it runs FIRST (LIFO).  We want to stop the
+        # scrape thread while Ray is still up so the final flush()
+        # tick can still query ``ray.nodes()`` and reach worker
+        # metrics endpoints.
+        def _stop_metrics_push() -> None:
+            try:
+                from cosmos_curator.core.utils.infra.metrics_push import (  # noqa: PLC0415
+                    disable_metrics_push,
+                    flush_metrics_push,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[otel-metrics] {process_tag()}: Failed to import metrics push hooks: {e}")
+                return
+
+            # Capture the last cumulative counter values before
+            # shutting down the loop thread.
+            try:
+                flush_metrics_push()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[otel-metrics] {process_tag()}: Failed to flush metrics push: {e}")
+
+            try:
+                disable_metrics_push()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[otel-metrics] {process_tag()}: Failed to disable metrics push: {e}")
+
+        register_pre_shutdown_hook(_stop_metrics_push)
+
+
+def _configure_otel_sdk_and_tracing(config: ProfilingConfig) -> None:
+    """Set OTEL_SDK_DISABLED and initialize tracing when enabled."""
+    if config.tracing_enabled or config.otlp_metrics_push_enabled:
+        os.environ.pop("OTEL_SDK_DISABLED", None)
+    else:
+        os.environ["OTEL_SDK_DISABLED"] = "true"
+
+    if not config.tracing_enabled:
+        return
+
+    try:
+        # Create the traces ArtifactDelivery first so that
+        # COSMOS_CURATOR_ARTIFACTS_STAGING_DIR is set before
+        # enable_tracing() reads it.
+        if config.profile_dir:
+            ArtifactDelivery.create(
+                kind="traces",
+                output_dir=config.profile_dir,
+                s3_profile_name=config.s3_profile_name,
+                upload_subdir="traces",
+            )
+
+        from cosmos_curator.core.utils.infra.tracing_hook import enable_tracing  # noqa: PLC0415
+
+        enable_tracing(
+            sampling_rate=config.tracing_sampling,
+            otlp_endpoint=config.tracing_otlp_endpoint,
+            include_run_attributes=config.otlp_run_attributes,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[otel] {process_tag()}: Failed to set up distributed tracing: {e}", exc_info=True)
 
 
 @contextlib.contextmanager
@@ -1361,6 +1470,11 @@ def profiling_scope(
         yield
         return
 
+    if config.otlp_run_attributes_map:
+        os.environ[ENV_OTLP_RUN_ATTRIBUTES_VALUES] = json.dumps(config.otlp_run_attributes_map)
+    else:
+        os.environ.pop(ENV_OTLP_RUN_ATTRIBUTES_VALUES, None)
+
     # Set up artifact delivery BEFORE the pipeline so that workers
     # inherit the COSMOS_CURATOR_ARTIFACTS_STAGING_DIR environment variable.
     # ArtifactDelivery.create() registers collect() as a Ray
@@ -1396,34 +1510,36 @@ def profiling_scope(
     # directory that ArtifactDelivery would create later, causing
     # collection to find zero files.
     # Globally disable or enable the OTel SDK.  This must happen before
-    # ray.init() so workers inherit the env var.  When tracing is disabled,
-    # OTEL_SDK_DISABLED=true tells all OTel-aware libraries (vLLM, boto
-    # instrumentors, etc.) to produce no-op spans.  When tracing is
-    # enabled, we clear it so the SDK is active.
-    if config.tracing_enabled:
-        os.environ.pop("OTEL_SDK_DISABLED", None)
+    # ray.init() so workers inherit the env var.
+    _configure_otel_sdk_and_tracing(config)
+
+    # Start the in-pipeline OTLP metrics scraper (driver-only) if
+    # requested.  Started here so the scrape thread is alive before
+    # workers start producing metrics; the scraper discovers nodes
+    # via ``ray.nodes()`` once Ray is up and reads each node's
+    # actual ``MetricsExportPort`` per tick (no port pinning).
+    if config.otlp_metrics_push_enabled:
         try:
-            # Create the traces ArtifactDelivery first so that
-            # COSMOS_CURATOR_ARTIFACTS_STAGING_DIR is set before
-            # enable_tracing() reads it.
-            if config.profile_dir:
-                ArtifactDelivery.create(
-                    kind="traces",
-                    output_dir=config.profile_dir,
-                    s3_profile_name=config.s3_profile_name,
-                    upload_subdir="traces",
-                )
+            from cosmos_curator.core.utils.infra.metrics_push import (  # noqa: PLC0415
+                MetricsPushConfig,
+                enable_metrics_push,
+            )
 
-            from cosmos_curator.core.utils.infra.tracing_hook import enable_tracing  # noqa: PLC0415
-
-            enable_tracing(
-                sampling_rate=config.tracing_sampling,
-                otlp_endpoint=config.tracing_otlp_endpoint,
+            push_config = MetricsPushConfig(
+                enabled=True,
+                interval_seconds=config.otlp_metrics_push_interval,
+                drop_regex=config.otlp_metrics_push_drop_regex,
+                include_run_attributes=config.otlp_run_attributes,
+            )
+            enable_metrics_push(
+                push_config,
+                cli_otlp_endpoint=config.otlp_metrics_push_endpoint,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[otel] {process_tag()}: Failed to set up distributed tracing: {e}", exc_info=True)
-    else:
-        os.environ["OTEL_SDK_DISABLED"] = "true"
+            logger.warning(
+                f"[otel-metrics] {process_tag()}: Failed to start metrics push: {e}",
+                exc_info=True,
+            )
 
     # Run the per-stage profiling scope (cpu/memory/gpu backends).
     # scope() wraps the block with an OTel span automatically.
@@ -1439,14 +1555,15 @@ def profiling_scope(
     #   has already collected and Ray has been shut down.
     #
     # By registering AFTER the ArtifactDelivery hooks, LIFO ordering
-    # ensures flush hooks run FIRST:
+    # ensures flush/teardown hooks run FIRST:
     #
     #   Shutdown sequence (LIFO):
-    #     1. flush driver traces   -- flushes OTel span file to disk
-    #     2. flush root profilers  -- writes cpu/mem/gpu files to staging
-    #     3. collect traces        -- ArtifactDelivery uploads spans
-    #     4. collect profiling     -- ArtifactDelivery uploads profiles
-    #     5. Ray shutdown
+    #     1. stop metrics push     -- stops OTLP scraper + final flush
+    #     2. flush driver traces   -- flushes OTel span file to disk
+    #     3. flush root profilers  -- writes cpu/mem/gpu files to staging
+    #     4. collect traces        -- ArtifactDelivery uploads spans
+    #     5. collect profiling     -- ArtifactDelivery uploads profiles
+    #     6. Ray shutdown
     #
     # ``stop_and_save`` is idempotent (each backend guards on None
     # state), so the subsequent ``scope.__exit__`` call is a safe

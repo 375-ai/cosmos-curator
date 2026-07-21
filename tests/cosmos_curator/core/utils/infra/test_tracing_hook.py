@@ -169,6 +169,45 @@ class TestTracingBackendFileLifecycle:
         # Clean up the file handle.
         backend._file_handle.close()
 
+    def test_resource_includes_run_attributes_when_enabled(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """TracerProvider resource carries Slurm metadata when enabled."""
+        monkeypatch.delenv("COSMOS_CURATOR_OTLP_RUN_ATTRIBUTES", raising=False)
+        monkeypatch.setenv("SLURM_JOB_ID", "9001")
+        config = TracingConfig(
+            trace_dir=str(tmp_path),
+            otlp_endpoint="",
+            include_run_attributes=True,
+        )
+        backend = _TracingBackend(config)
+        _reset_otel_provider_guard()
+        backend.setup_provider()
+        resource_attrs = dict(trace.get_tracer_provider().resource.attributes)
+        assert resource_attrs.get("slurm_job_id") == "9001"
+        backend.shutdown()
+
+    def test_resource_omits_run_attributes_when_disabled(
+        self,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``include_run_attributes=False`` keeps Slurm keys off the resource."""
+        monkeypatch.setenv("SLURM_JOB_ID", "9001")
+        config = TracingConfig(
+            trace_dir=str(tmp_path),
+            otlp_endpoint="",
+            include_run_attributes=False,
+        )
+        backend = _TracingBackend(config)
+        _reset_otel_provider_guard()
+        backend.setup_provider()
+        resource_attrs = dict(trace.get_tracer_provider().resource.attributes)
+        assert "slurm_job_id" not in resource_attrs
+        backend.shutdown()
+
     def test_setup_and_flush_produces_span_data(self, tmp_path: pathlib.Path) -> None:
         """After setup_provider + span creation + flush, the .jsonl file contains span data."""
         config = TracingConfig(
@@ -292,6 +331,24 @@ class TestFlushAndPropagateNoBackend:
         """propagate_trace_context() must not raise when _current_backend is None."""
         _hook_module._current_backend = None
         propagate_trace_context()  # Should not raise.
+
+
+class TestEnableTracingEnv:
+    """Verify tracing endpoint env-var wiring."""
+
+    def test_enable_tracing_pins_traces_endpoint(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Setting tracing OTLP endpoint pins both generic and traces-specific vars."""
+        monkeypatch.setattr(_hook_module, "setup_tracing", lambda: None)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+        monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+
+        _hook_module.enable_tracing(otlp_endpoint="http://traces.example:4318")
+
+        assert __import__("os").environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") == "http://traces.example:4318"
+        assert __import__("os").environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") == "http://traces.example:4318"
 
 
 class TestIsConnectionError:

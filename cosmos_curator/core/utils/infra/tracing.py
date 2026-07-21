@@ -220,14 +220,20 @@ _TRACER_NAME = "cosmos_curator"
 SpanAttributeValue = str | int | float | bool
 
 # Standard OpenTelemetry environment variables for OTLP export.
-# Kept here (the public API module) so both tracing_hook.py and
-# application code (e.g. local_vllm_serve_stage.py) share a single
-# source of truth for endpoint resolution.
-_ENV_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
-_ENV_OTLP_TRACES_ENDPOINT = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+# Kept here (the public API module) so tracing_hook.py, metrics_push.py,
+# and application code (e.g. local_vllm_serve_stage.py) share a single
+# source of truth for endpoint resolution.  Public because multiple
+# sibling modules import them; ``_ENV_OTLP_*`` underscore aliases are
+# preserved for backward compat with existing imports.
+ENV_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
+ENV_OTLP_TRACES_ENDPOINT = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
+_ENV_OTLP_ENDPOINT = ENV_OTLP_ENDPOINT
+_ENV_OTLP_TRACES_ENDPOINT = ENV_OTLP_TRACES_ENDPOINT
 
 # Re-export StatusCode so callers don't need an extra import.
 __all__ = [
+    "ENV_OTLP_ENDPOINT",
+    "ENV_OTLP_TRACES_ENDPOINT",
     "SpanAttributeValue",
     "StatusCode",
     "TracedSpan",

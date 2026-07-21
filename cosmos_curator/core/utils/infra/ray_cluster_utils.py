@@ -72,6 +72,19 @@ def init_or_connect_to_cluster() -> None:
     set (by :func:`~cosmos_curator.core.utils.infra.tracing_hook.enable_tracing`),
     the value is forwarded to ``ray.init(_tracing_startup_hook=...)``
     so that every worker runs the OTel tracing setup on startup.
+
+    Ray's Prometheus metrics listener port is not pinned here.  In
+    local mode Ray binds an ephemeral free port; in
+    Slurm / NVCF / helm / KubeRay mode the listening port was already
+    chosen by ``ray start --metrics-export-port=...`` in the
+    bootstrap script (which reads ``XENNA_RAY_METRICS_PORT``).
+    Either way, the in-pipeline metrics scraper discovers each
+    node's actual port via ``ray.nodes()[i].MetricsExportPort`` at
+    scrape time -- so the curator code path does not need to (and
+    deliberately does not) pass ``_metrics_export_port`` to
+    ``ray.init``, which would otherwise force Ray to bind a specific
+    port in local mode and could collide with other listeners on
+    the host.
     """
     # Turn off serization for loguru. This is needed as loguru is not serializable in general.
     ray.util.register_serializer(

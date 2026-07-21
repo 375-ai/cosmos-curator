@@ -124,6 +124,11 @@ from opentelemetry import context, trace
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
+from cosmos_curator.core.utils.infra.run_attributes import (
+    collect_run_attributes,
+    otlp_run_attributes_enabled,
+    set_otlp_run_attributes_enabled,
+)
 from cosmos_curator.core.utils.infra.tracing import (
     _ENV_OTLP_ENDPOINT,
     _ENV_OTLP_TRACES_ENDPOINT,
@@ -196,6 +201,7 @@ class TracingConfig:
     otlp_endpoint: str = ""
     traceparent: str = ""
     service_name: str = "cosmos_curator"
+    include_run_attributes: bool = True
 
     @classmethod
     def from_env(cls) -> "TracingConfig":
@@ -221,6 +227,7 @@ class TracingConfig:
             otlp_endpoint=get_otlp_endpoint(),
             traceparent=os.environ.get(_ENV_TRACEPARENT, ""),
             service_name=os.environ.get(_ENV_SERVICE_NAME, "cosmos_curator"),
+            include_run_attributes=otlp_run_attributes_enabled(),
         )
 
 
@@ -480,13 +487,14 @@ class _TracingBackend:
         #   process.pid   = OS PID          (e.g. 6135)
         #
         _pid = os.getpid()
-        resource = Resource.create(
-            {
-                "service.name": self._config.service_name,
-                "host.name": short_hostname(),
-                "process.pid": _pid,
-            }
-        )
+        resource_attrs: dict[str, str | int] = {
+            "service.name": self._config.service_name,
+            "host.name": short_hostname(),
+            "process.pid": _pid,
+        }
+        if self._config.include_run_attributes:
+            resource_attrs.update(collect_run_attributes())
+        resource = Resource.create(resource_attrs)
         provider = TracerProvider(resource=resource)
         trace.set_tracer_provider(provider)
         logger.trace(
@@ -837,7 +845,12 @@ def _instrument_libraries() -> None:
     )
 
 
-def enable_tracing(*, sampling_rate: float = 1.0, otlp_endpoint: str = "") -> None:
+def enable_tracing(
+    *,
+    sampling_rate: float = 1.0,
+    otlp_endpoint: str = "",
+    include_run_attributes: bool = True,
+) -> None:
     """Enable distributed OpenTelemetry tracing for the pipeline.
 
     Performs four actions:
@@ -869,9 +882,14 @@ def enable_tracing(*, sampling_rate: float = 1.0, otlp_endpoint: str = "") -> No
             disables remote OTLP export -- only the local file-based
             exporter is active.  When non-empty, sets
             ``OTEL_EXPORTER_OTLP_ENDPOINT`` so workers inherit it.
+        include_run_attributes: When ``False``, OTLP trace resources
+            omit run metadata (user, Slurm job id, etc.).  Propagated
+            to Ray workers via ``COSMOS_CURATOR_OTLP_RUN_ATTRIBUTES``.
 
     """
     import cosmos_curator  # noqa: PLC0415
+
+    set_otlp_run_attributes_enabled(enabled=include_run_attributes)
 
     # Ensure Ray workers can import the tracing hook module.
     # The driver can already import cosmos_curator (it's running this
@@ -919,6 +937,10 @@ def enable_tracing(*, sampling_rate: float = 1.0, otlp_endpoint: str = "") -> No
     otlp_endpoint = otlp_endpoint.strip()
     if otlp_endpoint:
         os.environ[_ENV_OTLP_ENDPOINT] = otlp_endpoint
+        # Pin the trace-specific endpoint so later writes to the
+        # generic OTEL_EXPORTER_OTLP_ENDPOINT (for metrics, etc.) do
+        # not redirect worker spans.
+        os.environ[_ENV_OTLP_TRACES_ENDPOINT] = otlp_endpoint
 
     # Also configure tracing on the driver process itself.
     # Workers get setup_tracing() via Ray's _tracing_startup_hook,

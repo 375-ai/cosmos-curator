@@ -19,6 +19,7 @@ import argparse
 import attrs
 import pytest
 
+from cosmos_curator.core.utils.infra.metrics_push import DEFAULT_DROP_METRIC_NAMES_REGEX
 from cosmos_curator.pipelines.common_pipeline_settings import (
     CommonPipelineSettings,
     composite_from_namespace,
@@ -106,6 +107,8 @@ def test_shard_parser_boolean_flags_use_action_not_type() -> None:
         "verbose",
         "perf_profile",
         "profile_tracing",
+        "otlp_metrics_push",
+        "otlp_run_attributes",
         "profile_cpu",
         "profile_memory",
         "profile_gpu",
@@ -286,6 +289,12 @@ def test_common_settings_rejects_invalid_execution_mode() -> None:
         profile_tracing=False,
         profile_tracing_sampling=0.01,
         profile_tracing_otlp_endpoint="",
+        otlp_metrics_push=False,
+        otlp_metrics_push_endpoint="",
+        otlp_metrics_push_interval=30,
+        otlp_metrics_push_drop_regex=DEFAULT_DROP_METRIC_NAMES_REGEX,
+        otlp_run_attributes=True,
+        otlp_run_attributes_map={},
         profile_cpu=False,
         profile_memory=False,
         profile_gpu=False,
@@ -311,6 +320,12 @@ def test_shard_settings_rejects_empty_input_clip_path() -> None:
         profile_tracing=False,
         profile_tracing_sampling=0.01,
         profile_tracing_otlp_endpoint="",
+        otlp_metrics_push=False,
+        otlp_metrics_push_endpoint="",
+        otlp_metrics_push_interval=30,
+        otlp_metrics_push_drop_regex=DEFAULT_DROP_METRIC_NAMES_REGEX,
+        otlp_run_attributes=True,
+        otlp_run_attributes_map={},
         profile_cpu=False,
         profile_memory=False,
         profile_gpu=False,

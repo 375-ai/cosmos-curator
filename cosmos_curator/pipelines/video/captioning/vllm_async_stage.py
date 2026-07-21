@@ -517,10 +517,17 @@ class VllmAsyncCaptionStage(SingleInferenceCaptionStage, ContinuousInterface):  
         vllm_log_level = logging.DEBUG if self._verbose else logging.INFO
         logging.getLogger("vllm").setLevel(vllm_log_level)
 
-        # Suppress OTLP exporter internal retry noise (WARNING/ERROR from
+        # Suppress OTLP trace/log exporter retry noise (WARNING/ERROR from
         # OTLPSpanExporter when no collector runs on localhost:4318).
-        # cosmos-curator uses its own TracerProvider; these loggers are noise.
-        logging.getLogger("opentelemetry.exporter.otlp.proto.http").setLevel(logging.CRITICAL)
+        # Scope to those exporters only -- not the parent logger, so
+        # ``…metric_exporter`` can still emit HTTP status codes when the
+        # driver pushes metrics via ``--otlp-metrics-push``.
+        for otlp_logger_name in (
+            "opentelemetry.exporter.otlp.proto.http.trace_exporter",
+            "opentelemetry.exporter.otlp.proto.http._log_exporter",
+        ):
+            logging.getLogger(otlp_logger_name).setLevel(logging.CRITICAL)
+        logging.getLogger("opentelemetry.exporter.otlp.proto.http.metric_exporter").setLevel(logging.ERROR)
 
         self._logger.info(
             "vLLM environment configured: env_vars={}, vllm_log_level={}",

@@ -131,6 +131,22 @@ def test_common_parse_coerces_limit_and_from_namespace_roundtrip() -> None:
     assert settings.execution_mode == "STREAMING"
 
 
+def test_otlp_run_attributes_map_parses_json_object() -> None:
+    """The map flag parses a JSON object into a dict[str, str]."""
+    parser = _common_parser()
+    args = parser.parse_args(
+        [
+            "--otlp-run-attributes-map",
+            '{"customer":"nvidia","cluster":"cs-oci-ord:interactive_singlenode"}',
+        ],
+    )
+    settings = CommonPipelineSettings.from_namespace(args)
+    assert settings.otlp_run_attributes_map == {
+        "customer": "nvidia",
+        "cluster": "cs-oci-ord:interactive_singlenode",
+    }
+
+
 def test_execution_mode_has_argparse_choices() -> None:
     """execution_mode exposes AUTO, BATCH, and STREAMING as argparse choices."""
     parser = _common_parser()
@@ -203,10 +219,16 @@ def test_xenna_streaming_scheduler_validator_rejects_unknown_value() -> None:
             profile_tracing=False,
             profile_tracing_sampling=0.01,
             profile_tracing_otlp_endpoint="",
+            otlp_metrics_push=False,
+            otlp_metrics_push_endpoint="",
+            otlp_metrics_push_interval=30,
+            otlp_metrics_push_drop_regex="",
+            otlp_run_attributes=True,
             profile_cpu=False,
             profile_memory=False,
             profile_gpu=False,
             profile_cpu_exclude="_root",
             profile_memory_exclude="_root",
             profile_gpu_exclude="_root",
+            otlp_run_attributes_map={},
         )
