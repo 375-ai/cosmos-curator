@@ -35,7 +35,7 @@ See the Cosmos3 recipe (transfer section) and
 
 import abc
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import attrs
 from loguru import logger
@@ -232,7 +232,7 @@ class Cosmos3OmniTransferModel(StyleTransferModel):
         vision_frames: "npt.NDArray[np.uint8]",
         control_paths: dict[str, Path] | None,
         params: StyleTransferParams,
-        work_dir: Path,
+        work_dir: Path,  # noqa: ARG002 -- part of StyleTransferModel.generate contract; this in-process backend encodes mp4 in-memory and needs no scratch
     ) -> TransferResult:
         """Run Cosmos3 transfer for one clip via the in-process Omni engine."""
         from vllm_omni.inputs.data import OmniDiffusionSamplingParams  # noqa: PLC0415
@@ -274,7 +274,7 @@ class Cosmos3OmniTransferModel(StyleTransferModel):
             raise TypeError(msg)
 
         frames = _extract_uint8_frames(output)
-        mp4_bytes = _encode_mp4(frames, fps=params.fps, work_dir=work_dir)
+        mp4_bytes = _encode_mp4(frames, fps=params.fps)
         return TransferResult(mp4_bytes=mp4_bytes, num_frames=int(frames.shape[0]))
 
     def shutdown(self) -> None:
@@ -440,10 +440,49 @@ def _to_uint8(arr: "npt.NDArray[Any]") -> "npt.NDArray[np.uint8]":
     return (np.clip(scaled, 0.0, 1.0) * 255.0).round().astype(np.uint8)
 
 
-def _encode_mp4(frames: "npt.NDArray[np.uint8]", *, fps: int, work_dir: Path) -> bytes:
-    """Encode a (T, H, W, 3) uint8 RGB array to mp4 bytes via diffusers' writer."""
-    from diffusers.utils import export_to_video  # noqa: PLC0415
+def _encode_mp4(frames: "npt.NDArray[np.uint8]", *, fps: int) -> bytes:
+    """Encode a (T, H, W, 3) uint8 RGB array to mp4 bytes in-memory via PyAV.
 
-    out_path = work_dir / "style_transfer_output.mp4"
-    export_to_video(list(frames), str(out_path), fps=fps)
-    return out_path.read_bytes()
+    Uses GPU H.264 (``h264_nvenc``); the software ``libx264`` encoder isn't built
+    into the image's ffmpeg, so nvenc is our H.264 path. Encoding here (rather than
+    via ``imageio`` / ``export_to_video``) also means the image doesn't need the
+    ``imageio-ffmpeg`` package, whose wheel bundles a prebuilt ffmpeg binary we don't
+    ship. Falls back to software ``mpeg4`` if NVENC is unavailable at runtime (matches
+    the SeedVR encoder in ``super_resolution/inference_seedvr2_window.py``).
+    """
+    import io  # noqa: PLC0415
+    from fractions import Fraction  # noqa: PLC0415
+
+    import av  # noqa: PLC0415
+    import numpy as np  # noqa: PLC0415
+
+    if frames.ndim != _VIDEO_NDIM or int(frames.shape[-1]) != 3:  # noqa: PLR2004 -- (T, H, W, 3) RGB
+        msg = f"_encode_mp4 expects (T, H, W, 3) uint8 RGB frames, got shape {frames.shape}"
+        raise ValueError(msg)
+
+    height, width = int(frames.shape[1]), int(frames.shape[2])
+    rate = Fraction(fps).limit_denominator(1000)
+
+    def _encode_with(codec_name: str) -> bytes:
+        buf = io.BytesIO()
+        with av.open(buf, mode="w", format="mp4") as container:
+            # add_stream widens to a Video|Audio|Subtitle union for a non-literal codec
+            # name; we only ever request video codecs here.
+            stream = cast("av.video.stream.VideoStream", container.add_stream(codec_name, rate=rate))
+            stream.width = width
+            stream.height = height
+            stream.pix_fmt = "yuv420p"
+            stream.options = {"preset": "p4", "tune": "hq"} if codec_name == "h264_nvenc" else {"qscale": "5"}
+            for frame in frames:
+                vf = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame, dtype=np.uint8), format="rgb24")
+                for pkt in stream.encode(vf):
+                    container.mux(pkt)
+            for pkt in stream.encode(None):
+                container.mux(pkt)
+        return buf.getvalue()
+
+    try:
+        return _encode_with("h264_nvenc")
+    except Exception as exc:  # noqa: BLE001 -- NVENC may be unavailable; fall back to software mpeg4
+        logger.warning(f"h264_nvenc encode failed ({exc}); falling back to software mpeg4")
+        return _encode_with("mpeg4")

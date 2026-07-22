@@ -480,6 +480,16 @@ RUN cd {{code_dir_str}} && \
     done && \
     $success && \
     for env in {{ envs | reject('equalto', 'cuml') | join(' ') }}; do \
+        if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('imageio_ffmpeg') else 1)"; then \
+            echo "[imageio-ffmpeg] present in env '$env'; removing (unused -- we encode via PyAV -- and its bundled ffmpeg binary must not ship)" && \
+            pixi run --as-is -e "$env" pip uninstall -y imageio-ffmpeg && \
+            if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(1 if importlib.util.find_spec('imageio_ffmpeg') else 0)"; then \
+                echo "[imageio-ffmpeg] confirmed removed from env '$env'"; \
+            else \
+                echo "ERROR: imageio-ffmpeg still present in env '$env' after uninstall; aborting build (this package must not remain in the image)" >&2; \
+                exit 1; \
+            fi; \
+        fi; \
 {% if redistributable %}        if pixi run --as-is -e "$env" python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('av') else 1)"; then \
             pixi run --as-is -e "$env" pip uninstall -y av && \
             pixi run --as-is -e "$env" pip install --no-cache-dir /opt/cosmos-curator-wheelhouse/av-17.0.0-*.whl && \
