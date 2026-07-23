@@ -15,8 +15,11 @@
 
 """SensorGroup: top-level coordinator for aligned multi-sensor sampling."""
 
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterator, Mapping
 from typing import Protocol
+
+import numpy as np
+import numpy.typing as npt
 
 from cosmos_curator.core.sensors.data.aligned_frame import AlignedFrame
 from cosmos_curator.core.sensors.data.sensor_data import SensorData
@@ -24,12 +27,18 @@ from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
 
 _MIN_SENSOR_OVERLAP_PARTICIPANTS = 2
 
+# Canonical error for sensors that expose no full-fidelity timeline read. Shared
+# so the message stays single-sourced across every non-camera sensor.
+STREAM_TIMESTAMPS_CAMERA_ONLY_MSG = "stream_timestamps is only implemented for CameraSensor"
+
 
 class Sensor(Protocol):  # pragma: no cover
     """Structural interface for all sensor implementations.
 
-    Any object with ``start_ns``, ``end_ns``, and ``sample()`` satisfies this
-    protocol; explicit inheritance is not required.
+    Any object with ``start_ns``, ``end_ns``, ``sample()``, and
+    ``stream_timestamps()`` satisfies this protocol; explicit inheritance is not
+    required. ``stream_timestamps()`` may raise ``NotImplementedError`` for
+    sensor types without a full-fidelity timeline read (see its docstring).
     """
 
     @property
@@ -44,6 +53,29 @@ class Sensor(Protocol):  # pragma: no cover
 
     def sample(self, spec: SamplingSpec) -> Generator[SensorData]:
         """Yield one ``SensorData`` per window in ``spec.grid``."""
+        ...
+
+    def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
+        """Yield the sensor's own ``int64`` ns timestamps in presentation order.
+
+        Unlike ``sample()``, which resamples onto ``spec``'s grid, this streams
+        every timestamp the sensor recorded, in order, with no resampling or
+        decimation. Batches are consecutive and non-overlapping, and their union
+        covers every timestamp.
+
+        Args:
+            batch_size: ``0`` yields all timestamps in a single batch; ``> 0``
+                yields consecutive batches of that length (the final batch may be
+                shorter). An empty timeline yields no batches in either mode.
+
+        Yields:
+            Timestamps in nanoseconds as ``int64`` arrays.
+
+        Raises:
+            NotImplementedError: for sensor types without a full-fidelity
+                timeline read. Only ``CameraSensor`` implements this today.
+
+        """
         ...
 
 

@@ -14,7 +14,7 @@
 # limitations under the License.
 """MCAP camera sensor."""
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 
 import numpy as np
 import numpy.typing as npt
@@ -27,6 +27,7 @@ from cosmos_curator.core.sensors.data.video import VideoMetadata
 from cosmos_curator.core.sensors.sampling.grid import SamplingWindow
 from cosmos_curator.core.sensors.sampling.sampler import sample_window_indices
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+from cosmos_curator.core.sensors.sensors.group import STREAM_TIMESTAMPS_CAMERA_ONLY_MSG
 from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.io import open_data_source
 from cosmos_curator.core.sensors.utils.mcap import (
@@ -171,6 +172,14 @@ class McapCameraSensor:
     def timestamps_ns(self) -> npt.NDArray[np.int64]:
         """Presentation times in nanoseconds (raw MCAP ``log_time``)."""
         return self._ensure_timeline_cached()
+
+    def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
+        """Not implemented: the timestamp stream is camera-only for now.
+
+        See :meth:`CameraSensor.stream_timestamps`.
+        """
+        del batch_size
+        raise NotImplementedError(STREAM_TIMESTAMPS_CAMERA_ONLY_MSG)
 
     def _resolve_topic_dimensions(self, reader: McapReader) -> tuple[int, int]:
         """Resolve and validate frame dimensions for the configured topic."""

@@ -15,7 +15,7 @@
 
 """Tests for SensorGroup."""
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 
 import attrs
 import numpy as np
@@ -27,7 +27,7 @@ from cosmos_curator.core.sensors.sampling.grid import SamplingGrid
 from cosmos_curator.core.sensors.sampling.policy import SamplingPolicy
 from cosmos_curator.core.sensors.sampling.sampler import sample_window_indices
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
-from cosmos_curator.core.sensors.sensors.group import SensorGroup
+from cosmos_curator.core.sensors.sensors.group import STREAM_TIMESTAMPS_CAMERA_ONLY_MSG, SensorGroup
 
 
 @attrs.define
@@ -65,6 +65,11 @@ class _FakeSensor:
                 sensor_timestamps_ns=self._ts[indices],
             )
 
+    def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
+        """Not implemented: the timestamp stream is camera-only for now."""
+        del batch_size
+        raise NotImplementedError(STREAM_TIMESTAMPS_CAMERA_ONLY_MSG)
+
 
 class _FixedWindowSensor:
     """Sensor that yields precomputed sensor timestamps for each grid window."""
@@ -97,6 +102,11 @@ class _FixedWindowSensor:
                 align_timestamps_ns=np.array(window.timestamps_ns, dtype=np.int64),
                 sensor_timestamps_ns=sensor_timestamps_ns,
             )
+
+    def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
+        """Not implemented: the timestamp stream is camera-only for now."""
+        del batch_size
+        raise NotImplementedError(STREAM_TIMESTAMPS_CAMERA_ONLY_MSG)
 
 
 def _make_grid(timestamps_ns: npt.NDArray[np.int64], stride_ns: int, duration_ns: int) -> SamplingGrid:

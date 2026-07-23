@@ -696,3 +696,11 @@ def test_mcap_camera_sensor_sample_returns_no_batches_when_grid_yields_nothing(
     spec = SimpleNamespace(grid=[])
 
     assert list(sensor.sample(spec)) == []  # type: ignore[arg-type]
+
+
+def test_mcap_camera_sensor_stream_timestamps_not_implemented() -> None:
+    """stream_timestamps is camera-only; McapCameraSensor raises NotImplementedError."""
+    sensor = McapCameraSensor(b"not-used")
+
+    with pytest.raises(NotImplementedError, match="only implemented for CameraSensor"):
+        list(sensor.stream_timestamps())

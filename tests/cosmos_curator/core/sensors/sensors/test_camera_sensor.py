@@ -1332,3 +1332,160 @@ def test_camera_sensor_sample_supports_gpu_decode_config(
     assert gpu_open_calls[0][2] is decode_config
     assert gpu_open_calls[0][3] is None
     np.testing.assert_array_equal(batch.align_timestamps_ns, np.array([100, 200], dtype=np.int64))
+
+
+# --- stream_timestamps -------------------------------------------------------
+
+
+class _PoisonSource:
+    """A video source that fails on any access.
+
+    The ``VideoIndex`` is stubbed in via ``patch_camera_sensor_dependencies``, so
+    a sensor built over this source never touches it during construction. It is
+    reached only if something tries to *decode* frames — which would open the
+    source through some decoder — so any access fails the test, independent of
+    which concrete decoder class does the opening.
+    """
+
+    def __getattr__(self, name: str) -> object:
+        msg = f"the video source must not be accessed (attempted .{name})"
+        raise AssertionError(msg)
+
+
+def _linear_camera_sensor(
+    patch_camera_sensor_dependencies: Callable[..., None],
+    *,
+    pts_ns: list[int],
+    is_discard: list[bool] | None = None,
+    source: object = b"not-used",
+) -> CameraSensor:
+    """Build a CameraSensor over a fake index with a strictly-increasing timeline."""
+    n = len(pts_ns)
+    discard = [False] * n if is_discard is None else is_discard
+    index, metadata = _make_video_index_and_metadata(
+        pts_ns=pts_ns,
+        pts_stream=[i + 1 for i in range(n)],
+        is_keyframe=[i == 0 for i in range(n)],
+        is_discard=discard,
+        kf_pts_ns=[pts_ns[0]],
+        kf_pts_stream=[1],
+    )
+
+    def fake_make_index_and_metadata(
+        source: object,
+        stream_idx: int = 0,
+        index_method: object = None,
+        **_kwargs: object,
+    ) -> tuple[VideoIndex, VideoMetadata]:
+        del source, stream_idx, index_method
+        return index, metadata
+
+    patch_camera_sensor_dependencies(make_index_and_metadata_fn=fake_make_index_and_metadata)
+    return CameraSensor(source)
+
+
+def _count_decoded_frames(video_bytes: bytes) -> int:
+    """Count displayable frames by decoding the clip independently of the index."""
+    count = 0
+    with av.open(io.BytesIO(video_bytes)) as container:
+        for _frame in container.decode(video=0):
+            count += 1
+    return count
+
+
+def test_stream_timestamps_single_batch_covers_full_timeline(
+    patch_camera_sensor_dependencies: Callable[..., None],
+) -> None:
+    """batch_size == 0 yields one batch equal to the full presentation timeline."""
+    sensor = _linear_camera_sensor(patch_camera_sensor_dependencies, pts_ns=[100, 200, 300, 400, 500])
+
+    batches = list(sensor.stream_timestamps())
+
+    assert len(batches) == 1
+    assert batches[0].dtype == np.int64
+    np.testing.assert_array_equal(batches[0], sensor.timestamps_ns)
+    assert bool(np.all(np.diff(batches[0]) > 0))
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 3, 5, 8])
+def test_stream_timestamps_batches_tile_the_timeline(
+    patch_camera_sensor_dependencies: Callable[..., None],
+    batch_size: int,
+) -> None:
+    """batch_size > 0 yields consecutive, non-overlapping batches whose union is the timeline."""
+    sensor = _linear_camera_sensor(patch_camera_sensor_dependencies, pts_ns=[100 * (i + 1) for i in range(7)])
+
+    batches = list(sensor.stream_timestamps(batch_size))
+
+    for batch in batches[:-1]:
+        assert len(batch) == batch_size
+    assert 0 < len(batches[-1]) <= batch_size
+    np.testing.assert_array_equal(np.concatenate(batches), sensor.timestamps_ns)
+
+
+def test_stream_timestamps_excludes_discarded_packets(
+    patch_camera_sensor_dependencies: Callable[..., None],
+) -> None:
+    """The streamed timeline is the displayable presentation timeline (discards removed)."""
+    sensor = _linear_camera_sensor(
+        patch_camera_sensor_dependencies,
+        pts_ns=[100, 200, 300, 400],
+        is_discard=[False, True, False, False],
+    )
+
+    (timeline,) = list(sensor.stream_timestamps())
+
+    np.testing.assert_array_equal(timeline, np.array([100, 300, 400], dtype=np.int64))
+    np.testing.assert_array_equal(timeline, sensor.timestamps_ns)
+
+
+def test_stream_timestamps_rejects_negative_batch_size(
+    patch_camera_sensor_dependencies: Callable[..., None],
+) -> None:
+    """A negative batch_size is rejected eagerly."""
+    sensor = _linear_camera_sensor(patch_camera_sensor_dependencies, pts_ns=[100, 200, 300])
+
+    with pytest.raises(ValueError, match="batch_size must be non-negative"):
+        sensor.stream_timestamps(-1)
+
+
+def test_stream_timestamps_reads_index_without_decoding(
+    patch_camera_sensor_dependencies: Callable[..., None],
+) -> None:
+    """stream_timestamps reads the index only: it never opens or reads the source.
+
+    The sensor is built over a source that raises on any access, so if the
+    method decoded frames — the outcome forbidden by the ticket — reaching for
+    the source would fail. Success means the timeline was produced from the
+    index alone, whatever decoder class a decode path would have used.
+    """
+    sensor = _linear_camera_sensor(
+        patch_camera_sensor_dependencies,
+        pts_ns=[100, 200, 300, 400],
+        source=_PoisonSource(),
+    )
+
+    batches = list(sensor.stream_timestamps(2))
+
+    np.testing.assert_array_equal(np.concatenate(batches), sensor.timestamps_ns)
+
+
+def test_stream_timestamps_bframe_clip_is_monotonic_presentation_order(
+    h264_video: Callable[..., bytes],
+) -> None:
+    """B-frame content: AUTO -> FULL_DEMUX yields a strictly-increasing timeline of frame_count length."""
+    video_bytes = h264_video(bframes=1)
+    sensor = CameraSensor(video_bytes)
+
+    # has_bframes True confirms the AUTO index method selected FULL_DEMUX for this clip.
+    assert sensor.has_bframes is True
+
+    (timeline,) = list(sensor.stream_timestamps())
+
+    assert timeline.dtype == np.int64
+    assert bool(np.all(np.diff(timeline) > 0))
+    assert len(timeline) == _count_decoded_frames(video_bytes)
+    np.testing.assert_array_equal(timeline, sensor.timestamps_ns)
+
+    # Batched reads over the same clip tile the identical timeline.
+    np.testing.assert_array_equal(np.concatenate(list(sensor.stream_timestamps(64))), timeline)

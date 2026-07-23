@@ -14,7 +14,7 @@
 # limitations under the License.
 """Camera sensor for the curator package."""
 
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -145,6 +145,37 @@ class CameraSensor:
 
         """
         return self._video_index.display_pts_ns
+
+    def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
+        """Stream the camera's presentation timeline in nanoseconds.
+
+        Reads the timeline directly from the ``VideoIndex`` (``display_pts_ns``,
+        strictly increasing by construction); no frames are decoded. With
+        ``VideoIndexCreationMethod.AUTO`` — the default — B-frame streams are
+        indexed via ``FULL_DEMUX``, so decode-order (DTS) reordering never reaches
+        the index and the streamed timeline is already in presentation order.
+
+        Args:
+            batch_size: ``0`` yields all timestamps in a single batch; ``> 0``
+                yields consecutive, non-overlapping batches of that length (the
+                final batch may be shorter).
+
+        Yields:
+            Timestamps in nanoseconds as ``int64`` arrays, in presentation order.
+
+        Raises:
+            ValueError: if ``batch_size`` is negative.
+
+        """
+        if batch_size < 0:
+            msg = f"batch_size must be non-negative, got {batch_size}"
+            raise ValueError(msg)
+        # The constructor rejects streams with no displayable frames, so the
+        # timeline is always non-empty here; step is therefore always >= 1.
+        timestamps = self._video_index.display_pts_ns
+        # batch_size == 0 means "one batch spanning the whole timeline".
+        step = batch_size or len(timestamps)
+        return (timestamps[start : start + step] for start in range(0, len(timestamps), step))
 
     @property
     def codec_name(self) -> str:

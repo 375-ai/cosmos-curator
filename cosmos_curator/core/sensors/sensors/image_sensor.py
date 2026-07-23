@@ -15,7 +15,7 @@
 
 """Sensor wrapper for timestamped still images."""
 
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -24,6 +24,7 @@ from PIL import Image as PILImage
 from cosmos_curator.core.sensors.data.image_data import ImageData, ImageMetadata
 from cosmos_curator.core.sensors.sampling.sampler import sample_window_indices
 from cosmos_curator.core.sensors.sampling.spec import SamplingSpec
+from cosmos_curator.core.sensors.sensors.group import STREAM_TIMESTAMPS_CAMERA_ONLY_MSG
 from cosmos_curator.core.sensors.types.types import DataSource
 from cosmos_curator.core.sensors.utils.io import open_data_source
 from cosmos_curator.core.sensors.utils.validation import require_strictly_increasing
@@ -84,6 +85,14 @@ class ImageSensor:
     def end_ns(self) -> int:
         """Return the latest sensor timestamp."""
         return int(self.sensor_timestamps_ns[-1])
+
+    def stream_timestamps(self, batch_size: int = 0) -> Iterator[npt.NDArray[np.int64]]:
+        """Not implemented: the timestamp stream is camera-only for now.
+
+        See :meth:`CameraSensor.stream_timestamps`.
+        """
+        del batch_size
+        raise NotImplementedError(STREAM_TIMESTAMPS_CAMERA_ONLY_MSG)
 
     def sample(self, spec: SamplingSpec) -> Generator[ImageData]:
         """Yield sampled ``ImageData`` batches for each window in ``spec.grid``."""

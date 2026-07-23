@@ -320,3 +320,13 @@ def test_image_sensor_path_and_stream_sources_produce_equivalent_output(
     np.testing.assert_array_equal(path_sample.sensor_timestamps_ns, stream_sample.sensor_timestamps_ns)
     np.testing.assert_array_equal(path_sample.align_timestamps_ns, stream_sample.align_timestamps_ns)
     assert path_sample.metadata == stream_sample.metadata
+
+
+def test_image_sensor_stream_timestamps_not_implemented(tmp_path: pathlib.Path) -> None:
+    """stream_timestamps is camera-only; ImageSensor raises NotImplementedError."""
+    image = tmp_path / "a.png"
+    _write_image(image, (10, 20, 30))
+    sensor = ImageSensor([image])
+
+    with pytest.raises(NotImplementedError, match="only implemented for CameraSensor"):
+        list(sensor.stream_timestamps())
