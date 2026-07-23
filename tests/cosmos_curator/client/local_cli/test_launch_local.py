@@ -63,6 +63,52 @@ def test_launch_command() -> None:
 
     # check docker command is formed
     assert called_args[:3] == ["docker", "run", "--rm"]
+    assert "--network=host" not in called_args
+    assert "--cap-add=SYS_ADMIN" not in called_args
+
+
+def test_launch_command_with_docker_network() -> None:
+    """Test that --docker-network forwards the selected Docker network."""
+    args = [
+        "local",
+        "launch",
+        "--docker-network",
+        "host",
+        "--",
+        "echo",
+        "hello",
+    ]
+    with patch("cosmos_curator.client.local_cli.launch_local.subprocess.call") as mock_call:
+        mock_call.return_value = 0
+
+        result = runner.invoke(cosmos_curator, args)
+
+        assert result.exit_code == 0
+        called_args = mock_call.call_args[0][0]
+
+    assert "--network=host" in called_args
+
+
+def test_launch_command_with_empty_docker_network_omits_network_arg() -> None:
+    """Test that a blank Docker network is treated as unset."""
+    args = [
+        "local",
+        "launch",
+        "--docker-network",
+        "",
+        "--",
+        "echo",
+        "hello",
+    ]
+    with patch("cosmos_curator.client.local_cli.launch_local.subprocess.call") as mock_call:
+        mock_call.return_value = 0
+
+        result = runner.invoke(cosmos_curator, args)
+
+        assert result.exit_code == 0
+        called_args = mock_call.call_args[0][0]
+
+    assert all(not arg.startswith("--network=") for arg in called_args)
 
 
 def test_verify_local_path_exists(monkeypatch: MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

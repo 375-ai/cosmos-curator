@@ -573,18 +573,24 @@ docker run -d --name jaeger \
   -p 16686:16686 -p 4318:4318 \
   jaegertracing/all-in-one:latest
 
+# Resolve the host address visible from containers on Docker's default bridge
+HOST_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+test -n "$HOST_IP" || { echo "Could not resolve Docker bridge gateway" >&2; exit 1; }
+
 # Run pipeline with tracing
 cosmos-curator local launch --curator-path . -- \
   pixi run --as-is python -m cosmos_curator.pipelines.video.run_pipeline split \
     --input-video-path /config/test_data/raw_videos/ \
     --output-clip-path /config/test_data/output_clips/ \
-    --profile-tracing --verbose
+    --profile-tracing \
+    --profile-tracing-otlp-endpoint "http://${HOST_IP}:4318" \
+    --verbose
 
 # Open Jaeger UI at http://localhost:16686
 ```
 
-By default the OTLP exporter sends spans to `http://localhost:4318`,
-so a Jaeger instance on the host receives spans out of the box.
+With Docker's default bridge network, the OTLP exporter must use a host address
+reachable from the container, such as the bridge gateway shown above.
 Because `cosmos-curator local launch` runs inside Docker,
 `OTEL_EXPORTER_OTLP_ENDPOINT` must be set **inside** the container
 (e.g. baked into the Docker image or passed via `docker run -e`)

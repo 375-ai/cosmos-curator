@@ -67,6 +67,7 @@ class LaunchDocker:
     mount_xenna: bool
     command: str
     gpus: str | None
+    docker_network: str | None
     mount_s3_creds: bool
     mount_azure_creds: bool
     extra_volumes: list[str]  # each entry is HOST_PATH:CONTAINER_PATH[:MODE]
@@ -145,6 +146,13 @@ def launch(  # noqa: PLR0913
             rich_help_panel="local-docker",
         ),
     ] = None,
+    docker_network: Annotated[
+        str | None,
+        Option(
+            help=("Docker network to connect the container to, e.g. host, bridge, or a custom network name."),
+            rich_help_panel="local-docker",
+        ),
+    ] = None,
     mount_s3_creds: Annotated[
         bool,
         Option(
@@ -189,6 +197,7 @@ def launch(  # noqa: PLR0913
         mount_xenna=mount_xenna,
         command=command_str,
         gpus=gpus,
+        docker_network=docker_network,
         mount_s3_creds=mount_s3_creds,
         mount_azure_creds=mount_azure_creds,
         extra_volumes=_parse_extra_volumes(extra_volumes),
@@ -437,13 +446,13 @@ def _launch_in_docker_container(opts: LaunchDocker) -> None:
         f"--gpus={gpus_string}",
         "--device=/dev/dri:/dev/dri",
         f"--shm-size={_get_shm_size_str()}",
-        "--network=host",
-        "--cap-add=SYS_ADMIN",
         "-e",
         f"{LOCAL_DOCKER_ENV_VAR_NAME}=1",
         "-e",
         "NVCF_REQUEST_STATUS=false",
     ]
+    if opts.docker_network:
+        docker_command.append(f"--network={opts.docker_network}")
     docker_command.extend(user_strings)
     docker_command.extend(home_strings)
     docker_command.extend(_get_log_env_forward_strings())

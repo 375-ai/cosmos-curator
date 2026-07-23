@@ -410,6 +410,12 @@ The container runs as your host UID:GID, so files written to bind-mounted paths 
 `COSMOS_CURATOR_LOCAL_HOME_DIR` to redirect this scratch dir (e.g. to a local disk when `$HOME` is a remote mount
 or has tight quotas).
 
+The launcher uses Docker's default bridge network. Inside the container, `localhost` refers to the container itself,
+not the Docker host. To connect to a service on the host, use a routable host name or the bridge gateway returned by
+`docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}'`. Use `--docker-network NAME` to connect
+the container to a different Docker network. Avoid `--docker-network host` unless bridge networking cannot meet the
+use case, because host networking removes network isolation.
+
 #### Configuration Files
 
 Instead of passing many CLI flags, you can define all pipeline settings in a JSON or YAML
