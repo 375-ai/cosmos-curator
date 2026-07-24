@@ -249,6 +249,46 @@ def _container_mount_specs_from_runtime(
     )
 
 
+def _get_remote_srun_mounts(opts: SlurmContainerRuntime) -> list[str]:
+    """Like _get_srun_mounts but without local filesystem side effects (no mkdir, no path validation).
+
+    Used when the mount paths live on a remote login node rather than the local machine.
+    """
+    mounts = [
+        _mount_string(opts.workspace_path.expanduser(), CONTAINER_PATHS_DEFAULT_WORKSPACE_DIR),
+        _mount_string(opts.cache_path.expanduser(), _CACHE_MOUNT_PATH),
+    ]
+    if opts.curator_path is not None:
+        mounts.append(_mount_string(opts.curator_path.expanduser(), _CONTAINER_SOURCE_DIR))
+    if opts.mount_s3_creds:
+        mounts.append(_mount_string(LOCAL_AWS_CREDENTIALS_FILE, _CONTAINER_S3_CREDS_PATH, mode="ro"))
+    if opts.mount_azure_creds:
+        mounts.append(_mount_string(LOCAL_AZURE_CREDENTIALS_FILE, _CONTAINER_AZURE_CREDS_PATH, mode="ro"))
+    if command_contains(opts.command, "model_cli"):
+        mounts.append(
+            _mount_string(
+                LOCAL_COSMOS_CURATOR_CONFIG_FILE,
+                CONTAINER_PATHS_COSMOS_CURATOR_CONFIG_FILE,
+                mode="ro",
+            )
+        )
+    return [
+        *mounts,
+        *opts.extra_mounts,
+    ]
+
+
+def _remote_container_mount_specs_from_runtime(
+    runtime: SlurmContainerRuntime, container_mounts: str | None = None
+) -> list[MountSpec]:
+    return _merge_mount_specs_by_destination(
+        [
+            *_mount_specs_from_strings(_get_remote_srun_mounts(runtime)),
+            *_parse_mount_specs(container_mounts),
+        ]
+    )
+
+
 def _normalize_optional_slurm_directive(value: str | None) -> str | None:
     if value is None:
         return None
@@ -333,7 +373,7 @@ def _get_workspace_mount(workspace_path: Path) -> str:
 def _get_cache_mount(cache_path: Path) -> str:
     cache = cache_path.expanduser()
     cache.mkdir(parents=True, exist_ok=True)
-    for subdir in ("rattler/cache/uv-cache", "pip", "torch", "triton", "nv/ComputeCache"):
+    for subdir in ("rattler/cache/uv-cache", "pip", "torch", "triton", "nv/ComputeCache", "huggingface", "laion"):
         (cache / subdir).mkdir(parents=True, exist_ok=True)
     return _mount_string(cache.resolve(), _CACHE_MOUNT_PATH)
 
@@ -399,6 +439,8 @@ def _get_cache_environment() -> dict[str, str]:
         "TORCH_HOME": str(_CACHE_MOUNT_PATH / "torch"),
         "TRITON_HOME": str(_CACHE_MOUNT_PATH / "triton"),
         "CUDA_CACHE_PATH": str(_CACHE_MOUNT_PATH / "nv" / "ComputeCache"),
+        "HF_HOME": str(_CACHE_MOUNT_PATH / "huggingface"),
+        "LAION_CACHE_HOME": str(_CACHE_MOUNT_PATH / "laion"),
     }
 
 

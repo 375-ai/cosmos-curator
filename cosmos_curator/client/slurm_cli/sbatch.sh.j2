@@ -11,7 +11,9 @@
 #SBATCH --ntasks={{num_nodes}}
 #SBATCH --ntasks-per-node=1
 #SBATCH --distribution=cyclic
+{% if exclusive %}
 #SBATCH --exclusive
+{% endif %}
 #SBATCH --output={{log_dir}}/%x_%j.log
 {% if comment %}
 #SBATCH --comment="{{comment}}"
@@ -87,6 +89,14 @@ echo "This slurm script is located in folder: $SCRIPT_FOLDER"
 export {{ env_var }}="{{ value }}"
 {% endfor %}
 
+{% if source_environment_file %}
+if [ -f "{{source_environment_file}}" ]; then
+  set -a
+  source "{{source_environment_file}}"
+  set +a
+fi
+{% endif %}
+
 echo "HEAD_NODE_ADDR=${HEAD_NODE_ADDR}"
 echo "HEAD_NODE_PORT=${HEAD_NODE_PORT}"
 echo "SLURMD_NODENAME=${SLURMD_NODENAME}"
@@ -116,6 +126,15 @@ cleanup_on_exit() {
   fi
 }
 trap cleanup_on_exit EXIT SIGTERM SIGINT
+
+{% if prepare_node_local_mounts and node_local_mount_sources %}
+echo "Preparing node-local mount source paths..."
+srun --mpi=none --nodes={{num_nodes}} --ntasks={{num_nodes}} --ntasks-per-node=1 bash -lc '
+{% for node_local_mount_source in node_local_mount_sources %}
+mkdir -p "{{node_local_mount_source}}"
+{% endfor %}
+'
+{% endif %}
 
 # Actual run command
 echo "$(date) - Calling srun..."

@@ -15,6 +15,8 @@
 """Test the slurm module."""
 
 import pathlib
+import shutil
+import subprocess
 import unittest
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -30,10 +32,13 @@ from cosmos_curator.client.slurm_cli.slurm_submit import (
     _START_RAY,
     ContainerSpec,
     SlurmJobSpec,
+    SlurmSubmitOptions,
     _parse_job_id,
     _render_sbatch_script,
+    build_slurm_submit_job_spec,
     connect,
     curator_submit,
+    render_slurm_submit_script,
     submit_cli,
     upload_text,
 )
@@ -134,7 +139,10 @@ def test_render_sbatch_script(exclude_nodes: list[str] | None) -> None:
     job_spec = SlurmJobSpec(
         login_node="login_node",
         container=ContainerSpec(
-            squashfs_path="test_path", command=[str(_START_RAY), "arg1", "arg2"], mounts=[], environment=[]
+            squashfs_path="test_path",
+            command=[str(_START_RAY), "arg1", "arg2"],
+            mounts=[MountSpec("/remote/files/test_job.20260611", "/remote_files")],
+            environment=[],
         ),
         job_name="test_job",
         account="test_account",
@@ -169,6 +177,158 @@ def test_render_sbatch_script(exclude_nodes: list[str] | None) -> None:
     assert f'--comment="{job_spec.comment}"' in sbatch_script
     assert "COSMOS_S3_PROFILE_PATH" in sbatch_script
     assert "COSMOS_AZURE_PROFILE_PATH" in sbatch_script
+
+
+def test_render_sbatch_script_omits_exclusive_when_disabled() -> None:
+    """The rendered sbatch script should honor non-exclusive job specs."""
+    job_spec = SlurmJobSpec(
+        login_node="login_node",
+        container=ContainerSpec(
+            squashfs_path="test_path", command=[str(_START_RAY), "arg1", "arg2"], mounts=[], environment=[]
+        ),
+        job_name="test_job",
+        account="test_account",
+        partition="test_partition",
+        username="test_user",
+        num_nodes=1,
+        gres=GRES,
+        exclusive=False,
+        remote_job_path=pathlib.Path("/remote/files") / "test_job.20260611",
+        time_limit="01:00:00",
+        log_dir=pathlib.Path("/logs"),
+        stop_retries_after=100,
+    )
+
+    sbatch_script = _render_sbatch_script(job_spec)
+
+    assert "#SBATCH --exclusive" not in sbatch_script
+
+
+def test_render_sbatch_script_passes_extra_container_environment_keys_without_values() -> None:
+    """Caller-selected environment keys should be passed by name, not rendered with secret values."""
+    job_spec = SlurmJobSpec(
+        login_node="login_node",
+        container=ContainerSpec(
+            squashfs_path="test_path", command=[str(_START_RAY), "arg1", "arg2"], mounts=[], environment=[]
+        ),
+        job_name="test_job",
+        account="test_account",
+        partition="test_partition",
+        username="test_user",
+        num_nodes=1,
+        gres=GRES,
+        exclusive=False,
+        remote_job_path=pathlib.Path("/remote/files") / "test_job.20260611",
+        time_limit="01:00:00",
+        log_dir=pathlib.Path("/logs"),
+        extra_container_env_keys=["GENERIC_SECRET_TOKEN", "GENERIC_ORG"],
+    )
+
+    sbatch_script = _render_sbatch_script(job_spec)
+
+    assert "\n  . " not in sbatch_script
+    assert "NGC_NVCF_API_KEY" not in sbatch_script
+    assert "PERF_NGC_NVCF_API_KEY" not in sbatch_script
+    assert "GENERIC_SECRET_TOKEN=secret" not in sbatch_script
+    assert "GENERIC_ORG=secret" not in sbatch_script
+    container_env_line = next(line for line in sbatch_script.splitlines() if line.strip().startswith("--container-env"))
+    for key in ("GENERIC_SECRET_TOKEN", "GENERIC_ORG"):
+        assert key in container_env_line
+
+
+def test_render_sbatch_script_sources_environment_file_before_srun() -> None:
+    """Sourced exported values should override Curator defaults before srun builds the container env."""
+    job_spec = SlurmJobSpec(
+        login_node="login_node",
+        container=ContainerSpec(
+            squashfs_path="test_path",
+            command=[str(_START_RAY), "arg1", "arg2"],
+            mounts=[],
+            environment=["COSMOS_S3_PROFILE_PATH=/creds/s3_creds"],
+        ),
+        job_name="test_job",
+        account="test_account",
+        partition="test_partition",
+        username="test_user",
+        num_nodes=1,
+        gres=GRES,
+        exclusive=False,
+        remote_job_path=pathlib.Path("/remote/files") / "test_job.20260611",
+        time_limit="01:00:00",
+        log_dir=pathlib.Path("/logs"),
+        source_environment_file=pathlib.Path("/remote/files/test_job.20260611/secrets.env"),
+        extra_container_env_keys=["NGC_NVCF_API_KEY"],
+    )
+
+    sbatch_script = _render_sbatch_script(job_spec)
+
+    assert 'source "/remote/files/test_job.20260611/secrets.env"' in sbatch_script
+    assert sbatch_script.index('export COSMOS_S3_PROFILE_PATH="/creds/s3_creds"') < sbatch_script.index(
+        'source "/remote/files/test_job.20260611/secrets.env"'
+    )
+    assert sbatch_script.index('source "/remote/files/test_job.20260611/secrets.env"') < sbatch_script.index("srun \\")
+    container_env_line = next(line for line in sbatch_script.splitlines() if line.strip().startswith("--container-env"))
+    assert "NGC_NVCF_API_KEY" in container_env_line
+
+
+def test_render_slurm_submit_script_uses_submit_mount_shape() -> None:
+    """The public dry-run renderer should match the sbatch shape used by submit."""
+    job_spec = SlurmJobSpec(
+        login_node="login_node",
+        container=ContainerSpec(
+            squashfs_path="test_path", command=[str(_START_RAY), "arg1", "arg2"], mounts=[], environment=[]
+        ),
+        job_name="test_job",
+        account="test_account",
+        partition="test_partition",
+        username="test_user",
+        num_nodes=1,
+        gres=GRES,
+        exclusive=False,
+        remote_job_path=pathlib.Path("/remote/files") / "test_job.20260611",
+        time_limit="01:00:00",
+        log_dir=pathlib.Path("/logs"),
+    )
+
+    sbatch_script = render_slurm_submit_script(job_spec)
+
+    assert "#SBATCH --job-name=test_job" in sbatch_script
+    assert "/remote/files/test_job.20260611:/remote_files:rw" in sbatch_script
+    assert sbatch_script.count(":/remote_files:rw") == 1
+
+
+def test_render_sbatch_script_does_not_source_arbitrary_files() -> None:
+    """The sbatch script should not source arbitrary files."""
+    job_spec = SlurmJobSpec(
+        login_node="login_node",
+        container=ContainerSpec(
+            squashfs_path="test_path", command=[str(_START_RAY), "arg1", "arg2"], mounts=[], environment=[]
+        ),
+        job_name="test_job",
+        account="test_account",
+        partition="test_partition",
+        username="test_user",
+        num_nodes=1,
+        gres=GRES,
+        exclusive=False,
+        remote_job_path=pathlib.Path("/remote/files") / "test_job.20260611",
+        log_dir=pathlib.Path("/logs"),
+    )
+
+    sbatch_script = _render_sbatch_script(job_spec)
+
+    assert "set -a" not in sbatch_script
+
+
+def test_sbatch_template_uses_single_environment_file_source_hook() -> None:
+    """The sbatch template should keep the environment import small and fixed."""
+    template = (
+        pathlib.Path(__file__).parents[4] / "cosmos_curator" / "client" / "slurm_cli" / "sbatch.sh.j2"
+    ).read_text(encoding="utf-8")
+
+    assert template.count('source "{{source_environment_file}}"') == 1
+    assert template.count("set -a") == 1
+    assert template.count("set +a") == 1
 
 
 def test_render_sbatch_script_with_qos() -> None:
@@ -291,6 +451,8 @@ def test_submit_uses_shared_defaults_for_container_runtime(
     assert env_vars["UV_CACHE_DIR"] == "/cache/rattler/cache/uv-cache"
     assert env_vars["TORCH_HOME"] == "/cache/torch"
     assert env_vars["TRITON_HOME"] == "/cache/triton"
+    assert env_vars["HF_HOME"] == "/cache/huggingface"
+    assert env_vars["LAION_CACHE_HOME"] == "/cache/laion"
     assert env_vars["CONDA_OVERRIDE_CUDA"] == "13.0.2"
     assert env_vars["EXTRA"] == "value"
     assert env_vars["HOST_ONLY"] == "host-value"
@@ -331,6 +493,222 @@ def test_submit_container_mounts_override_default_targets(tmp_path: pathlib.Path
     assert [mount.dest for mount in job_spec.container.mounts].count("/cache") == 1
     assert mounts_by_destination["/config"] == MountSpec(source=str(explicit_workspace), dest="/config", mode="ro")
     assert mounts_by_destination["/cache"] == MountSpec(source=str(explicit_cache), dest="/cache", mode="rw")
+
+
+def test_submit_node_local_mounts_are_marked_to_skip_login_node_validation(tmp_path: pathlib.Path) -> None:
+    """Node-local mount sources may exist only on allocated compute nodes."""
+    node_local_source = "/raid/scratch/$USER/$SLURM_JOB_ID"
+    job_spec = build_slurm_submit_job_spec(
+        ["echo", "test"],
+        SlurmSubmitOptions(
+            login_node="remote-login",
+            username="cluster-user",
+            container_image="test_image",
+            workspace_path=tmp_path / "workspace",
+            cache_path=tmp_path / "cache",
+            mount_s3_creds=False,
+            node_local_mounts=f"{node_local_source}:/config/models:rw",
+        ),
+    )
+
+    assert MountSpec(source=node_local_source, dest="/config/models", mode="rw") in job_spec.container.mounts
+    assert job_spec.node_local_mount_sources == [node_local_source]
+    sbatch_script = render_slurm_submit_script(job_spec)
+    assert f'mkdir -p "{node_local_source}"' not in sbatch_script
+
+
+def test_submit_can_prepare_node_local_mount_sources(tmp_path: pathlib.Path) -> None:
+    """Node-local mount preparation is explicit so cluster-specific scratch policy stays opt-in."""
+    node_local_source = "/raid/scratch/$USER/$SLURM_JOB_ID"
+    other_node_local_source = "/local/scratch/$USER/$SLURM_JOB_ID"
+    job_spec = build_slurm_submit_job_spec(
+        ["echo", "test"],
+        SlurmSubmitOptions(
+            login_node="remote-login",
+            username="cluster-user",
+            container_image="test_image",
+            workspace_path=tmp_path / "workspace",
+            cache_path=tmp_path / "cache",
+            mount_s3_creds=False,
+            node_local_mounts=f"{node_local_source}:/config/models:rw,{other_node_local_source}:/scratch:rw",
+            prepare_node_local_mounts=True,
+        ),
+    )
+
+    sbatch_script = render_slurm_submit_script(job_spec)
+    assert sbatch_script.count("srun --mpi=none --nodes=") == 1
+    assert f'mkdir -p "{node_local_source}"' in sbatch_script
+    assert f'mkdir -p "{other_node_local_source}"' in sbatch_script
+    assert sbatch_script.index(f'mkdir -p "{node_local_source}"') < sbatch_script.index(
+        f"{node_local_source}:/config/models:rw"
+    )
+    assert sbatch_script.index(f'mkdir -p "{other_node_local_source}"') < sbatch_script.index(
+        f"{other_node_local_source}:/scratch:rw"
+    )
+
+
+def test_build_submit_job_spec_accepts_options_object(tmp_path: pathlib.Path) -> None:
+    """Programmatic callers pass one options object instead of mirroring the CLI signature."""
+    options = SlurmSubmitOptions(
+        login_node="remote-login",
+        username="cluster-user",
+        account="acct",
+        partition="batch",
+        remote_files_path=pathlib.Path("/remote/files"),
+        container_image="test_image",
+        workspace_path=tmp_path / "workspace",
+        cache_path=tmp_path / "cache",
+        mount_s3_creds=False,
+        mount_azure_creds=False,
+        job_name="remote_job",
+        gres="gpu:8",
+        log_dir=pathlib.Path("/remote/logs"),
+    )
+
+    job_spec = build_slurm_submit_job_spec(["echo", "hello"], options)
+
+    assert job_spec.login_node == "remote-login"
+    assert job_spec.username == "cluster-user"
+    assert job_spec.account == "acct"
+    assert job_spec.gres == "gpu:8"
+    assert job_spec.log_dir == pathlib.Path("/remote/logs")
+
+
+def test_build_remote_submit_job_spec_does_not_prepare_local_workspace_or_cache(tmp_path: pathlib.Path) -> None:
+    """Remote submit paths belong to the login node and should not be created on the launcher."""
+    workspace = tmp_path / "remote-only" / "workspace"
+    cache = tmp_path / "remote-only" / "cache"
+
+    job_spec = build_slurm_submit_job_spec(
+        ["echo", "hello"],
+        SlurmSubmitOptions(
+            login_node="remote-login",
+            username="cluster-user",
+            account="acct",
+            partition="batch",
+            remote_files_path=pathlib.Path("/remote/files"),
+            container_image="test_image",
+            workspace_path=workspace,
+            cache_path=cache,
+            mount_s3_creds=False,
+            mount_azure_creds=False,
+            job_name="remote_job",
+            gres="gpu:8",
+            log_dir=pathlib.Path("/remote/logs"),
+        ),
+    )
+
+    assert not workspace.exists()
+    assert not cache.exists()
+    mount_values = [str(mount) for mount in job_spec.container.mounts]
+    assert f"{workspace}:/config:rw" in mount_values
+    assert f"{cache}:/cache:rw" in mount_values
+
+
+def test_build_remote_submit_job_spec_does_not_infer_curator_path(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Programmatic builder callers should only mount source when curator_path is explicit."""
+    repo = _create_repo(tmp_path)
+    monkeypatch.chdir(repo)
+
+    job_spec = build_slurm_submit_job_spec(
+        ["echo", "hello"],
+        SlurmSubmitOptions(
+            login_node="remote-login",
+            username="cluster-user",
+            remote_files_path=pathlib.Path("/remote/files"),
+            container_image="test_image",
+            workspace_path=pathlib.Path("/remote/workspace"),
+            cache_path=pathlib.Path("/remote/cache"),
+            mount_s3_creds=False,
+            mount_azure_creds=False,
+        ),
+    )
+
+    mount_values = [str(mount) for mount in job_spec.container.mounts]
+    assert f"{repo}:/src/cosmos-curator:rw" not in mount_values
+
+
+def test_submit_cli_keeps_curator_path_inference(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI keeps the repo-root convenience behavior for existing users."""
+    repo = _create_repo(tmp_path)
+    monkeypatch.chdir(repo)
+
+    with patch(f"{MODULE_NAME}.curator_submit", return_value="12345") as mock_curator_submit:
+        submit_cli(
+            command=["echo", "hello"],
+            container_image="test_image",
+            workspace_path=tmp_path / "workspace",
+            cache_path=tmp_path / "cache",
+            mount_s3_creds=False,
+            remote_files_path=tmp_path / "job_files",
+        )
+
+    job_spec: SlurmJobSpec = mock_curator_submit.call_args.args[0]
+    mount_values = [str(mount) for mount in job_spec.container.mounts]
+    assert f"{repo.resolve()}:/src/cosmos-curator:rw" in mount_values
+
+
+def test_build_remote_submit_job_spec_preserves_remote_credential_mounts(tmp_path: pathlib.Path) -> None:
+    """Remote credential paths are validated on the login node, not on the launcher."""
+    aws_creds = tmp_path / "missing" / "aws_credentials"
+    azure_creds = tmp_path / "missing" / "azure_credentials"
+    config = tmp_path / "missing" / "config.yaml"
+
+    with (
+        patch("cosmos_curator.client.slurm_cli.slurm_common.LOCAL_AWS_CREDENTIALS_FILE", aws_creds),
+        patch("cosmos_curator.client.slurm_cli.slurm_common.LOCAL_AZURE_CREDENTIALS_FILE", azure_creds),
+        patch("cosmos_curator.client.slurm_cli.slurm_common.LOCAL_COSMOS_CURATOR_CONFIG_FILE", config),
+    ):
+        job_spec = build_slurm_submit_job_spec(
+            ["python", "-m", "cosmos_curator.client.model_cli"],
+            SlurmSubmitOptions(
+                login_node="remote-login",
+                username="cluster-user",
+                remote_files_path=pathlib.Path("/remote/files"),
+                container_image="test_image",
+                workspace_path=tmp_path / "workspace",
+                cache_path=tmp_path / "cache",
+                mount_s3_creds=True,
+                mount_azure_creds=True,
+                job_name="remote_job",
+            ),
+        )
+
+    mount_values = [str(mount) for mount in job_spec.container.mounts]
+    assert f"{aws_creds}:/creds/s3_creds:ro" in mount_values
+    assert f"{azure_creds}:/creds/azure_creds:ro" in mount_values
+    assert f"{config}:/cosmos_curator/config/cosmos_curator.yaml:ro" in mount_values
+
+
+def test_build_local_submit_job_spec_keeps_workspace_and_cache_preparation(tmp_path: pathlib.Path) -> None:
+    """Local submit keeps existing convenience behavior for workspace/cache directories."""
+    workspace = tmp_path / "workspace"
+    cache = tmp_path / "cache"
+
+    job_spec = build_slurm_submit_job_spec(
+        ["echo", "hello"],
+        SlurmSubmitOptions(
+            login_node="localhost",
+            username="local-user",
+            remote_files_path=tmp_path / "job_files",
+            container_image="test_image",
+            workspace_path=workspace,
+            cache_path=cache,
+            mount_s3_creds=False,
+            mount_azure_creds=False,
+            job_name="local_job",
+        ),
+    )
+
+    assert workspace.is_dir()
+    assert (cache / "rattler" / "cache" / "uv-cache").is_dir()
+    assert (cache / "huggingface").is_dir()
+    assert (cache / "laion").is_dir()
+    mount_values = [str(mount) for mount in job_spec.container.mounts]
+    assert f"{workspace.resolve()}:/config:rw" in mount_values
+    assert f"{cache.resolve()}:/cache:rw" in mount_values
 
 
 def test_submit_uses_sbatch_account_environment_default(
@@ -519,6 +897,108 @@ def test_submit_accepts_slurm_style_short_options(tmp_path: pathlib.Path) -> Non
 
     sbatch_script = _render_sbatch_script(job_spec)
     assert "#SBATCH --gpus=8" in sbatch_script
+
+
+def test_submit_dry_run_prints_sbatch_without_submitting(tmp_path: pathlib.Path) -> None:
+    """Dry-run should render the real submission script and stop before remote upload or sbatch."""
+    with patch(f"{MODULE_NAME}.curator_submit") as mock_curator_submit:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "submit",
+                "--dry-run",
+                "-A",
+                "test_account",
+                "-p",
+                "batch",
+                "-G",
+                "8",
+                "-J",
+                "batch_job",
+                "-N",
+                "2",
+                "--container-image",
+                "test_image",
+                "--workspace-path",
+                str(tmp_path / "workspace"),
+                "--cache-path",
+                str(tmp_path / "cache"),
+                "--remote-files-path",
+                str(tmp_path / "job_files"),
+                "--no-mount-s3-creds",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_curator_submit.assert_not_called()
+    assert "#!/bin/bash" in result.output
+    assert ":/remote_files:rw" in result.output
+    assert "echo hello" in result.output
+    assert "Job submitted with ID" not in result.output
+
+
+def test_submit_dry_run_script_is_syntactically_valid_bash(tmp_path: pathlib.Path) -> None:
+    """The rendered sbatch script should pass `bash -n` so template regressions fail here, not on Slurm."""
+    if shutil.which("bash") is None:
+        pytest.skip("bash is not available on this host")
+
+    with patch(f"{MODULE_NAME}.curator_submit") as mock_curator_submit:
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "submit",
+                "--dry-run",
+                "-A",
+                "test_account",
+                "-p",
+                "batch",
+                "-G",
+                "8",
+                "-J",
+                "batch_job",
+                "-N",
+                "2",
+                "--container-image",
+                "test_image",
+                "--workspace-path",
+                str(tmp_path / "workspace"),
+                "--cache-path",
+                str(tmp_path / "cache"),
+                "--remote-files-path",
+                str(tmp_path / "job_files"),
+                "--no-mount-s3-creds",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_curator_submit.assert_not_called()
+
+    # Slice from the shebang so any log preamble on stdout doesn't reach bash -n.
+    script_start = result.output.find("#!/bin/bash")
+    assert script_start != -1, "expected #!/bin/bash in dry-run output"
+    script = result.output[script_start:]
+
+    bash = shutil.which("bash")
+    assert bash is not None
+
+    completed = subprocess.run(  # noqa: S603 - validates generated sbatch syntax with bash -n; script is parsed, not executed.
+        [bash, "-n"],
+        input=script,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"bash -n rejected the rendered sbatch script:\n{completed.stderr}\n--- script ---\n{script}"
+    )
 
 
 def test_submit_rejects_gres_with_gpus(tmp_path: pathlib.Path) -> None:
@@ -785,6 +1265,115 @@ class TestSubmitCurationJob:
         ]
         EXPECTED_SBATCH_CALL_COUNT = 1
         assert len(sbatch_calls) == EXPECTED_SBATCH_CALL_COUNT
+
+    def test_curator_submit_uploads_extra_remote_files(self, mock_connection: Mock, job_spec: SlurmJobSpec) -> None:
+        """Upload caller-provided files through the same SSH submission path."""
+        conn = mock_connection.return_value
+        job_spec.extra_remote_files = [
+            ("SECRET=value\n", job_spec.remote_job_path / "secrets.env", 0o600),
+            (
+                "machine nvcr.io login $oauthtoken password token\n",
+                job_spec.remote_job_path / "enroot/.credentials",
+                0o600,
+            ),
+        ]
+
+        failed_result = Mock()
+        failed_result.exited = 1
+        unexpected_exit = invoke.exceptions.UnexpectedExit(result=failed_result)
+        success_result = Mock()
+        success_result.stdout = "Submitted batch job 12345"
+        conn.run.side_effect = [
+            Mock(),  # ls call succeeds
+            unexpected_exit,  # directory check should fail as expected (test -e)
+            Mock(),  # mkdir job dir
+            Mock(),  # chmod job dir
+            Mock(),  # mkdir enroot dir
+            Mock(),  # chmod enroot dir
+            Mock(),  # chmod sbatch script
+            Mock(),  # chmod prometheus service discovery script
+            Mock(),  # chmod secrets.env
+            Mock(),  # chmod enroot/.credentials
+            success_result,  # sbatch command returns job ID
+        ]
+
+        job_id = curator_submit(job_spec)
+
+        assert job_id == "12345"
+        uploaded_paths = [call_args.kwargs["remote"] for call_args in conn.put.call_args_list]
+        assert str(job_spec.remote_job_path / "secrets.env") in uploaded_paths
+        assert str(job_spec.remote_job_path / "enroot/.credentials") in uploaded_paths
+        commands = [call_args.args[0] for call_args in conn.run.call_args_list]
+        assert f"mkdir -p {job_spec.remote_job_path / 'enroot'}" in commands
+
+    def test_curator_submit_creates_extra_remote_file_dirs_before_mount_validation(
+        self, monkeypatch: pytest.MonkeyPatch, job_spec: SlurmJobSpec
+    ) -> None:
+        """Generated extra remote file directories may be used as mount sources."""
+        events: list[str] = []
+        panoptes_dir = job_spec.remote_job_path / "panoptes_certs"
+        job_spec.container.mounts.append(MountSpec(source=str(panoptes_dir), dest="/certs", mode="ro"))
+        job_spec.extra_remote_files = [("", panoptes_dir / ".keep", 0o600)]
+
+        connection = Mock()
+        connection.run.return_value.stdout = "Submitted batch job 12345"
+
+        def fake_remote_path_exists(_connection: Mock, path: pathlib.Path) -> bool:
+            events.append(f"exists:{path}")
+            if path == panoptes_dir:
+                return "create_extra_dirs" in events
+            return True
+
+        monkeypatch.setattr(f"{MODULE_NAME}.connect", lambda _login_node, _username: connection)
+        monkeypatch.setattr(
+            f"{MODULE_NAME}.create_remote_job_path",
+            lambda _connection, _job_spec: events.append("job_dir"),
+        )
+        monkeypatch.setattr(
+            f"{MODULE_NAME}._create_extra_remote_file_dirs",
+            lambda _connection, _job_spec: events.append("create_extra_dirs"),
+        )
+        monkeypatch.setattr(
+            f"{MODULE_NAME}._upload_extra_remote_files",
+            lambda _connection, _job_spec: events.append("upload_extra"),
+        )
+        monkeypatch.setattr(f"{MODULE_NAME}.remote_path_exists", fake_remote_path_exists)
+        monkeypatch.setattr(f"{MODULE_NAME}.upload_text", lambda _connection, _files: events.append("upload_sbatch"))
+
+        job_id = curator_submit(job_spec)
+
+        assert job_id == "12345"
+        assert events.index("create_extra_dirs") < events.index(f"exists:{panoptes_dir}")
+        assert events.index("upload_extra") > events.index(f"exists:{panoptes_dir}")
+
+    def test_curator_submit_skips_login_node_validation_for_node_local_mounts(
+        self, monkeypatch: pytest.MonkeyPatch, job_spec: SlurmJobSpec
+    ) -> None:
+        """Node-local mounts are passed to sbatch without probing them on the login node."""
+        node_local_source = "/raid/scratch/$USER/$SLURM_JOB_ID"
+        job_spec.container.mounts.append(MountSpec(source=node_local_source, dest="/config/models", mode="rw"))
+        job_spec.node_local_mount_sources = [node_local_source]
+        checked_paths: list[pathlib.Path] = []
+
+        connection = Mock()
+        connection.run.return_value.stdout = "Submitted batch job 12345"
+
+        def fake_remote_path_exists(_connection: Mock, path: pathlib.Path) -> bool:
+            checked_paths.append(path)
+            return True
+
+        monkeypatch.setattr(f"{MODULE_NAME}.connect", lambda _login_node, _username: connection)
+        monkeypatch.setattr(f"{MODULE_NAME}.create_remote_job_path", lambda _connection, _job_spec: None)
+        monkeypatch.setattr(f"{MODULE_NAME}._create_extra_remote_file_dirs", lambda _connection, _job_spec: None)
+        monkeypatch.setattr(f"{MODULE_NAME}._upload_extra_remote_files", lambda _connection, _job_spec: None)
+        monkeypatch.setattr(f"{MODULE_NAME}.remote_path_exists", fake_remote_path_exists)
+        monkeypatch.setattr(f"{MODULE_NAME}.upload_text", lambda _connection, _files: None)
+
+        job_id = curator_submit(job_spec)
+
+        assert job_id == "12345"
+        assert pathlib.Path(node_local_source) not in checked_paths
+        assert MountSpec(source=node_local_source, dest="/config/models", mode="rw") in job_spec.container.mounts
 
     def test_curator_submit_quotes_remote_paths(self, mock_connection: Mock, job_spec: SlurmJobSpec) -> None:
         """Quote remote paths passed through shell commands."""

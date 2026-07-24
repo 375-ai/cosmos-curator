@@ -53,6 +53,8 @@ from cosmos_curator.client.slurm_cli.slurm_common import (
     _is_local_host,
     _merge_mount_specs_by_destination,
     _normalize_optional_slurm_directive,
+    _parse_mount_specs,
+    _remote_container_mount_specs_from_runtime,
     _resolve_container_image,
     _resolve_slurm_account,
     _validate_gpu_options,
@@ -121,8 +123,8 @@ class LocalConnection:
         """Execute a shell command locally."""
         result = self._context.run(command, **kwargs)
         if result is None:
-            error_message = f"Local command did not produce a result: {command}"
-            raise RuntimeError(error_message)
+            msg = "LocalConnection.run does not support disown=True"
+            raise ValueError(msg)
         return result
 
     def put(self, local: str, remote: str) -> None:
@@ -200,6 +202,22 @@ def _environment_entries_from_srun_defaults(opts: SlurmContainerRuntime) -> list
     return [f"{key}={env[key]}" for key in container_env_keys if key in env]
 
 
+def _environment_entries_to_map(entries: list[str]) -> dict[str, str]:
+    env_vars: dict[str, str] = {}
+    for env_entry in entries:
+        key: str
+        value: str | None
+        if "=" in env_entry:
+            key, value = env_entry.split("=", 1)
+        else:
+            key = env_entry
+            value = os.environ.get(key)
+        if value is None:
+            continue
+        env_vars[key] = value
+    return env_vars
+
+
 @attrs.define
 class ContainerSpec:
     """Configuration for a container to run in the SLURM job."""
@@ -208,6 +226,49 @@ class ContainerSpec:
     squashfs_path: str
     mounts: list[MountSpec]
     environment: list[str]
+
+
+@attrs.define
+class SlurmSubmitOptions:
+    """User-facing Slurm submit options before normalization into a job spec."""
+
+    login_node: str = _DEFAULT_LOGIN_NODE
+    username: str | None = None
+    account: str | None = None
+    partition: str | None = None
+    remote_files_path: Path = _HOME_DIR / "curator_launch_files"
+    remote_job_path: Path | None = None
+    container_image: str = _DEFAULT_CONTAINER_IMAGE
+    curator_path: Path | None = None
+    workspace_path: Path = environment.LOCAL_WORKSPACE_PATH
+    cache_path: Path = _DEFAULT_CACHE_PATH
+    mount_s3_creds: bool = True
+    mount_azure_creds: bool = False
+    container_mounts: str | None = None
+    extra_mounts: str = ""
+    node_local_mounts: str = ""
+    prepare_node_local_mounts: bool = False
+    environment: str | None = None
+    extra_environment: list[str] = attrs.field(factory=list)
+    conda_override_cuda: str | None = _DEFAULT_CONDA_OVERRIDE_CUDA
+    pixi_envs: str | None = None
+    job_name: str = "cosmos_curator"
+    num_nodes: int = 1
+    gres: str | None = None
+    gpus: str | None = None
+    qos: str | None = None
+    exclusive: bool = True
+    time: str | None = None
+    stop_retries_after: int = 600
+    exclude_nodes: str | None = None
+    log_dir: Path | None = None
+    comment: str | None = None
+    prometheus_service_discovery_path: Path | None = None
+    mail_type: str | None = None
+    mail_user: str | None = None
+    extra_remote_files: list[tuple[str, Path, int]] = attrs.field(factory=list)
+    source_environment_file: Path | None = None
+    extra_container_env_keys: list[str] = attrs.field(factory=list)
 
 
 @attrs.define
@@ -234,6 +295,11 @@ class SlurmJobSpec:
     prometheus_service_discovery_path: Path | None = None
     mail_type: str | None = None
     mail_user: str | None = None
+    extra_remote_files: list[tuple[str, Path, int]] = attrs.field(factory=list)
+    source_environment_file: Path | None = None
+    extra_container_env_keys: list[str] = attrs.field(factory=list)
+    node_local_mount_sources: list[str] = attrs.field(factory=list)
+    prepare_node_local_mounts: bool = False
 
 
 def _render_sbatch_script(spec: SlurmJobSpec) -> str:
@@ -257,20 +323,10 @@ def _render_sbatch_script(spec: SlurmJobSpec) -> str:
     template_dir = Path(__file__).parent
     sbatch_template = template_dir / _SBATCH_TEMPLATE_PATH
 
-    env_vars: dict[str, str] = {}
-    if spec.container.environment is not None:
-        for env_entry in spec.container.environment:
-            key: str
-            value: str | None
-            if "=" in env_entry:
-                key, value = env_entry.split("=", 1)
-            else:
-                key = env_entry
-                value = os.environ.get(key)
-            if value is None:
-                continue
-            env_vars[key] = value
-    container_env_keys = list(dict.fromkeys([*env_vars, *_SBATCH_DYNAMIC_CONTAINER_ENV_KEYS]))
+    env_vars = _environment_entries_to_map(spec.container.environment or [])
+    container_env_keys = list(
+        dict.fromkeys([*env_vars, *spec.extra_container_env_keys, *_SBATCH_DYNAMIC_CONTAINER_ENV_KEYS])
+    )
 
     return jinja2.Template(sbatch_template.read_text()).render(
         job_name=spec.job_name,
@@ -287,6 +343,7 @@ def _render_sbatch_script(spec: SlurmJobSpec) -> str:
         container_command=container_command,
         container_env_keys=container_env_keys,
         env_vars=env_vars,
+        source_environment_file=str(spec.source_environment_file) if spec.source_environment_file else "",
         launcher_env_prefixes_to_unset=_LAUNCHER_ENV_PREFIXES,
         launcher_env_vars_to_unset=(*_PIXI_ACTIVATION_ENV_VARS, *_CONDA_ACTIVATION_ENV_VARS),
         time_limit_string=spec.time_limit,
@@ -299,6 +356,8 @@ def _render_sbatch_script(spec: SlurmJobSpec) -> str:
         prometheus_service_discovery_path=str(spec.prometheus_service_discovery_path),
         mail_type=spec.mail_type,
         mail_user=spec.mail_user,
+        node_local_mount_sources=list(dict.fromkeys(spec.node_local_mount_sources)),
+        prepare_node_local_mounts=spec.prepare_node_local_mounts,
     )
 
 
@@ -482,6 +541,43 @@ def _raise_helpful_sbatch_error(error: invoke.exceptions.UnexpectedExit, job_spe
     raise ValueError(message) from error
 
 
+def _with_remote_files_mount(slurm_job_spec: SlurmJobSpec) -> SlurmJobSpec:
+    remote_files_mount = MountSpec(source=str(slurm_job_spec.remote_job_path), dest="/remote_files")
+    if remote_files_mount in slurm_job_spec.container.mounts:
+        return slurm_job_spec
+
+    container = attrs.evolve(
+        slurm_job_spec.container,
+        mounts=_merge_mount_specs_by_destination(
+            [
+                *slurm_job_spec.container.mounts,
+                remote_files_mount,
+            ]
+        ),
+    )
+    return attrs.evolve(slurm_job_spec, container=container)
+
+
+def _create_extra_remote_file_dirs(connection: ConnectionProtocol, job_spec: SlurmJobSpec) -> None:
+    if not job_spec.extra_remote_files:
+        return
+
+    extra_remote_dirs = {
+        remote_path.parent
+        for _, remote_path, _ in job_spec.extra_remote_files
+        if remote_path.parent != job_spec.remote_job_path
+    }
+    for remote_dir in sorted(extra_remote_dirs, key=str):
+        create_remote_path(connection, remote_dir)
+
+
+def _upload_extra_remote_files(connection: ConnectionProtocol, job_spec: SlurmJobSpec) -> None:
+    if not job_spec.extra_remote_files:
+        return
+
+    upload_text(connection, job_spec.extra_remote_files)
+
+
 def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
     """Submit a curator pipeline batch job to the cluster.
 
@@ -498,12 +594,14 @@ def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
     """
     connection = connect(slurm_job_spec.login_node, slurm_job_spec.username)
     create_remote_job_path(connection, slurm_job_spec)
+    _create_extra_remote_file_dirs(connection, slurm_job_spec)
 
     # Validate that all mount source paths exist on the remote cluster
+    node_local_mount_sources = set(slurm_job_spec.node_local_mount_sources)
     missing_mounts = [
         mount.source
         for mount in slurm_job_spec.container.mounts
-        if not remote_path_exists(connection, Path(mount.source))
+        if mount.source not in node_local_mount_sources and not remote_path_exists(connection, Path(mount.source))
     ]
 
     if missing_mounts:
@@ -515,9 +613,7 @@ def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
 
         raise ValueError(error_message)
 
-    slurm_job_spec.container.mounts = _merge_mount_specs_by_destination(
-        [*slurm_job_spec.container.mounts, MountSpec(source=str(slurm_job_spec.remote_job_path), dest="/remote_files")]
-    )
+    slurm_job_spec = _with_remote_files_mount(slurm_job_spec)
     logger.debug("Container mounts: %s", slurm_job_spec.container.mounts)
     remote_sbatch_path = slurm_job_spec.remote_job_path / "sbatch.sh"
 
@@ -535,12 +631,18 @@ def curator_submit(slurm_job_spec: SlurmJobSpec) -> str:
     ]
 
     upload_text(connection, remote_files)
+    _upload_extra_remote_files(connection, slurm_job_spec)
     try:
         out = connection.run(f"sbatch {_quote_remote_path(remote_sbatch_path)}")
     except invoke.exceptions.UnexpectedExit as e:
         _raise_helpful_sbatch_error(e, slurm_job_spec)
         raise
     return _parse_job_id(out.stdout)
+
+
+def render_slurm_submit_script(slurm_job_spec: SlurmJobSpec) -> str:
+    """Render the sbatch script that would be uploaded by :func:`curator_submit`."""
+    return _render_sbatch_script(_with_remote_files_mount(slurm_job_spec))
 
 
 def remote_find_job_log_file(connection: ConnectionProtocol, log_dir: Path, job_id: str) -> Path:
@@ -621,6 +723,83 @@ def job_log_cli(
 
     """
     job_log(login_node, username, job_id, log_dir)
+
+
+def build_slurm_submit_job_spec(command: list[str], options: SlurmSubmitOptions | None = None) -> SlurmJobSpec:
+    """Build a Slurm job spec for batch submission without submitting it."""
+    opts = options or SlurmSubmitOptions()
+    if not command:
+        error_message = "A command must be provided"
+        raise ValueError(error_message)
+
+    if opts.mail_type is not None and opts.mail_user is None:
+        error_message = "If --mail-type is provided, --mail-user must also be provided"
+        raise ValueError(error_message)
+
+    if opts.num_nodes < 1:
+        msg = "--nodes must be at least 1"
+        raise typer.BadParameter(msg)
+
+    gres, gpus = _validate_gpu_options(gres=opts.gres, gpus=opts.gpus)
+    submit_runtime = _build_slurm_container_runtime(
+        container_image=opts.container_image,
+        curator_path=opts.curator_path,
+        command=command,
+        workspace_path=opts.workspace_path,
+        cache_path=opts.cache_path,
+        mount_s3_creds=opts.mount_s3_creds,
+        mount_azure_creds=opts.mount_azure_creds,
+        extra_mounts=opts.extra_mounts,
+        environment=opts.environment,
+        conda_override_cuda=opts.conda_override_cuda,
+        pixi_envs=opts.pixi_envs,
+    )
+    mount_builder = (
+        _container_mount_specs_from_runtime
+        if _is_local_host(opts.login_node)
+        else _remote_container_mount_specs_from_runtime
+    )
+    container_mount_specs = mount_builder(submit_runtime, opts.container_mounts)
+    node_local_mount_specs = _parse_mount_specs(opts.node_local_mounts)
+    container_mount_specs = _merge_mount_specs_by_destination([*container_mount_specs, *node_local_mount_specs])
+    env_list = _environment_entries_from_srun_defaults(submit_runtime)
+    env_list.extend(opts.extra_environment)
+    exclude_nodes_list = opts.exclude_nodes.split(",") if opts.exclude_nodes is not None else None
+
+    container_spec = ContainerSpec(
+        command=["pixi", "run", "--as-is", str(_START_RAY), *command],
+        squashfs_path=_resolve_container_image(opts.container_image),
+        environment=env_list,
+        mounts=container_mount_specs,
+    )
+
+    return SlurmJobSpec(
+        login_node=opts.login_node,
+        username=opts.username or _get_username(),
+        log_dir=_get_log_dir(opts.log_dir),
+        job_name=opts.job_name,
+        remote_job_path=opts.remote_job_path or _get_remote_job_path(opts.remote_files_path, opts.job_name),
+        account=_resolve_slurm_account(opts.account),
+        partition=_normalize_optional_slurm_directive(opts.partition),
+        num_nodes=opts.num_nodes,
+        container=container_spec,
+        gres=gres,
+        gpus=gpus,
+        qos=_normalize_optional_slurm_directive(opts.qos),
+        exclusive=opts.exclusive,
+        time_limit=opts.time,
+        stop_retries_after=opts.stop_retries_after,
+        exclude_nodes=exclude_nodes_list,
+        comment=opts.comment,
+        prometheus_service_discovery_path=opts.prometheus_service_discovery_path,
+        mail_type=opts.mail_type,
+        mail_user=opts.mail_user,
+        extra_remote_files=list(opts.extra_remote_files),
+        source_environment_file=opts.source_environment_file,
+        extra_container_env_keys=list(opts.extra_container_env_keys),
+        node_local_mount_sources=[mount.source for mount in node_local_mount_specs],
+        prepare_node_local_mounts=opts.prepare_node_local_mounts,
+    )
 
 
 def submit_cli(  # noqa: PLR0913
@@ -729,6 +908,25 @@ def submit_cli(  # noqa: PLR0913
             rich_help_panel="container",
         ),
     ] = "",
+    node_local_mounts: Annotated[
+        str,
+        Option(
+            "--node-local-mounts",
+            help=(
+                "Comma-separated container mounts whose source paths exist only on allocated compute nodes. "
+                "These mounts are included in srun but skipped during login-node source validation."
+            ),
+            rich_help_panel="container",
+        ),
+    ] = "",
+    prepare_node_local_mounts: Annotated[
+        bool,
+        Option(
+            "--prepare-node-local-mounts",
+            help="Create node-local mount source directories on allocated compute nodes before container launch.",
+            rich_help_panel="container",
+        ),
+    ] = False,
     environment: Annotated[
         str | None,
         Option(
@@ -867,67 +1065,57 @@ def submit_cli(  # noqa: PLR0913
             rich_help_panel="cluster",
         ),
     ] = None,
+    dry_run: Annotated[
+        bool,
+        Option(
+            "--dry-run",
+            help="Render the sbatch script and exit without uploading files or submitting the job.",
+            rich_help_panel="misc",
+        ),
+    ] = False,
 ) -> None:
     """Submit a job to a SLURM cluster."""
-    if not command:
-        error_message = "A command must be provided"
-        raise ValueError(error_message)
-
-    if mail_type is not None and mail_user is None:
-        error_message = "If --mail-type is provided, --mail-user must also be provided"
-        raise ValueError(error_message)
-
-    if num_nodes < 1:
-        msg = "--nodes must be at least 1"
-        raise typer.BadParameter(msg)
-    gres, gpus = _validate_gpu_options(gres=gres, gpus=gpus)
-
-    submit_runtime = _build_slurm_container_runtime(
-        container_image=container_image,
-        curator_path=_infer_curator_path(curator_path),
-        command=command,
-        workspace_path=workspace_path,
-        cache_path=cache_path,
-        mount_s3_creds=mount_s3_creds,
-        mount_azure_creds=mount_azure_creds,
-        extra_mounts=extra_mounts,
-        environment=environment,
-        conda_override_cuda=conda_override_cuda,
-        pixi_envs=pixi_envs,
+    slurm_job_spec = build_slurm_submit_job_spec(
+        command,
+        SlurmSubmitOptions(
+            login_node=login_node,
+            username=username,
+            account=account,
+            partition=partition,
+            remote_files_path=remote_files_path,
+            container_image=container_image,
+            curator_path=_infer_curator_path(curator_path),
+            workspace_path=workspace_path,
+            cache_path=cache_path,
+            mount_s3_creds=mount_s3_creds,
+            mount_azure_creds=mount_azure_creds,
+            container_mounts=container_mounts,
+            extra_mounts=extra_mounts,
+            node_local_mounts=node_local_mounts,
+            prepare_node_local_mounts=prepare_node_local_mounts,
+            environment=environment,
+            conda_override_cuda=conda_override_cuda,
+            pixi_envs=pixi_envs,
+            job_name=job_name,
+            num_nodes=num_nodes,
+            gres=gres,
+            gpus=gpus,
+            qos=qos,
+            exclusive=exclusive,
+            time=time,
+            stop_retries_after=stop_retries_after,
+            exclude_nodes=exclude_nodes,
+            log_dir=log_dir,
+            comment=comment,
+            prometheus_service_discovery_path=prometheus_service_discovery_path,
+            mail_type=mail_type,
+            mail_user=mail_user,
+        ),
     )
-    container_mount_specs = _container_mount_specs_from_runtime(submit_runtime, container_mounts)
-    env_list = _environment_entries_from_srun_defaults(submit_runtime)
-    exclude_nodes_list = exclude_nodes.split(",") if exclude_nodes is not None else None
 
-    container_spec = ContainerSpec(
-        command=["pixi", "run", "--as-is", str(_START_RAY), *command],
-        squashfs_path=_resolve_container_image(container_image),
-        environment=env_list,
-        mounts=container_mount_specs,
-    )
-
-    slurm_job_spec = SlurmJobSpec(
-        login_node=login_node,
-        username=username,
-        log_dir=_get_log_dir(log_dir),
-        job_name=job_name,
-        remote_job_path=_get_remote_job_path(remote_files_path, job_name),
-        account=_resolve_slurm_account(account),
-        partition=_normalize_optional_slurm_directive(partition),
-        num_nodes=num_nodes,
-        container=container_spec,
-        gres=gres,
-        gpus=gpus,
-        qos=_normalize_optional_slurm_directive(qos),
-        exclusive=exclusive,
-        time_limit=time,
-        stop_retries_after=stop_retries_after,
-        exclude_nodes=exclude_nodes_list,
-        comment=comment,
-        prometheus_service_discovery_path=prometheus_service_discovery_path,
-        mail_type=mail_type,
-        mail_user=mail_user,
-    )
+    if dry_run:
+        typer.echo(render_slurm_submit_script(slurm_job_spec))
+        return
 
     job_id = curator_submit(slurm_job_spec)
     logger.info("Job submitted with ID: %s", job_id)

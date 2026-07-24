@@ -300,7 +300,23 @@ def _remote_srun_command(shell_command: SrunCommand) -> str:
     return shlex.join(["env", *env_assignments, *shell_command.command])
 
 
-def _run_srun_command(login_node: str, username: str, shell_command: SrunCommand) -> None:
+def _ssh_srun_command(login_node: str, username: str, shell_command: SrunCommand, *, pty: bool) -> list[str]:
+    ssh_target = f"{username}@{login_node}" if username else login_node
+    command = ["ssh"]
+    if pty:
+        command.append("-t")
+    command.extend([ssh_target, _remote_srun_command(shell_command)])
+    return command
+
+
+def _print_srun_command(login_node: str, username: str, shell_command: SrunCommand, *, pty: bool) -> None:
+    if _is_local_host(login_node):
+        typer.echo(shlex.join(shell_command.command))
+        return
+    typer.echo(shlex.join(_ssh_srun_command(login_node, username, shell_command, pty=pty)))
+
+
+def _run_srun_command(login_node: str, username: str, shell_command: SrunCommand, *, pty: bool = True) -> None:
     logger.info("Slurm command:\n%s", shlex.join(shell_command.command))
 
     if _is_local_host(login_node):
@@ -314,8 +330,7 @@ def _run_srun_command(login_node: str, username: str, shell_command: SrunCommand
             raise typer.Exit(1)
         return
 
-    ssh_target = f"{username}@{login_node}" if username else login_node
-    ssh_command = ["ssh", "-t", ssh_target, _remote_srun_command(shell_command)]
+    ssh_command = _ssh_srun_command(login_node, username, shell_command, pty=pty)
     logger.info("SSH command:\n%s", shlex.join(ssh_command))
     result = subprocess.call(ssh_command, shell=False)  # noqa: S603
     if result != 0:
@@ -348,8 +363,8 @@ def _run_srun_command_with_retries(
             return
 
 
-def _run_srun_shell(login_node: str, username: str, shell_command: SrunCommand) -> None:
-    _run_srun_command(login_node, username, shell_command)
+def _run_srun_shell(login_node: str, username: str, shell_command: SrunCommand, *, pty: bool) -> None:
+    _run_srun_command(login_node, username, shell_command, pty=pty)
 
 
 def import_image_cli(  # noqa: PLR0913
@@ -666,6 +681,22 @@ def shell_cli(  # noqa: PLR0913
         str,
         Option(help="Optional cluster username.", rich_help_panel="misc"),
     ] = f"{_get_username()}",
+    pty: Annotated[
+        bool,
+        Option(
+            "--pty/--no-pty",
+            help="Request a pseudo-terminal from srun and remote ssh. Use --no-pty for non-interactive callers.",
+            rich_help_panel="runtime",
+        ),
+    ] = True,
+    dry_run: Annotated[
+        bool,
+        Option(
+            "--dry-run",
+            help="Print the local srun or remote ssh command without executing it.",
+            rich_help_panel="runtime",
+        ),
+    ] = False,
 ) -> None:
     """Start an interactive shell or command inside a Slurm/Pyxis allocation."""
     if _should_show_shell_help(ctx, command):
@@ -715,6 +746,10 @@ def shell_cli(  # noqa: PLR0913
                 else _container_mount_specs_from_runtime(runtime, container_mounts)
             )
         ],
-        pty=True,
+        pty=pty,
     )
-    _run_srun_shell(login_node, username, shell_command)
+    if dry_run:
+        _print_srun_command(login_node, username, shell_command, pty=pty)
+        return
+
+    _run_srun_shell(login_node, username, shell_command, pty=pty)

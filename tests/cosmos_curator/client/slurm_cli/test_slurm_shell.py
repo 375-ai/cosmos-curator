@@ -14,6 +14,7 @@
 # limitations under the License.
 """Test the interactive Slurm launcher."""
 
+import shlex
 from pathlib import Path
 from unittest.mock import patch
 
@@ -533,6 +534,97 @@ def test_slurm_shell_remote_login_node_runs_srun_through_ssh() -> None:
     assert f"{workspace}:/config:rw" in remote_command
     assert f"{cache}:/cache:rw" in remote_command
     assert "echo hello" in remote_command
+
+
+def test_slurm_shell_remote_login_node_no_pty_omits_ssh_and_srun_pty() -> None:
+    """--no-pty should make remote shell execution usable from non-interactive SSH contexts."""
+    repo = Path("/cluster/repo")
+    workspace = Path("/cluster/workspace")
+    cache = Path("/cluster/cache")
+
+    with (
+        patch(f"{SLURM_MODULE_NAME}._is_local_host", return_value=False),
+        patch(f"{SLURM_MODULE_NAME}.subprocess.call", return_value=0) as mock_call,
+    ):
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "shell",
+                "--login-node",
+                "remote-login",
+                "--username",
+                "cluster-user",
+                "--no-pty",
+                "--container-image",
+                "cosmos-curator+1.0.0-slim",
+                "--curator-path",
+                str(repo),
+                "--workspace-path",
+                str(workspace),
+                "--cache-path",
+                str(cache),
+                "--no-mount-s3-creds",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_call.assert_called_once()
+    ssh_command = mock_call.call_args.args[0]
+    remote_command = ssh_command[2]
+    assert ssh_command[:2] == ["ssh", "cluster-user@remote-login"]
+    assert "-t" not in ssh_command
+    remote_tokens = shlex.split(remote_command)
+    assert "srun" in remote_tokens
+    assert "--pty" not in remote_tokens
+    assert "--container-writable" in remote_tokens
+
+
+def test_slurm_shell_dry_run_prints_remote_command_without_executing() -> None:
+    """Dry-run should print the same remote ssh/srun command the shell would execute."""
+    repo = Path("/cluster/repo")
+    workspace = Path("/cluster/workspace")
+    cache = Path("/cluster/cache")
+
+    with (
+        patch(f"{SLURM_MODULE_NAME}._is_local_host", return_value=False),
+        patch(f"{SLURM_MODULE_NAME}.subprocess.call") as mock_call,
+    ):
+        result = runner.invoke(
+            cosmos_curator,
+            [
+                "slurm",
+                "shell",
+                "--login-node",
+                "remote-login",
+                "--username",
+                "cluster-user",
+                "--dry-run",
+                "--container-image",
+                "cosmos-curator+1.0.0-slim",
+                "--curator-path",
+                str(repo),
+                "--workspace-path",
+                str(workspace),
+                "--cache-path",
+                str(cache),
+                "--no-mount-s3-creds",
+                "--",
+                "echo",
+                "hello",
+            ],
+        )
+
+    assert result.exit_code == 0
+    mock_call.assert_not_called()
+    assert result.output.startswith("ssh -t cluster-user@remote-login ")
+    assert "env COSMOS_CURATOR_RAY_SLURM_JOB=True" in result.output
+    assert "srun --pty" in result.output
+    assert "--container-image cosmos-curator+1.0.0-slim" in result.output
+    assert "echo hello" in result.output
 
 
 def test_slurm_shell_remote_login_node_allows_explicit_default_like_paths() -> None:
