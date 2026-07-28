@@ -103,17 +103,47 @@ def validate_source(source: str) -> None:
         raise CloudCliError(msg)
 
 
-def make_s3_client(source: str, s3_profile_name: str | None) -> BaseClient:
+def resolve_s3_endpoint_url(explicit: str | None = None) -> str | None:
+    """Resolve the S3 endpoint URL to use, or ``None`` for the default AWS endpoint.
+
+    boto3 does not read the ``endpoint_url`` that the ``awscli_plugin_endpoint``
+    plugin nests under the ``s3`` / ``s3api`` sections of ``~/.aws/config`` (that
+    is a CLI-only plugin feature), so an S3-compatible store reached only through
+    such a profile needs the endpoint supplied here.
+
+    Resolution order (first non-empty wins):
+
+    1. ``explicit`` — typically a ``--endpoint-url`` CLI argument
+    2. ``AWS_ENDPOINT_URL_S3`` environment variable (S3-specific)
+    3. ``AWS_ENDPOINT_URL`` environment variable (all services)
+    4. ``None`` — boto3's default AWS endpoint
+    """
+    for candidate in (explicit, os.getenv("AWS_ENDPOINT_URL_S3"), os.getenv("AWS_ENDPOINT_URL")):
+        if candidate:
+            return candidate
+    return None
+
+
+def make_s3_client(source: str, s3_profile_name: str | None, endpoint_url: str | None = None) -> BaseClient:
     """Build a credentialled boto3 S3 client for an ``s3://`` source.
 
     The returned client is the place to attach botocore event hooks (e.g.
     ``before-send.s3.GetObject``) before handing it into
     :func:`open_cloud_source`.
 
+    Args:
+        source: The ``s3://`` URI the client will be used for (for error messages).
+        s3_profile_name: Optional AWS profile; ``None`` uses boto3's default chain.
+        endpoint_url: Optional S3 endpoint override. Passed through
+            :func:`resolve_s3_endpoint_url`, so ``None`` still honours the
+            ``AWS_ENDPOINT_URL_S3`` / ``AWS_ENDPOINT_URL`` environment variables
+            before falling back to boto3's default AWS endpoint.
+
     Raises:
         CloudCliError: When boto3 cannot construct a credentialled S3 client.
 
     """
+    endpoint_url = resolve_s3_endpoint_url(endpoint_url)
     try:
         session = boto3.Session(profile_name=s3_profile_name) if s3_profile_name else boto3.Session()
         credentials = session.get_credentials()
@@ -129,7 +159,7 @@ def make_s3_client(source: str, s3_profile_name: str | None) -> BaseClient:
         raise CloudCliError(msg)
 
     try:
-        return cast("BaseClient", session.client("s3"))
+        return cast("BaseClient", session.client("s3", endpoint_url=endpoint_url))
     except (BotoCoreError, ProfileNotFound) as e:
         msg = f"could not configure S3 access for {source!r}: {e}\n{S3_CREDENTIALS_HINT}"
         raise CloudCliError(msg) from e
@@ -225,13 +255,14 @@ def make_azure_client(source: str, azure_profile_name: str) -> BlobServiceClient
 
 
 @contextmanager
-def open_cloud_source(
+def open_cloud_source(  # noqa: PLR0913
     source: str,
     *,
     s3_client: BaseClient | None = None,
     azure_client: BlobServiceClient | None = None,
     s3_profile_name: str | None = None,
     azure_profile_name: str = "default",
+    endpoint_url: str | None = None,
 ) -> Generator[BinaryIO]:
     """Open an ``s3://`` or ``az://`` URI as a seekable :class:`BinaryIO`.
 
@@ -249,6 +280,9 @@ def open_cloud_source(
             provided. ``None`` falls back to boto3's default credential chain.
         azure_profile_name: Azure profile used when ``azure_client`` is not
             provided.
+        endpoint_url: Optional S3 endpoint override used only when ``s3_client``
+            is not supplied (see :func:`resolve_s3_endpoint_url`). Ignored for
+            Azure, whose endpoint is baked into the account URL.
 
     Yields:
         A seekable :class:`BinaryIO` opened in binary read mode via
@@ -261,7 +295,7 @@ def open_cloud_source(
     """
     transport_params: dict[str, Any]
     if is_s3_uri(source):
-        s3 = s3_client if s3_client is not None else make_s3_client(source, s3_profile_name)
+        s3 = s3_client if s3_client is not None else make_s3_client(source, s3_profile_name, endpoint_url)
         transport_params = {"client": s3}
     elif is_azure_uri(source):
         azure = azure_client if azure_client is not None else make_azure_client(source, azure_profile_name)
@@ -274,8 +308,158 @@ def open_cloud_source(
         yield stream
 
 
+def _split_s3_uri(uri: str) -> tuple[str, str]:
+    """Split ``s3://bucket/key/prefix`` into ``(bucket, key_prefix)``."""
+    rest = uri[len("s3://") :]
+    bucket, _, key_prefix = rest.partition("/")
+    if not bucket:
+        msg = f"malformed s3 URI (no bucket): {uri!r}"
+        raise CloudCliError(msg)
+    return bucket, key_prefix
+
+
+def _split_azure_uri(uri: str) -> tuple[str, str]:
+    """Split ``az://container/blob/prefix`` into ``(container, blob_prefix)``."""
+    rest = uri[len("az://") :]
+    container, _, blob_prefix = rest.partition("/")
+    if not container:
+        msg = f"malformed az URI (no container): {uri!r}"
+        raise CloudCliError(msg)
+    return container, blob_prefix
+
+
+def _matches_suffix(key: str, suffixes: tuple[str, ...] | None) -> bool:
+    """Whether ``key`` ends with one of ``suffixes`` (case-insensitive); no filter when ``None``."""
+    if suffixes is None:
+        return True
+    lowered = key.lower()
+    return lowered.endswith(suffixes)
+
+
+def _list_s3_objects(prefix: str, s3_client: BaseClient, limit: int, suffixes: tuple[str, ...] | None) -> list[str]:
+    """List object URIs under an ``s3://`` prefix, stopping once ``limit`` matches are found."""
+    bucket, key_prefix = _split_s3_uri(prefix)
+    uris: list[str] = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=key_prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            # Skip the zero-byte "directory" placeholder keys some tools create.
+            if key.endswith("/") or not _matches_suffix(key, suffixes):
+                continue
+            uris.append(f"s3://{bucket}/{key}")
+            if 0 < limit <= len(uris):
+                return uris
+    return uris
+
+
+def _list_azure_objects(
+    prefix: str, azure_client: BlobServiceClient, limit: int, suffixes: tuple[str, ...] | None
+) -> list[str]:
+    """List blob URIs under an ``az://`` prefix, stopping once ``limit`` matches are found."""
+    container, blob_prefix = _split_azure_uri(prefix)
+    container_client = azure_client.get_container_client(container)
+    uris: list[str] = []
+    for blob in container_client.list_blobs(name_starts_with=blob_prefix):
+        if blob.name.endswith("/") or not _matches_suffix(blob.name, suffixes):
+            continue
+        uris.append(f"az://{container}/{blob.name}")
+        if 0 < limit <= len(uris):
+            return uris
+    return uris
+
+
+def list_cloud_objects(  # noqa: PLR0913
+    prefix: str,
+    *,
+    s3_client: BaseClient | None = None,
+    azure_client: BlobServiceClient | None = None,
+    s3_profile_name: str | None = None,
+    azure_profile_name: str = "default",
+    endpoint_url: str | None = None,
+    limit: int = 0,
+    suffixes: tuple[str, ...] | None = None,
+) -> list[str]:
+    """List object URIs under an ``s3://`` or ``az://`` prefix.
+
+    Returns fully-qualified URIs (``s3://bucket/key`` / ``az://container/blob``)
+    suitable for handing straight back to :func:`open_cloud_source`. Zero-byte
+    directory-placeholder keys are skipped. Listing stops as soon as ``limit``
+    matching objects are collected so a caller can cheaply sample a huge bucket
+    without paging it in full.
+
+    Args:
+        prefix: ``s3://`` or ``az://`` prefix to list under.
+        s3_client: Pre-built boto3 S3 client (overrides ``s3_profile_name`` /
+            ``endpoint_url``).
+        azure_client: Pre-built Azure ``BlobServiceClient`` (overrides
+            ``azure_profile_name``).
+        s3_profile_name: Optional AWS profile used when ``s3_client`` is absent.
+        azure_profile_name: Azure profile used when ``azure_client`` is absent.
+        endpoint_url: Optional S3 endpoint override used when ``s3_client`` is
+            absent (see :func:`resolve_s3_endpoint_url`).
+        limit: Maximum number of objects to return; ``0`` (default) means all.
+        suffixes: Optional tuple of lowercased suffixes (for example
+            ``(".mp4", ".mkv")``); only matching keys are returned and counted
+            toward ``limit``. ``None`` (default) returns every object.
+
+    Raises:
+        CloudCliError: If ``prefix`` is not a supported cloud URI.
+
+    """
+    if is_s3_uri(prefix):
+        s3 = s3_client if s3_client is not None else make_s3_client(prefix, s3_profile_name, endpoint_url)
+        return _list_s3_objects(prefix, s3, limit, suffixes)
+    if is_azure_uri(prefix):
+        azure = azure_client if azure_client is not None else make_azure_client(prefix, azure_profile_name)
+        return _list_azure_objects(prefix, azure, limit, suffixes)
+    msg = f"list_cloud_objects requires an s3:// or az:// URI, got {prefix!r}"
+    raise CloudCliError(msg)
+
+
+def get_cloud_object_size(  # noqa: PLR0913
+    source: str,
+    *,
+    s3_client: BaseClient | None = None,
+    azure_client: BlobServiceClient | None = None,
+    s3_profile_name: str | None = None,
+    azure_profile_name: str = "default",
+    endpoint_url: str | None = None,
+) -> int | None:
+    """Return the byte size of a single cloud object, or ``None`` if it can't be determined.
+
+    Best-effort: issues a single ``HEAD`` (S3) / ``get_blob_properties`` (Azure)
+    for ``source``. Any failure (non-cloud URI, missing object, credential error)
+    returns ``None`` rather than raising, because this is only used to enrich a
+    progress display and must never break the actual check.
+
+    Args:
+        source: ``s3://`` or ``az://`` URI of the object.
+        s3_client: pre-built boto3 S3 client (overrides ``s3_profile_name`` / ``endpoint_url``).
+        azure_client: pre-built Azure ``BlobServiceClient`` (overrides ``azure_profile_name``).
+        s3_profile_name: optional AWS profile used when ``s3_client`` is absent.
+        azure_profile_name: Azure profile used when ``azure_client`` is absent.
+        endpoint_url: optional S3 endpoint override used when ``s3_client`` is absent.
+
+    """
+    try:
+        if is_s3_uri(source):
+            s3 = s3_client if s3_client is not None else make_s3_client(source, s3_profile_name, endpoint_url)
+            bucket, key = _split_s3_uri(source)
+            # head_object is a dynamically generated botocore method (not on BaseClient's stub).
+            return int(cast("Any", s3).head_object(Bucket=bucket, Key=key)["ContentLength"])
+        if is_azure_uri(source):
+            azure = azure_client if azure_client is not None else make_azure_client(source, azure_profile_name)
+            container, blob = _split_azure_uri(source)
+            props = azure.get_container_client(container).get_blob_client(blob).get_blob_properties()
+            return int(props.size)
+    except Exception:  # noqa: BLE001 - size is advisory only; never fail the caller over it
+        return None
+    return None
+
+
 def add_cloud_credential_args(parser: argparse.ArgumentParser) -> None:
-    """Attach ``--s3-profile-name`` / ``--azure-profile-name`` flags to ``parser``."""
+    """Attach ``--s3-profile-name`` / ``--azure-profile-name`` / ``--endpoint-url`` flags to ``parser``."""
     parser.add_argument(
         "--s3-profile-name",
         default=None,
@@ -285,4 +469,13 @@ def add_cloud_credential_args(parser: argparse.ArgumentParser) -> None:
         "--azure-profile-name",
         default="default",
         help="Azure profile name used for az:// sources (default: 'default').",
+    )
+    parser.add_argument(
+        "--endpoint-url",
+        default=None,
+        help=(
+            "Optional S3 endpoint URL for s3:// sources on S3-compatible stores. "
+            "Falls back to AWS_ENDPOINT_URL_S3 / AWS_ENDPOINT_URL, "
+            "then boto3's default AWS endpoint. Ignored for az:// sources."
+        ),
     )

@@ -239,7 +239,7 @@ def _open_measured_source(args: argparse.Namespace, stats: IOStats) -> Generator
     source_str: str = args.source
 
     if is_s3_uri(source_str):
-        s3_client = make_s3_client(source_str, args.s3_profile_name)
+        s3_client = make_s3_client(source_str, args.s3_profile_name, args.endpoint_url)
         hook = _install_s3_hook(s3_client, stats)
         try:
             with open_cloud_source(source_str, s3_client=s3_client) as raw:

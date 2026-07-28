@@ -638,11 +638,11 @@ def _has_composition_offset(container: InputContainer, stream_idx: int) -> bool:
 
 
 def _resolve_auto_index_method(
-    data: DataSource,
+    container: InputContainer,
+    video_stream: av.video.stream.VideoStream,
     stream_idx: int = 0,
-    video_format: str | None = None,
-) -> VideoIndexCreationMethod:
-    """Resolve ``AUTO`` to ``FROM_HEADER`` (fast) or ``FULL_DEMUX`` (correct) for *data*.
+) -> tuple[VideoIndexCreationMethod, bool]:
+    """Resolve ``AUTO`` to ``FROM_HEADER`` (fast) or ``FULL_DEMUX`` (correct).
 
     ``FROM_HEADER`` reads ``AVIndexEntry.timestamp`` (DTS), which equals PTS only
     when presentation order matches decode order. Two things break that:
@@ -656,18 +656,47 @@ def _resolve_auto_index_method(
       :func:`_has_composition_offset`).
 
     Either condition routes to ``FULL_DEMUX``; otherwise the fast header path is
-    exact. Runs in its own short-lived container so the probe demux does not
-    perturb the index build, which reopens the source.
+    exact.
+
+    Args:
+        container: already-open container for the source being indexed.
+        video_stream: the video stream ``container`` is being indexed on.
+        stream_idx: index of the video stream to probe.
+
+    Returns:
+        ``(method, probe_consumed_packets)``. ``probe_consumed_packets`` is True
+        when the composition-offset probe demuxed from ``container``, leaving the
+        demuxer mid-stream. A caller that then runs ``FULL_DEMUX`` needs a fresh
+        container; ``FROM_HEADER`` is unaffected because it reads the header index
+        instead of demuxing.
+
+    """
+    # Ordered so the free header read short-circuits before the probe: when
+    # B-frames are signaled the probe never runs and the demuxer stays pristine.
+    if video_stream.codec_context.has_b_frames:
+        return VideoIndexCreationMethod.FULL_DEMUX, False
+    if _has_composition_offset(container, stream_idx):
+        return VideoIndexCreationMethod.FULL_DEMUX, True
+    return VideoIndexCreationMethod.FROM_HEADER, True
+
+
+def _resolve_auto_index_method_for_source(
+    data: DataSource,
+    stream_idx: int = 0,
+    video_format: str | None = None,
+) -> VideoIndexCreationMethod:
+    """Return the method ``AUTO`` would pick for *data*, opening it solely to decide.
+
+    Diagnostics helper for callers that need the routing decision on its own.
+    :func:`make_index_and_metadata` deliberately does not use this: it resolves
+    inside the container it already has open, so it never re-reads the header.
     """
     with (
         open_data_source(data, mode="rb") as stream,
         open_video_container(stream, stream_idx=stream_idx, video_format=video_format) as (container, video_stream),
     ):
-        if video_stream.codec_context.has_b_frames:
-            return VideoIndexCreationMethod.FULL_DEMUX
-        if _has_composition_offset(container, stream_idx):
-            return VideoIndexCreationMethod.FULL_DEMUX
-        return VideoIndexCreationMethod.FROM_HEADER
+        method, _probe_consumed_packets = _resolve_auto_index_method(container, video_stream, stream_idx)
+        return method
 
 
 def make_index_and_metadata(
@@ -686,6 +715,12 @@ def make_index_and_metadata(
     argsorted by PTS so that ``VideoIndex.pts_ns`` is always monotonically
     increasing.  As a consequence, ``VideoIndex.offset`` is **not** monotonically
     increasing for B-frame video — it is a per-packet lookup, not a scan order.
+
+    The source is opened once. ``AUTO`` resolves and builds within that single
+    container; only a B-frame-free stream that carries a ctts composition offset
+    needs a second open, because the probe that detects it consumes packets that
+    ``FULL_DEMUX`` would otherwise index. This matters for cloud-backed sources,
+    where every open re-reads and re-parses the container header.
 
     Args:
         data: Video data source. See
@@ -715,11 +750,6 @@ def make_index_and_metadata(
         ValueError: if the stream contains no keyframes.
 
     """
-    # Resolve AUTO before the index build (in its own container) so the
-    # composition-offset probe demux does not perturb the build below.
-    if index_method == VideoIndexCreationMethod.AUTO:
-        index_method = _resolve_auto_index_method(data, stream_idx, video_format)
-
     with (
         open_data_source(data, mode="rb") as stream,
         open_video_container(stream, stream_idx=stream_idx, video_format=video_format) as (
@@ -727,95 +757,164 @@ def make_index_and_metadata(
             video_stream,
         ),
     ):
-        if video_stream.time_base is None:
-            error_msg = f"Time base is None for video stream {stream_idx}"
-            raise ValueError(error_msg)
-        time_base = video_stream.time_base
+        if index_method != VideoIndexCreationMethod.AUTO:
+            return _build_index_and_metadata(
+                container, video_stream, stream_idx, index_method, allow_header_fallback=allow_header_fallback
+            )
 
-        match index_method:
-            case VideoIndexCreationMethod.FULL_DEMUX:
+        resolved, probe_consumed_packets = _resolve_auto_index_method(container, video_stream, stream_idx)
+        if not probe_consumed_packets:
+            # The probe short-circuited before demuxing, so the demuxer is still at the
+            # first packet and any method can build from this container.
+            return _build_index_and_metadata(
+                container, video_stream, stream_idx, resolved, allow_header_fallback=allow_header_fallback
+            )
+
+        if resolved == VideoIndexCreationMethod.FROM_HEADER:
+            # FROM_HEADER ignores demuxer position, but its FULL_DEMUX fallback would
+            # resume from wherever the probe stopped and silently drop the packets it
+            # consumed. Deny that fallback here and reopen below instead.
+            try:
+                return _build_index_and_metadata(
+                    container, video_stream, stream_idx, resolved, allow_header_fallback=False
+                )
+            except _HeaderIndexUnavailableError as e:
+                if not allow_header_fallback:
+                    raise
+                logger.warning(
+                    "FROM_HEADER unavailable for stream {} ({}); reopening for FULL_DEMUX",
+                    stream_idx,
+                    e,
+                )
+
+    # Reached only when the probe consumed packets and the build needs a demuxer sitting
+    # at the first packet: AUTO resolved to FULL_DEMUX (B-frame-free stream with a ctts
+    # composition offset), or FROM_HEADER turned out to be unavailable. Passing an
+    # explicit method keeps this to a single retry — the probe cannot run again.
+    return make_index_and_metadata(
+        data,
+        stream_idx=stream_idx,
+        video_format=video_format,
+        index_method=VideoIndexCreationMethod.FULL_DEMUX,
+        allow_header_fallback=allow_header_fallback,
+    )
+
+
+def _build_index_and_metadata(
+    container: InputContainer,
+    video_stream: av.video.stream.VideoStream,
+    stream_idx: int,
+    index_method: VideoIndexCreationMethod,
+    *,
+    allow_header_fallback: bool,
+) -> tuple[VideoIndex, VideoMetadata]:
+    """Collect packet metadata from an open container and assemble the index/metadata pair.
+
+    Args:
+        container: already-open container positioned for indexing. ``FULL_DEMUX``
+            requires the demuxer to still be at the first packet.
+        video_stream: the video stream to index.
+        stream_idx: index of that stream within the container.
+        index_method: already-resolved method; ``AUTO`` is rejected.
+        allow_header_fallback: see :func:`make_index_and_metadata`.
+
+    Returns:
+        ``(index, metadata)`` as described on :func:`make_index_and_metadata`.
+
+    Raises:
+        ValueError: if the stream has no time base, no packets with valid PTS, no
+            keyframes, or ``index_method`` is unsupported.
+
+    """
+    if video_stream.time_base is None:
+        error_msg = f"Time base is None for video stream {stream_idx}"
+        raise ValueError(error_msg)
+    time_base = video_stream.time_base
+
+    match index_method:
+        case VideoIndexCreationMethod.FULL_DEMUX:
+            offset, size, pts, is_keyframe, is_discard = _get_video_index_full_demux(container, stream_idx)
+        case VideoIndexCreationMethod.FROM_HEADER:
+            try:
+                offset, size, pts, is_keyframe, is_discard = _get_video_index_from_header(video_stream)
+            except _HeaderIndexUnavailableError as e:
+                if not allow_header_fallback:
+                    raise
+                logger.warning(
+                    "FROM_HEADER unavailable for stream {} ({}); falling back to FULL_DEMUX",
+                    stream_idx,
+                    e,
+                )
                 offset, size, pts, is_keyframe, is_discard = _get_video_index_full_demux(container, stream_idx)
-            case VideoIndexCreationMethod.FROM_HEADER:
-                try:
-                    offset, size, pts, is_keyframe, is_discard = _get_video_index_from_header(video_stream)
-                except _HeaderIndexUnavailableError as e:
-                    if not allow_header_fallback:
-                        raise
-                    logger.warning(
-                        "FROM_HEADER unavailable for stream {} ({}); falling back to FULL_DEMUX",
-                        stream_idx,
-                        e,
-                    )
-                    offset, size, pts, is_keyframe, is_discard = _get_video_index_full_demux(container, stream_idx)
-            case _:
-                error_msg = f"unsupported index_method: {index_method!r}"  # type: ignore[unreachable]
-                raise ValueError(error_msg)
-
-        pts_stream_np = np.array(pts, dtype=np.int64)
-        pts_ns_np = pts_to_ns(pts_stream_np, time_base)
-        offset_np = np.array(offset, dtype=np.int64)
-        size_np = np.array(size, dtype=np.int64)
-        is_keyframe_np = np.array(is_keyframe, dtype=np.bool_)
-        is_discard_np = np.array(is_discard, dtype=np.bool_)
-
-        # Sort all arrays by PTS so that pts_ns is monotonically increasing.
-        # For non-B-frame video this is a no-op.  For B-frame video, packets
-        # arrive in decode order (DTS order) which is not PTS order, so without
-        # this sort pts_ns[-1] would not be the maximum PTS and any sorted
-        # assumption (e.g. searchsorted in make_decode_plan) would be violated.
-        sort_idx = np.argsort(pts_ns_np, kind="stable")
-        pts_ns_np = pts_ns_np[sort_idx]
-        pts_stream_np = pts_stream_np[sort_idx]
-        offset_np = offset_np[sort_idx]
-        size_np = size_np[sort_idx]
-        is_keyframe_np = is_keyframe_np[sort_idx]
-        is_discard_np = is_discard_np[sort_idx]
-
-        if len(pts_ns_np) == 0:
-            error_msg = f"video stream {stream_idx} contains no packets with valid PTS"
+        case _:
+            error_msg = f"unsupported index_method: {index_method!r}"
             raise ValueError(error_msg)
 
-        if not is_keyframe_np.any():
-            error_msg = f"video stream {stream_idx} contains no keyframes"
-            raise ValueError(error_msg)
+    pts_stream_np = np.array(pts, dtype=np.int64)
+    pts_ns_np = pts_to_ns(pts_stream_np, time_base)
+    offset_np = np.array(offset, dtype=np.int64)
+    size_np = np.array(size, dtype=np.int64)
+    is_keyframe_np = np.array(is_keyframe, dtype=np.bool_)
+    is_discard_np = np.array(is_discard, dtype=np.bool_)
 
-        kf_pts_ns_np = pts_ns_np[is_keyframe_np]
-        kf_pts_stream_np = pts_stream_np[is_keyframe_np]
+    # Sort all arrays by PTS so that pts_ns is monotonically increasing.
+    # For non-B-frame video this is a no-op.  For B-frame video, packets
+    # arrive in decode order (DTS order) which is not PTS order, so without
+    # this sort pts_ns[-1] would not be the maximum PTS and any sorted
+    # assumption (e.g. searchsorted in make_decode_plan) would be violated.
+    sort_idx = np.argsort(pts_ns_np, kind="stable")
+    pts_ns_np = pts_ns_np[sort_idx]
+    pts_stream_np = pts_stream_np[sort_idx]
+    offset_np = offset_np[sort_idx]
+    size_np = size_np[sort_idx]
+    is_keyframe_np = is_keyframe_np[sort_idx]
+    is_discard_np = is_discard_np[sort_idx]
 
-        index = VideoIndex(
-            offset=offset_np,
-            size=size_np,
-            pts_ns=pts_ns_np,
-            pts_stream=pts_stream_np,
-            is_keyframe=is_keyframe_np,
-            is_discard=is_discard_np,
-            kf_pts_ns=kf_pts_ns_np,
-            kf_pts_stream=kf_pts_stream_np,
-            time_base=time_base,
-        )
+    if len(pts_ns_np) == 0:
+        error_msg = f"video stream {stream_idx} contains no packets with valid PTS"
+        raise ValueError(error_msg)
 
-        duration_s = (pts_ns_np[-1] - pts_ns_np[0]) / 1_000_000_000.0
-        bit_rate_bps = int(size_np.sum() * 8 / duration_s) if duration_s > 0 else 0
-        avg_rate = video_stream.average_rate
+    if not is_keyframe_np.any():
+        error_msg = f"video stream {stream_idx} contains no keyframes"
+        raise ValueError(error_msg)
 
-        metadata = VideoMetadata(
-            codec_name=video_stream.codec_context.name,
-            has_bframes=bool(video_stream.codec_context.has_b_frames),
-            codec_profile=video_stream.codec_context.profile or "",
-            container_format=container.format.name,
-            height=video_stream.height,
-            width=video_stream.width,
-            # Defensive code, denominator should never be zero, handle it anyway
-            avg_frame_rate=(
-                Fraction(avg_rate.numerator, avg_rate.denominator)
-                if avg_rate and avg_rate.denominator != 0
-                else Fraction(0)
-            ),
-            pix_fmt=str(video_stream.codec_context.pix_fmt) if video_stream.codec_context.pix_fmt else "",
-            bit_rate_bps=bit_rate_bps,
-        )
+    kf_pts_ns_np = pts_ns_np[is_keyframe_np]
+    kf_pts_stream_np = pts_stream_np[is_keyframe_np]
 
-        return index, metadata
+    index = VideoIndex(
+        offset=offset_np,
+        size=size_np,
+        pts_ns=pts_ns_np,
+        pts_stream=pts_stream_np,
+        is_keyframe=is_keyframe_np,
+        is_discard=is_discard_np,
+        kf_pts_ns=kf_pts_ns_np,
+        kf_pts_stream=kf_pts_stream_np,
+        time_base=time_base,
+    )
+
+    duration_s = (pts_ns_np[-1] - pts_ns_np[0]) / 1_000_000_000.0
+    bit_rate_bps = int(size_np.sum() * 8 / duration_s) if duration_s > 0 else 0
+    avg_rate = video_stream.average_rate
+
+    metadata = VideoMetadata(
+        codec_name=video_stream.codec_context.name,
+        has_bframes=bool(video_stream.codec_context.has_b_frames),
+        codec_profile=video_stream.codec_context.profile or "",
+        container_format=container.format.name,
+        height=video_stream.height,
+        width=video_stream.width,
+        # Defensive code, denominator should never be zero, handle it anyway
+        avg_frame_rate=(
+            Fraction(avg_rate.numerator, avg_rate.denominator)
+            if avg_rate and avg_rate.denominator != 0
+            else Fraction(0)
+        ),
+        pix_fmt=str(video_stream.codec_context.pix_fmt) if video_stream.codec_context.pix_fmt else "",
+        bit_rate_bps=bit_rate_bps,
+    )
+
+    return index, metadata
 
 
 def _validate_decode_plan_timestamp_inputs(

@@ -36,7 +36,7 @@ from cosmos_curator.core.sensors.scripts._cli_cloud import (
 from cosmos_curator.core.sensors.types.types import DataSource, VideoIndexCreationMethod
 from cosmos_curator.core.sensors.utils.video import (
     _HeaderIndexUnavailableError,
-    _resolve_auto_index_method,
+    _resolve_auto_index_method_for_source,
     make_index_and_metadata,
 )
 
@@ -180,6 +180,7 @@ def _open_source(
     *,
     s3_profile_name: str | None,
     azure_profile_name: str,
+    endpoint_url: str | None,
 ) -> Generator[pathlib.Path | BinaryIO]:
     """Yield a per-phase source — a :class:`Path` locally, a fresh :class:`BinaryIO` for cloud URIs.
 
@@ -191,22 +192,29 @@ def _open_source(
             source,
             s3_profile_name=s3_profile_name,
             azure_profile_name=azure_profile_name,
+            endpoint_url=endpoint_url,
         ) as stream:
             yield stream
     else:
         yield pathlib.Path(source)
 
 
-def _check_video_index(
+def _check_video_index(  # noqa: PLR0913
     source: str,
     *,
     stream_idx: int,
     video_format: str | None,
     s3_profile_name: str | None,
     azure_profile_name: str,
+    endpoint_url: str | None = None,
 ) -> tuple[IndexVerdict, list[str]]:
     def _open() -> AbstractContextManager[pathlib.Path | BinaryIO]:
-        return _open_source(source, s3_profile_name=s3_profile_name, azure_profile_name=azure_profile_name)
+        return _open_source(
+            source,
+            s3_profile_name=s3_profile_name,
+            azure_profile_name=azure_profile_name,
+            endpoint_url=endpoint_url,
+        )
 
     def _index(method: VideoIndexCreationMethod, *, allow_header_fallback: bool = True) -> VideoIndex:
         with _open() as src:
@@ -227,7 +235,7 @@ def _check_video_index(
     # false positive.
     with _open() as src:
         data = src if isinstance(src, pathlib.Path) else _as_data_source(src)
-        resolved = _resolve_auto_index_method(data, stream_idx, video_format)
+        resolved = _resolve_auto_index_method_for_source(data, stream_idx, video_format)
 
     full_index = _index(VideoIndexCreationMethod.FULL_DEMUX)
 
@@ -297,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             video_format=args.video_format,
             s3_profile_name=args.s3_profile_name,
             azure_profile_name=args.azure_profile_name,
+            endpoint_url=args.endpoint_url,
         )
     except CloudCliError as e:
         sys.stderr.write(f"error: {e}\n")

@@ -112,6 +112,7 @@ def _resolve_source(args: argparse.Namespace) -> tuple[str, SourceFactory]:
     if is_cloud_uri(source_str):
         s3_profile_name = args.s3_profile_name
         azure_profile_name = args.azure_profile_name
+        endpoint_url = args.endpoint_url
 
         @contextmanager
         def factory() -> Generator[DataSource]:
@@ -119,6 +120,7 @@ def _resolve_source(args: argparse.Namespace) -> tuple[str, SourceFactory]:
                 source_str,
                 s3_profile_name=s3_profile_name,
                 azure_profile_name=azure_profile_name,
+                endpoint_url=endpoint_url,
             ) as stream:
                 yield cast("DataSource", stream)
 

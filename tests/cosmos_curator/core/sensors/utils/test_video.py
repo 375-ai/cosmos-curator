@@ -15,12 +15,12 @@
 """Test video utilities for the sensor library."""
 
 import io
-from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, BinaryIO
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import av
@@ -1731,7 +1731,113 @@ def test_resolve_auto_uses_full_demux_on_composition_offset(
     no_bframe = h264_video(bframes=0)  # has_b_frames == 0, so only the offset probe can trip
     monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._has_composition_offset", lambda *_a, **_k: True)
 
-    assert _resolve_auto_index_method(no_bframe) is VideoIndexCreationMethod.FULL_DEMUX
+    with open_video_container(io.BytesIO(no_bframe)) as (container, video_stream):
+        # The probe ran, so the demuxer is reported as no longer pristine.
+        assert _resolve_auto_index_method(container, video_stream) == (VideoIndexCreationMethod.FULL_DEMUX, True)
+
+
+def test_resolve_auto_skips_probe_for_b_frame_streams(h264_video: Callable[..., bytes]) -> None:
+    """Signalled B-frames short-circuit before the probe, leaving the demuxer pristine."""
+    with open_video_container(io.BytesIO(h264_video(bframes=2))) as (container, video_stream):
+        assert _resolve_auto_index_method(container, video_stream) == (VideoIndexCreationMethod.FULL_DEMUX, False)
+
+
+def test_resolve_auto_reports_consumed_packets_for_clean_streams(h264_video: Callable[..., bytes]) -> None:
+    """A clean stream routes to FROM_HEADER, which tolerates the packets the probe consumed."""
+    with open_video_container(io.BytesIO(h264_video(bframes=0))) as (container, video_stream):
+        assert _resolve_auto_index_method(container, video_stream) == (VideoIndexCreationMethod.FROM_HEADER, True)
+
+
+def _raise_header_unavailable(*_args: object, **_kwargs: object) -> None:
+    """Stand in for ``_get_video_index_from_header`` on a stream with no usable header index."""
+    msg = "forced for test"
+    raise _HeaderIndexUnavailableError(msg)
+
+
+def _patch_counting_container_open(monkeypatch: pytest.MonkeyPatch) -> Callable[[], int]:
+    """Wrap ``open_video_container`` with a pass-through that counts how often it opens."""
+    real_open = open_video_container
+    count = 0
+
+    @contextmanager
+    def counting(
+        stream: BinaryIO,
+        stream_idx: int = 0,
+        video_format: str | None = None,
+    ) -> Iterator[tuple[av.container.InputContainer, av.video.stream.VideoStream]]:
+        nonlocal count
+        count += 1
+        with real_open(stream, stream_idx=stream_idx, video_format=video_format) as pair:
+            yield pair
+
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video.open_video_container", counting)
+    return lambda: count
+
+
+@pytest.mark.parametrize("bframes", [0, 2])
+def test_make_index_and_metadata_auto_opens_source_once(
+    monkeypatch: pytest.MonkeyPatch, h264_video: Callable[..., bytes], bframes: int
+) -> None:
+    """AUTO resolves and builds within a single container open on both common paths."""
+    opens = _patch_counting_container_open(monkeypatch)
+
+    make_index_and_metadata(h264_video(bframes=bframes), index_method=VideoIndexCreationMethod.AUTO)
+
+    assert opens() == 1
+
+
+def test_make_index_and_metadata_auto_reopens_only_for_composition_offset(
+    monkeypatch: pytest.MonkeyPatch, h264_video: Callable[..., bytes]
+) -> None:
+    """The one case needing a pristine demuxer reopens: B-frame-free plus a ctts offset."""
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._has_composition_offset", lambda *_a, **_k: True)
+    opens = _patch_counting_container_open(monkeypatch)
+
+    index, _metadata = make_index_and_metadata(h264_video(bframes=0), index_method=VideoIndexCreationMethod.AUTO)
+
+    assert opens() == 2
+    # The retry must index from the first packet, not from where the probe stopped.
+    full = make_index_and_metadata(h264_video(bframes=0), index_method=VideoIndexCreationMethod.FULL_DEMUX)[0]
+    assert index == full
+
+
+def test_make_index_and_metadata_auto_reopens_when_header_index_unavailable(
+    monkeypatch: pytest.MonkeyPatch, h264_video: Callable[..., bytes]
+) -> None:
+    """AUTO must reopen before the FULL_DEMUX fallback once the probe has consumed packets.
+
+    Regression guard: FROM_HEADER tolerates a mid-stream demuxer, but its fallback does
+    not. Falling back on the probed container would index from wherever the probe
+    stopped and silently drop the leading packets.
+    """
+    monkeypatch.setattr(
+        "cosmos_curator.core.sensors.utils.video._get_video_index_from_header",
+        _raise_header_unavailable,
+    )
+    opens = _patch_counting_container_open(monkeypatch)
+
+    index, _metadata = make_index_and_metadata(h264_video(bframes=0), index_method=VideoIndexCreationMethod.AUTO)
+
+    assert opens() == 2
+    full = make_index_and_metadata(h264_video(bframes=0), index_method=VideoIndexCreationMethod.FULL_DEMUX)[0]
+    assert index == full, "fallback indexed a truncated stream instead of reopening"
+
+
+def test_make_index_and_metadata_auto_propagates_header_error_without_fallback(
+    monkeypatch: pytest.MonkeyPatch, h264_video: Callable[..., bytes]
+) -> None:
+    """With fallback disabled, an unavailable header index surfaces rather than reopening."""
+    monkeypatch.setattr(
+        "cosmos_curator.core.sensors.utils.video._get_video_index_from_header",
+        _raise_header_unavailable,
+    )
+
+    with pytest.raises(_HeaderIndexUnavailableError, match="forced for test"):
+        make_index_and_metadata(
+            h264_video(bframes=0),
+            index_method=VideoIndexCreationMethod.AUTO,
+            allow_header_fallback=False,
+        )
 
 
 # ===========================================================================

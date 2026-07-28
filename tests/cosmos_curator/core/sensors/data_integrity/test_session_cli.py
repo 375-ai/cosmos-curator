@@ -1,0 +1,245 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for the session-level data-integrity CLI (argparse + main + exit codes)."""
+
+import io
+import json
+import pathlib
+
+import pytest
+
+from cosmos_curator.core.sensors.data_integrity import session_cli
+from cosmos_curator.core.sensors.data_integrity.cli_common import CheckResult, CheckStatus
+from cosmos_curator.core.sensors.data_integrity.report import SessionReport, StreamResult
+from cosmos_curator.core.sensors.scripts._cli_cloud import CloudCliError
+
+
+def _stream(source: str, status: CheckStatus, *, error: str | None = None) -> StreamResult:
+    if error is not None:
+        return StreamResult(
+            source=source,
+            codec_name=None,
+            has_bframes=None,
+            num_samples=None,
+            start_ns=None,
+            end_ns=None,
+            metrics=[],
+            error=error,
+        )
+    return StreamResult(
+        source=source,
+        codec_name="h264",
+        has_bframes=False,
+        num_samples=10,
+        start_ns=0,
+        end_ns=1,
+        metrics=[CheckResult("rate", status, "rate=ok", measurement=None, evaluation=None)],
+    )
+
+
+def test_exit_code_pass(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """An all-PASS session exits 0 and prints the human report."""
+    monkeypatch.setattr(
+        session_cli, "run_session", lambda *_a, **_k: SessionReport("s", [_stream("a", CheckStatus.PASS)])
+    )
+    code = session_cli.main(["--session-path", "s"])
+    assert code == session_cli.PASS_EXIT_CODE
+    assert "Session overall: PASS" in capsys.readouterr().out
+
+
+def test_exit_code_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session with a failing stream exits 1."""
+    monkeypatch.setattr(
+        session_cli, "run_session", lambda *_a, **_k: SessionReport("s", [_stream("a", CheckStatus.FAIL)])
+    )
+    assert session_cli.main(["--session-path", "s"]) == session_cli.FAIL_EXIT_CODE
+
+
+def test_unmeasured_stream_exits_error_even_alongside_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session mixing a FAIL with an unreadable stream exits 2, not 1.
+
+    The exit code has to carry the same precedence as the verdict, so a caller
+    scripting on it can tell "measured and bad" (1) from "not fully measured" (2)
+    and re-queue only the latter.
+    """
+    report = SessionReport("s", [_stream("a", CheckStatus.FAIL), _stream("b", CheckStatus.PASS, error="boom")])
+    monkeypatch.setattr(session_cli, "run_session", lambda *_a, **_k: report)
+    assert session_cli.main(["--session-path", "s"]) == session_cli.ERROR_EXIT_CODE
+
+
+def test_render_failure_exits_error(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """A failure while rendering or writing the report yields exit code 2, not a traceback."""
+    monkeypatch.setattr(
+        session_cli, "run_session", lambda *_a, **_k: SessionReport("s", [_stream("a", CheckStatus.PASS)])
+    )
+
+    def _boom(_report: object) -> str:
+        msg = "unserializable measurement"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(session_cli, "render_text", _boom)
+    assert session_cli.main(["--session-path", "s"]) == session_cli.ERROR_EXIT_CODE
+    assert "error:" in capsys.readouterr().err
+
+
+def test_exit_code_error_on_empty_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session with no discovered streams exits 2 (ERROR)."""
+    monkeypatch.setattr(session_cli, "run_session", lambda *_a, **_k: SessionReport("s", []))
+    assert session_cli.main(["--session-path", "s"]) == session_cli.ERROR_EXIT_CODE
+
+
+def test_json_output_is_valid(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """--json emits a parseable document with the session status."""
+    monkeypatch.setattr(
+        session_cli, "run_session", lambda *_a, **_k: SessionReport("s", [_stream("a", CheckStatus.PASS)])
+    )
+    session_cli.main(["--session-path", "s", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "PASS"
+    assert payload["num_streams"] == 1
+
+
+def test_missing_local_path_exits_error(capsys: pytest.CaptureFixture[str]) -> None:
+    """A nonexistent local session path is a clean ERROR exit, not a traceback."""
+    code = session_cli.main(["--session-path", "/no/such/session/dir"])
+    assert code == session_cli.ERROR_EXIT_CODE
+    assert "error:" in capsys.readouterr().err
+
+
+def test_forwards_cloud_and_sampling_args(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CLI args are threaded through to run_session (endpoint, profile, limit, hz)."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_session(session_path: str, **kwargs: object) -> SessionReport:
+        captured["session_path"] = session_path
+        captured.update(kwargs)
+        return SessionReport(session_path, [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _fake_run_session)
+    session_cli.main(
+        [
+            "--session-path",
+            "s3://bucket/clips/uuid/",
+            "--expected-hz",
+            "30",
+            "--limit",
+            "5",
+            "--endpoint-url",
+            "https://endpoint.io",
+            "--s3-profile-name",
+            "prof",
+        ]
+    )
+    assert captured["session_path"] == "s3://bucket/clips/uuid/"
+    assert captured["expected_hz"] == 30.0
+    assert captured["limit"] == 5
+    assert captured["endpoint_url"] == "https://endpoint.io"
+    assert captured["s3_profile_name"] == "prof"
+
+
+def test_bogus_video_dir_is_error(tmp_path: pathlib.Path) -> None:
+    """End-to-end (no mocks): a dir of undecodable mp4s discovers streams but exits ERROR."""
+    (tmp_path / "a.mp4").write_bytes(b"not a real video")
+    assert session_cli.main(["--session-path", str(tmp_path)]) == session_cli.ERROR_EXIT_CODE
+
+
+def test_progress_lines_go_to_stderr(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--progress (default) streams a per-stream start/finish line to stderr, not stdout."""
+    (tmp_path / "a.mp4").write_bytes(b"not a real video")
+    session_cli.main(["--session-path", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert "[1/1]" in captured.err
+    assert "-> ERROR" in captured.err
+    # The report itself stays on stdout; progress never leaks there.
+    assert "[1/1]" not in captured.out
+
+
+def test_no_progress_is_silent_on_stderr(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--no-progress suppresses the per-stream progress lines."""
+    (tmp_path / "a.mp4").write_bytes(b"not a real video")
+    session_cli.main(["--session-path", str(tmp_path), "--no-progress"])
+    assert "[1/1]" not in capsys.readouterr().err
+
+
+def test_counting_reader_counts_and_delegates() -> None:
+    """_CountingReader tallies bytes read and passes seek/tell through to the raw stream."""
+    seen: list[int] = []
+    raw = io.BytesIO(b"abcdefghij")
+    reader = session_cli._CountingReader(raw, seen.append)
+    assert reader.read(4) == b"abcd"
+    assert reader.read() == b"efghij"
+    assert seen == [4, 10]  # cumulative counts
+    assert reader.seekable()
+    assert reader.readable()
+    reader.seek(0)
+    assert reader.tell() == 0
+    # readinto routes through read, so it is counted too.
+    buf = bytearray(3)
+    assert reader.readinto(buf) == 3
+    assert bytes(buf) == b"abc"
+    assert seen[-1] == 13
+
+
+def test_progress_shows_total_and_percent_when_size_known(capsys: pytest.CaptureFixture[str]) -> None:
+    """When a size lookup resolves, the counter renders read/total (pct%)."""
+    progress = session_cli._Progress(size_lookup=lambda _s: 100)
+    wrapper = progress.make_wrapper(1, 1, "s3://bucket/clip.mp4")
+    stream = wrapper(io.BytesIO(b"x" * 50))
+    stream.read()  # 50 of 100 bytes -> 50%
+    assert "(50%)" in capsys.readouterr().err
+
+
+def test_progress_survives_a_raising_size_lookup(capsys: pytest.CaptureFixture[str]) -> None:
+    """A size lookup that raises degrades to the unknown-size counter, it does not propagate."""
+
+    def _boom(_source: str) -> int:
+        msg = "HEAD denied"
+        raise CloudCliError(msg)
+
+    progress = session_cli._Progress(size_lookup=_boom)
+    wrapper = progress.make_wrapper(1, 1, "s3://bucket/clip.mp4")
+    stream = wrapper(io.BytesIO(b"x" * 50))
+    stream.read()
+    assert "MB read" in capsys.readouterr().err
+
+
+def test_progress_falls_back_to_read_only_when_size_unknown(capsys: pytest.CaptureFixture[str]) -> None:
+    """With no resolvable size, the counter shows a bare 'MB read' figure."""
+    progress = session_cli._Progress(size_lookup=lambda _s: None)
+    wrapper = progress.make_wrapper(1, 1, "s3://bucket/clip.mp4")
+    stream = wrapper(io.BytesIO(b"x" * 50))
+    stream.read()
+    err = capsys.readouterr().err
+    assert "MB read" in err
+    assert "%" not in err
+
+
+def test_wrapper_factory_threaded_to_run_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With progress on, main passes a make_stream_wrapper factory into run_session."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_session(session_path: str, **kwargs: object) -> SessionReport:
+        captured.update(kwargs)
+        return SessionReport(session_path, [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _fake_run_session)
+    session_cli.main(["--session-path", "s3://bucket/clips/uuid/"])
+    assert captured["make_stream_wrapper"] is not None
+    # The factory produces a stream wrapper that counts an in-memory stream.
+    factory = captured["make_stream_wrapper"]
+    wrapper = factory(1, 1, "s3://bucket/clips/uuid/a.mp4")  # type: ignore[operator]
+    wrapped = wrapper(io.BytesIO(b"xyz"))
+    assert wrapped.read() == b"xyz"
