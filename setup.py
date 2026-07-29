@@ -50,11 +50,23 @@ build_dir = "build"
 dist_dir = "dist"
 pkg_path = Path(build_dir) / name
 src_env_file = Path(name) / "core" / "utils" / "environment.py"
+src_sensors_dir = Path(name) / "core" / "sensors"
+src_sensor_examples_dir = src_sensors_dir / "examples"
+src_sensor_schemas_dir = src_sensors_dir / "schemas"
+src_sensor_scripts_dir = src_sensors_dir / "scripts"
+src_sensor_types_dir = src_sensors_dir / "types"
+src_sensor_utils_dir = src_sensors_dir / "utils"
 src_storage_dir = Path(name) / "core" / "utils" / "storage"
 src_pipelines_dir = Path(name) / "pipelines"
 src_ray_data_dir = src_pipelines_dir / "ray_data"
 src_init_file = Path(name) / "__init__.py"
 dst_core_dir = pkg_path / "core"
+dst_sensors_dir = dst_core_dir / "sensors"
+dst_sensor_examples_dir = dst_sensors_dir / "examples"
+dst_sensor_schemas_dir = dst_sensors_dir / "schemas"
+dst_sensor_scripts_dir = dst_sensors_dir / "scripts"
+dst_sensor_types_dir = dst_sensors_dir / "types"
+dst_sensor_utils_dir = dst_sensors_dir / "utils"
 dst_utils_dir = dst_core_dir / "utils"
 dst_storage_dir = dst_utils_dir / "storage"
 dst_client_dir = pkg_path / "client"
@@ -132,6 +144,27 @@ def build_package() -> None:
     if src_env_file.exists():
         shutil.copy2(src_env_file, dst_utils_dir)
 
+    shutil.copytree(
+        src_sensor_examples_dir,
+        dst_sensor_examples_dir,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+
+    shutil.copytree(
+        src_sensor_schemas_dir,
+        dst_sensor_schemas_dir,
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+
+    copy_required_files(src_sensors_dir, dst_sensors_dir, ("__init__.py",))
+    copy_required_files(src_sensor_scripts_dir, dst_sensor_scripts_dir, ("__init__.py", "validate_protobuf_mapping.py"))
+    copy_required_files(src_sensor_types_dir, dst_sensor_types_dir, ("__init__.py", "types.py"))
+    copy_required_files(
+        src_sensor_utils_dir,
+        dst_sensor_utils_dir,
+        ("__init__.py", "io.py", "mcap.py", "protobuf_mapper.py", "protobuf_mapping_targets.py"),
+    )
+
     copy_required_files(src_storage_dir, dst_storage_dir, ("__init__.py", "zip_utils.py"))
     copy_required_files(src_pipelines_dir, dst_pipelines_dir, ("__init__.py",))
     copy_required_files(src_ray_data_dir, dst_ray_data_dir, ("__init__.py", "video_split_config.py"))
@@ -157,7 +190,11 @@ setup(
     include_package_data=True,
     package_dir=package_dir,
     package_data={
-        name: ["examples/**/*"],
+        name: [
+            "examples/**/*",
+            "core/sensors/examples/*.yaml",
+            "core/sensors/schemas/*.proto",
+        ],
         f"{name}.client.nvcf_cli.ncf.launcher": ["helm_values/*"],
     },
 )

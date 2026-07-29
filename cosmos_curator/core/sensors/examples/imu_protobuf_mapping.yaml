@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Complete mapping for the reference ImuSample schema in
+# core/sensors/schemas/imu.proto. Use this file unchanged for that message, or
+# copy it and replace the source paths and units for another protobuf schema.
+# The mapping consumer supplies the target row class, so there is no `target`
+# entry.
+#
+# ImuSample is the channel message itself, so this mapping has no `root`.
+
+fields:
+  # Required source measurement timestamp. align_timestamp_ns is omitted
+  # intentionally, so it defaults to this mapped sensor timestamp.
+  sensor_timestamp_ns:
+    from: sensor_timestamp_ns
+    type: timestamp
+    unit: ns
+
+  # Required three-axis measurements. Axis order is x, y, z.
+  angular_velocity_rad_s:
+    group: [angular_velocity_x_rad_s, angular_velocity_y_rad_s, angular_velocity_z_rad_s]
+    type: float
+  linear_acceleration_m_s2:
+    group: [linear_acceleration_x_m_s2, linear_acceleration_y_m_s2, linear_acceleration_z_m_s2]
+    type: float
+
+  # Optional per-axis validity masks.
+  angular_velocity_valid:
+    group: [angular_velocity_x_valid, angular_velocity_y_valid, angular_velocity_z_valid]
+    type: bool
+  linear_acceleration_valid:
+    group: [linear_acceleration_x_valid, linear_acceleration_y_valid, linear_acceleration_z_valid]
+    type: bool
+
+  # Optional three-axis sensor bias estimates in the same frame and SI units
+  # as their corresponding measurements. Delete a pair when unavailable. If a
+  # bias is mapped without its validity, all axes default to valid.
+  angular_velocity_bias_rad_s:
+    group: [angular_velocity_bias_x_rad_s, angular_velocity_bias_y_rad_s, angular_velocity_bias_z_rad_s]
+    type: float
+  angular_velocity_bias_valid:
+    group: [angular_velocity_bias_x_valid, angular_velocity_bias_y_valid, angular_velocity_bias_z_valid]
+    type: bool
+  linear_acceleration_bias_m_s2:
+    group: [linear_acceleration_bias_x_m_s2, linear_acceleration_bias_y_m_s2, linear_acceleration_bias_z_m_s2]
+    type: float
+  linear_acceleration_bias_valid:
+    group: [linear_acceleration_bias_x_valid, linear_acceleration_bias_y_valid, linear_acceleration_bias_z_valid]
+    type: bool
+
+  # Optional source metadata.
+  host_timestamp_ns:
+    from: host_timestamp_ns
+    type: timestamp
+    unit: ns
+  sequence_counter:
+    from: sequence_counter
+    type: int
+
+  # Optional temperature. If temperature_valid is omitted in an adapted schema,
+  # the mapper defaults validity to true whenever temperature_c is mapped.
+  temperature_c:
+    from: temperature_c
+    type: float
+  temperature_valid:
+    from: temperature_valid
+    type: bool

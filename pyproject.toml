@@ -37,6 +37,7 @@ dependencies = [
     "multidict>=6.6.3,<7",
     "ngcsdk",
     "psutil",
+    "protobuf>=5,<7",
     "pydantic>=2.12,<3",
     "pyopenssl",
     "pyyaml>=6.0.2,<7",
@@ -77,6 +78,8 @@ build-backend = "setuptools.build_meta"
 "cosmos_curator" = [
     "client/slurm_cli/sbatch.sh.j2",
     "pipelines/video/captioning/prompts/*.md",
+    "core/sensors/examples/*.yaml",
+    "core/sensors/schemas/*.proto",
     "configs/*.json",
     "models/configs/*.json",
 ]
@@ -184,5 +187,13 @@ module = [
     "vllm.*",
     "vllm_omni",
     "vllm_omni.*",
+    "google.protobuf",
+    "google.protobuf.*",
 ]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cosmos_curator.core.sensors.utils.mcap",
+]
+warn_return_any = false

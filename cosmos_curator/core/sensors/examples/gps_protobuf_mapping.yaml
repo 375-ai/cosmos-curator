@@ -1,0 +1,94 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Complete mapping for the reference GpsSample schema in
+# core/sensors/schemas/gps.proto. Use this file unchanged for that message, or
+# copy it and replace the source paths and units for another protobuf schema.
+# The mapping consumer supplies the target row class, so there is no `target`
+# entry.
+#
+# GpsSample is the channel message itself, so this mapping has no `root`.
+# The schema's course, speed, climb, and corresponding validity fields are not
+# mapped because GpsData does not expose those destinations.
+
+fields:
+  # Required source fix timestamp. align_timestamp_ns is omitted intentionally,
+  # so it defaults to this mapped sensor timestamp.
+  sensor_timestamp_ns:
+    from: sensor_timestamp_ns
+    type: timestamp
+    unit: ns
+
+  # Required WGS-84 position and its per-component validity.
+  latitude_deg:
+    from: latitude_deg
+    type: float
+  longitude_deg:
+    from: longitude_deg
+    type: float
+  altitude_m:
+    from: altitude_m
+    type: float
+  position_valid:
+    group: [latitude_valid, longitude_valid, altitude_valid]
+    type: bool
+
+  # Optional receiver metadata represented by both GpsSample and GpsData.
+  satellites_used:
+    from: satellites_used
+    type: int
+  satellites_used_valid:
+    from: satellites_used_valid
+    type: bool
+
+  horizontal_accuracy_m:
+    from: horizontal_accuracy_m
+    type: float
+  horizontal_accuracy_m_valid:
+    from: horizontal_accuracy_m_valid
+    type: bool
+
+  vertical_accuracy_m:
+    from: vertical_accuracy_m
+    type: float
+  vertical_accuracy_m_valid:
+    from: vertical_accuracy_m_valid
+    type: bool
+
+  hdop:
+    from: hdop
+    type: float
+  hdop_valid:
+    from: hdop_valid
+    type: bool
+
+  vdop:
+    from: vdop
+    type: float
+  vdop_valid:
+    from: vdop_valid
+    type: bool
+
+  pdop:
+    from: pdop
+    type: float
+  pdop_valid:
+    from: pdop_valid
+    type: bool
+
+  host_timestamp_ns:
+    from: host_timestamp_ns
+    type: timestamp
+    unit: ns
