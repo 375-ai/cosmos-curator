@@ -27,6 +27,13 @@ def as_readonly_view(array: npt.NDArray[Any]) -> npt.NDArray[Any]:
     return readonly_view
 
 
+def as_optional_readonly_view(array: npt.NDArray[Any] | None) -> npt.NDArray[Any] | None:
+    """Return a read-only view while preserving an absent optional array."""
+    if array is None:
+        return None
+    return as_readonly_view(array)
+
+
 def as_readonly_view_tuple(
     arrays: tuple[npt.NDArray[Any], ...] | list[npt.NDArray[Any]],
 ) -> tuple[npt.NDArray[Any], ...]:

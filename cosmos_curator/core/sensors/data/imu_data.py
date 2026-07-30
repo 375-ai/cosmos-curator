@@ -20,12 +20,15 @@ import attrs
 import numpy as np
 import numpy.typing as npt
 
-from cosmos_curator.core.sensors.utils.helpers import as_readonly_view
+from cosmos_curator.core.sensors.utils.helpers import as_optional_readonly_view, as_readonly_view
 from cosmos_curator.core.sensors.utils.validation import (
+    bool_batch,
+    float64_batch,
     nondecreasing_int64_array,
-    require_finite_float64_array,
     strictly_increasing_int64_array,
+    symmetric_psd_covariance_batch,
     uint64_array,
+    unit_quaternion_batch,
 )
 
 if TYPE_CHECKING:
@@ -34,11 +37,13 @@ else:
     AttrsAttribute = attrs.Attribute
 
 _VECTOR_COLUMNS = 3
-_VECTOR_BATCH_NDIM = 2
-_QUATERNION_COLUMNS = 4
-_COVARIANCE_NDIM = 3
-_QUATERNION_NORM_TOLERANCE = 1e-6
-_COVARIANCE_TOLERANCE = 1e-9
+_COVARIANCE_SYMMETRY_RTOL = 1e-9
+_VECTOR_BATCH_VALIDATOR = float64_batch((_VECTOR_COLUMNS,), finite=False)
+_OPTIONAL_QUATERNION_BATCH_VALIDATOR = attrs.validators.optional(unit_quaternion_batch)
+_OPTIONAL_COVARIANCE_BATCH_VALIDATOR = attrs.validators.optional(
+    symmetric_psd_covariance_batch(_VECTOR_COLUMNS, symmetry_rtol=_COVARIANCE_SYMMETRY_RTOL)
+)
+_OPTIONAL_PER_AXIS_VALIDITY_VALIDATOR = attrs.validators.optional(bool_batch((_VECTOR_COLUMNS,)))
 
 
 class _HasImuBatchFields(Protocol):
@@ -53,16 +58,14 @@ class _HasImuBatchFields(Protocol):
     angular_velocity_valid: npt.NDArray[np.bool_] | None
     linear_acceleration_valid: npt.NDArray[np.bool_] | None
     orientation_valid: npt.NDArray[np.bool_] | None
+    angular_velocity_bias_rad_s: npt.NDArray[np.float64] | None
+    linear_acceleration_bias_m_s2: npt.NDArray[np.float64] | None
+    angular_velocity_bias_valid: npt.NDArray[np.bool_] | None
+    linear_acceleration_bias_valid: npt.NDArray[np.bool_] | None
     host_timestamps_ns: npt.NDArray[np.int64] | None
     sequence_counter: npt.NDArray[np.uint64] | None
     temperature_c: npt.NDArray[np.float64] | None
-
-
-def _as_optional_readonly_view(array: npt.NDArray[Any] | None) -> npt.NDArray[Any] | None:
-    """Return a read-only view of ``array`` while preserving ``None``."""
-    if array is None:
-        return None
-    return as_readonly_view(array)
+    temperature_valid: npt.NDArray[np.bool_] | None
 
 
 def _require_bool_array(name: str, value: npt.NDArray[np.bool_]) -> None:
@@ -82,76 +85,19 @@ def _require_int64_vector(name: str, value: npt.NDArray[np.int64]) -> None:
         raise ValueError(msg)
 
 
+def _require_float64_array(name: str, value: npt.NDArray[np.float64]) -> None:
+    """Raise if ``value`` is not a ``float64`` array."""
+    if value.dtype != np.float64:
+        msg = f"{name} must have dtype float64, got {value.dtype}"
+        raise ValueError(msg)
+
+
 def _require_float64_vector(name: str, value: npt.NDArray[np.float64]) -> None:
-    """Raise if ``value`` is not a finite 1-D ``float64`` vector."""
+    """Raise if ``value`` is not a 1-D ``float64`` vector."""
     if value.ndim != 1:
         msg = f"{name} must have shape (N,), got shape={value.shape}"
         raise ValueError(msg)
-    require_finite_float64_array(name, value)
-
-
-def _float64_vector_batch(
-    _instance: object,
-    attribute: AttrsAttribute,
-    value: npt.NDArray[np.float64],
-) -> None:
-    """Validate a finite ``float64`` vector batch with shape ``(N, 3)``."""
-    if value.ndim != _VECTOR_BATCH_NDIM or value.shape[1:] != (_VECTOR_COLUMNS,):
-        msg = f"{attribute.name} must have shape (N, 3), got shape={value.shape}"
-        raise ValueError(msg)
-    require_finite_float64_array(attribute.name, value)
-
-
-def _optional_quaternion_batch(
-    _instance: object,
-    attribute: AttrsAttribute,
-    value: npt.NDArray[np.float64] | None,
-) -> None:
-    """Validate optional orientation quaternions with shape ``(N, 4)``."""
-    if value is None:
-        return
-    if value.ndim != _VECTOR_BATCH_NDIM or value.shape[1:] != (_QUATERNION_COLUMNS,):
-        msg = f"{attribute.name} must have shape (N, 4), got shape={value.shape}"
-        raise ValueError(msg)
-    require_finite_float64_array(attribute.name, value)
-    norms = np.linalg.norm(value, axis=1)
-    if not np.all(np.isclose(norms, 1.0, rtol=0.0, atol=_QUATERNION_NORM_TOLERANCE)):
-        msg = f"{attribute.name} quaternion rows must have unit norm within tolerance"
-        raise ValueError(msg)
-
-
-def _optional_covariance_batch(
-    _instance: object,
-    attribute: AttrsAttribute,
-    value: npt.NDArray[np.float64] | None,
-) -> None:
-    """Validate optional covariance matrices with shape ``(N, 3, 3)``."""
-    if value is None:
-        return
-    if value.ndim != _COVARIANCE_NDIM or value.shape[1:] != (_VECTOR_COLUMNS, _VECTOR_COLUMNS):
-        msg = f"{attribute.name} must have shape (N, 3, 3), got shape={value.shape}"
-        raise ValueError(msg)
-    require_finite_float64_array(attribute.name, value)
-    if not np.allclose(value, np.swapaxes(value, 1, 2), rtol=_COVARIANCE_TOLERANCE, atol=_COVARIANCE_TOLERANCE):
-        msg = f"{attribute.name} covariance matrices must be symmetric"
-        raise ValueError(msg)
-    if value.shape[0] and np.min(np.linalg.eigvalsh(value)) < -_COVARIANCE_TOLERANCE:
-        msg = f"{attribute.name} covariance matrices must be positive semidefinite"
-        raise ValueError(msg)
-
-
-def _optional_per_axis_validity_mask(
-    _instance: object,
-    attribute: AttrsAttribute,
-    value: npt.NDArray[np.bool_] | None,
-) -> None:
-    """Validate optional per-axis validity masks with shape ``(N, 3)``."""
-    if value is None:
-        return
-    if value.ndim != _VECTOR_BATCH_NDIM or value.shape[1:] != (_VECTOR_COLUMNS,):
-        msg = f"{attribute.name} must have shape (N, 3), got shape={value.shape}"
-        raise ValueError(msg)
-    _require_bool_array(attribute.name, value)
+    _require_float64_array(name, value)
 
 
 def _optional_row_validity_mask(
@@ -195,16 +141,113 @@ def _optional_float64_vector(
     attribute: AttrsAttribute,
     value: npt.NDArray[np.float64] | None,
 ) -> None:
-    """Validate optional finite 1-D ``float64`` arrays."""
+    """Validate optional 1-D ``float64`` arrays."""
     if value is None:
         return
     _require_float64_vector(attribute.name, value)
 
 
+def _optional_temperature_valid(
+    instance: _HasImuBatchFields,
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.bool_] | None,
+) -> None:
+    """Validate optional temperature validity mask."""
+    _optional_row_validity_mask(instance, attribute, value)
+    if value is not None and instance.temperature_c is None:
+        msg = "temperature_valid requires temperature_c"
+        raise ValueError(msg)
+
+
+def _optional_orientation_valid(
+    instance: _HasImuBatchFields,
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.bool_] | None,
+) -> None:
+    """Validate optional orientation validity mask."""
+    _optional_row_validity_mask(instance, attribute, value)
+    if value is not None and instance.orientation_quat_xyzw is None:
+        msg = "orientation_valid requires orientation_quat_xyzw"
+        raise ValueError(msg)
+
+
+def _optional_angular_velocity_bias_valid(
+    instance: _HasImuBatchFields,
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.bool_] | None,
+) -> None:
+    """Validate optional gyroscope-bias validity mask."""
+    _OPTIONAL_PER_AXIS_VALIDITY_VALIDATOR(instance, attribute, value)
+    if value is not None and instance.angular_velocity_bias_rad_s is None:
+        msg = "angular_velocity_bias_valid requires angular_velocity_bias_rad_s"
+        raise ValueError(msg)
+
+
+def _optional_linear_acceleration_bias_valid(
+    instance: _HasImuBatchFields,
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.bool_] | None,
+) -> None:
+    """Validate optional accelerometer-bias validity mask."""
+    _OPTIONAL_PER_AXIS_VALIDITY_VALIDATOR(instance, attribute, value)
+    if value is not None and instance.linear_acceleration_bias_m_s2 is None:
+        msg = "linear_acceleration_bias_valid requires linear_acceleration_bias_m_s2"
+        raise ValueError(msg)
+
+
+def _require_finite_or_marked_invalid(
+    name: str,
+    values: npt.NDArray[np.float64],
+    validity: npt.NDArray[np.bool_] | None,
+) -> None:
+    """Allow non-finite values only when a matching validity mask is false."""
+    nonfinite = ~np.isfinite(values)
+    if not np.any(nonfinite):
+        return
+    if validity is None:
+        msg = f"{name} must contain only finite values when no validity mask is provided"
+        raise ValueError(msg)
+    if np.any(nonfinite & validity):
+        msg = f"{name} non-finite values require matching validity mask entries to be false"
+        raise ValueError(msg)
+
+
+def _raw_value_finiteness(
+    instance: _HasImuBatchFields,
+    _attribute: object,
+    _value: object,
+) -> None:
+    """Validate raw IMU payload values against their validity masks."""
+    _require_finite_or_marked_invalid(
+        "angular_velocity_rad_s",
+        instance.angular_velocity_rad_s,
+        instance.angular_velocity_valid,
+    )
+    _require_finite_or_marked_invalid(
+        "linear_acceleration_m_s2",
+        instance.linear_acceleration_m_s2,
+        instance.linear_acceleration_valid,
+    )
+    if instance.temperature_c is not None:
+        _require_finite_or_marked_invalid("temperature_c", instance.temperature_c, instance.temperature_valid)
+    if instance.angular_velocity_bias_rad_s is not None:
+        _require_finite_or_marked_invalid(
+            "angular_velocity_bias_rad_s",
+            instance.angular_velocity_bias_rad_s,
+            instance.angular_velocity_bias_valid,
+        )
+    if instance.linear_acceleration_bias_m_s2 is not None:
+        _require_finite_or_marked_invalid(
+            "linear_acceleration_bias_m_s2",
+            instance.linear_acceleration_bias_m_s2,
+            instance.linear_acceleration_bias_valid,
+        )
+
+
 def _batch_lengths(
     instance: _HasImuBatchFields,
     _attribute: object,
-    _value: npt.NDArray[np.float64] | None,
+    _value: object,
 ) -> None:
     """Validate shared row-count invariants across IMU batch arrays."""
     expected_len = len(instance.align_timestamps_ns)
@@ -222,9 +265,14 @@ def _batch_lengths(
         "angular_velocity_valid",
         "linear_acceleration_valid",
         "orientation_valid",
+        "angular_velocity_bias_rad_s",
+        "linear_acceleration_bias_m_s2",
+        "angular_velocity_bias_valid",
+        "linear_acceleration_bias_valid",
         "host_timestamps_ns",
         "sequence_counter",
         "temperature_c",
+        "temperature_valid",
     )
     for field_name in optional_fields:
         field_value = getattr(instance, field_name)
@@ -241,7 +289,9 @@ class ImuData:
     """IMU point samples stored as structure-of-arrays batches.
 
     Satisfies ``SensorData`` (``cosmos_curator.core.sensors.data.sensor_data``).
-    Required vector fields use SI units in the IMU sensor frame.
+    Required vector fields use SI units in the IMU sensor frame. Optional bias
+    estimates use the corresponding measurement units and are stored without
+    correction; downstream consumers subtract valid biases when appropriate.
     """
 
     __hash__ = None  # type: ignore[assignment]
@@ -256,67 +306,95 @@ class ImuData:
     )
     angular_velocity_rad_s: npt.NDArray[np.float64] = attrs.field(
         converter=as_readonly_view,
-        validator=_float64_vector_batch,
+        validator=_VECTOR_BATCH_VALIDATOR,
     )
     linear_acceleration_m_s2: npt.NDArray[np.float64] = attrs.field(
         converter=as_readonly_view,
-        validator=_float64_vector_batch,
+        validator=_VECTOR_BATCH_VALIDATOR,
     )
 
     orientation_quat_xyzw: npt.NDArray[np.float64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_quaternion_batch,
+        converter=as_optional_readonly_view,
+        validator=_OPTIONAL_QUATERNION_BATCH_VALIDATOR,
     )
     angular_velocity_covariance: npt.NDArray[np.float64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_covariance_batch,
+        converter=as_optional_readonly_view,
+        validator=_OPTIONAL_COVARIANCE_BATCH_VALIDATOR,
     )
     linear_acceleration_covariance: npt.NDArray[np.float64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_covariance_batch,
+        converter=as_optional_readonly_view,
+        validator=_OPTIONAL_COVARIANCE_BATCH_VALIDATOR,
     )
     orientation_covariance: npt.NDArray[np.float64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_covariance_batch,
+        converter=as_optional_readonly_view,
+        validator=_OPTIONAL_COVARIANCE_BATCH_VALIDATOR,
     )
 
     angular_velocity_valid: npt.NDArray[np.bool_] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_per_axis_validity_mask,
+        converter=as_optional_readonly_view,
+        validator=_OPTIONAL_PER_AXIS_VALIDITY_VALIDATOR,
     )
     linear_acceleration_valid: npt.NDArray[np.bool_] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_per_axis_validity_mask,
+        converter=as_optional_readonly_view,
+        validator=_OPTIONAL_PER_AXIS_VALIDITY_VALIDATOR,
     )
     orientation_valid: npt.NDArray[np.bool_] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
-        validator=_optional_row_validity_mask,
+        converter=as_optional_readonly_view,
+        validator=_optional_orientation_valid,
+    )
+
+    angular_velocity_bias_rad_s: npt.NDArray[np.float64] | None = attrs.field(
+        default=None,
+        converter=as_optional_readonly_view,
+        validator=attrs.validators.optional(_VECTOR_BATCH_VALIDATOR),
+    )
+    linear_acceleration_bias_m_s2: npt.NDArray[np.float64] | None = attrs.field(
+        default=None,
+        converter=as_optional_readonly_view,
+        validator=attrs.validators.optional(_VECTOR_BATCH_VALIDATOR),
+    )
+    angular_velocity_bias_valid: npt.NDArray[np.bool_] | None = attrs.field(
+        default=None,
+        converter=as_optional_readonly_view,
+        validator=_optional_angular_velocity_bias_valid,
+    )
+    linear_acceleration_bias_valid: npt.NDArray[np.bool_] | None = attrs.field(
+        default=None,
+        converter=as_optional_readonly_view,
+        validator=_optional_linear_acceleration_bias_valid,
     )
 
     host_timestamps_ns: npt.NDArray[np.int64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
+        converter=as_optional_readonly_view,
         validator=_optional_int64_vector,
     )
     sequence_counter: npt.NDArray[np.uint64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
+        converter=as_optional_readonly_view,
         validator=_optional_uint64_vector,
     )
-    # temperature_c is the last optional field; its _as_optional_readonly_view converter runs before validators.
-    # attrs.validators.and_ then runs _optional_float64_vector and _batch_lengths, even when temperature_c is None.
     temperature_c: npt.NDArray[np.float64] | None = attrs.field(
         default=None,
-        converter=_as_optional_readonly_view,
+        converter=as_optional_readonly_view,
         validator=attrs.validators.and_(
             _optional_float64_vector,
+        ),
+    )
+    # temperature_valid is last so cross-field validators see every optional array.
+    temperature_valid: npt.NDArray[np.bool_] | None = attrs.field(
+        default=None,
+        converter=as_optional_readonly_view,
+        validator=attrs.validators.and_(
+            _optional_temperature_valid,
             _batch_lengths,
+            _raw_value_finiteness,
         ),
     )

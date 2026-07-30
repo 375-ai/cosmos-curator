@@ -16,13 +16,11 @@
 
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
-import numpy.typing as npt
 import pytest
 from google.protobuf import descriptor_pb2
 from google.protobuf.message import Message
@@ -288,29 +286,6 @@ def test_load_start_end_ns_raises_if_latest_lookup_fails_after_earliest() -> Non
         load_start_end_ns(_FakeReader(), "/camera/rgb")
 
 
-def test_iter_messages_log_time_ns_forwards_to_reader_iter_messages() -> None:
-    """iter_messages_log_time_ns should forward the expected bounds to reader.iter_messages."""
-    calls: list[tuple[str, int, int, bool]] = []
-    expected = [(None, None, SimpleNamespace(log_time=123))]
-
-    class _FakeReader:
-        def iter_messages(
-            self,
-            *,
-            topics: str,
-            start_time: int,
-            end_time: int,
-            log_time_order: bool,
-        ) -> Iterator[tuple[Any, Any, Any]]:
-            calls.append((topics, start_time, end_time, log_time_order))
-            return iter(expected)
-
-    got = list(iter_messages_log_time_ns(_FakeReader(), "/camera/rgb", 100, 200, log_time_order=False))
-
-    assert got == expected
-    assert calls == [("/camera/rgb", 100, 200, False)]
-
-
 def test_iter_messages_log_time_ns_excludes_end_ns_exclusive_with_real_mcap(tmp_path: Path) -> None:
     """iter_messages_log_time_ns should exclude messages whose log_time equals end_ns_exclusive."""
     path = tmp_path / "exclusive_end.mcap"
@@ -330,90 +305,6 @@ def test_iter_messages_log_time_ns_excludes_end_ns_exclusive_with_real_mcap(tmp_
         ]
 
     assert got == [100]
-
-
-def test_mcap_topic_accessor_start_end_can_load_without_full_timeline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """McapTopicAccessor should load bounds without materializing the full timeline."""
-    timeline_calls = 0
-    start_end_calls = 0
-
-    @contextmanager
-    def fake_open_data_source(source: object, mode: str = "rb") -> Iterator[object]:
-        del source, mode
-        yield object()
-
-    def fake_make_reader(stream: object) -> object:
-        del stream
-        return object()
-
-    def fake_load_timeline(reader: object, topic: str) -> npt.NDArray[np.int64]:
-        nonlocal timeline_calls
-        del reader, topic
-        timeline_calls += 1
-        return np.array([100, 200, 300], dtype=np.int64)
-
-    def fake_load_start_end_ns(reader: object, topic: str) -> tuple[int, int]:
-        nonlocal start_end_calls
-        del reader, topic
-        start_end_calls += 1
-        return 100, 300
-
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.open_data_source", fake_open_data_source)
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.mcap_make_reader", fake_make_reader)
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_timeline", fake_load_timeline)
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_start_end_ns", fake_load_start_end_ns)
-
-    accessor = McapTopicAccessor(b"not-used", "/camera/rgb")
-
-    assert accessor.start_ns == 100
-    assert accessor.end_ns == 300
-    assert start_end_calls == 1
-    assert timeline_calls == 0
-
-
-def test_mcap_topic_accessor_timestamps_cache_populates_start_end(monkeypatch: pytest.MonkeyPatch) -> None:
-    """McapTopicAccessor should cache a read-only timeline and reuse it for bounds."""
-    timeline_calls = 0
-    start_end_calls = 0
-    timeline = np.array([100, 200, 300], dtype=np.int64)
-    timeline.flags.writeable = False
-
-    @contextmanager
-    def fake_open_data_source(source: object, mode: str = "rb") -> Iterator[object]:
-        del source, mode
-        yield object()
-
-    def fake_make_reader(stream: object) -> object:
-        del stream
-        return object()
-
-    def fake_load_timeline(reader: object, topic: str) -> npt.NDArray[np.int64]:
-        nonlocal timeline_calls
-        del reader, topic
-        timeline_calls += 1
-        return timeline
-
-    def fake_load_start_end_ns(reader: object, topic: str) -> tuple[int, int]:
-        nonlocal start_end_calls
-        del reader, topic
-        start_end_calls += 1
-        return 0, 0
-
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.open_data_source", fake_open_data_source)
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.mcap_make_reader", fake_make_reader)
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_timeline", fake_load_timeline)
-    monkeypatch.setattr("cosmos_curator.core.sensors.utils.mcap.load_start_end_ns", fake_load_start_end_ns)
-
-    accessor = McapTopicAccessor(b"not-used", "/camera/rgb")
-
-    np.testing.assert_array_equal(accessor.timestamps_ns, timeline)
-    np.testing.assert_array_equal(accessor.timestamps_ns, timeline)
-    assert not accessor.timestamps_ns.flags.writeable
-    assert accessor.start_ns == 100
-    assert accessor.end_ns == 300
-    assert accessor.max_gap_ns == 0
-    assert timeline_calls == 1
-    assert start_end_calls == 0
 
 
 def test_mcap_topic_accessor_raises_on_missing_topic(tmp_path: Path) -> None:

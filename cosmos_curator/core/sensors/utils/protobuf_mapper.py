@@ -36,6 +36,23 @@ _SUPPORTED_TYPES = frozenset(_OUTPUT_TYPES)
 _TIMESTAMP_UNITS_TO_NS = {"ns": 1, "us": 1_000, "ms": 1_000_000, "s": 1_000_000_000}
 _MCAP_LOGTIME_SOURCE = "$mcap.logtime"
 _SENSOR_TIMESTAMP_FIELDS = ("sensor_timestamp_ns", "sensor_timestamps_ns")
+PROTOBUF_NUMERIC_TYPES = frozenset(
+    {
+        FieldDescriptor.TYPE_DOUBLE,
+        FieldDescriptor.TYPE_FLOAT,
+        FieldDescriptor.TYPE_INT64,
+        FieldDescriptor.TYPE_UINT64,
+        FieldDescriptor.TYPE_INT32,
+        FieldDescriptor.TYPE_FIXED64,
+        FieldDescriptor.TYPE_FIXED32,
+        FieldDescriptor.TYPE_UINT32,
+        FieldDescriptor.TYPE_SFIXED32,
+        FieldDescriptor.TYPE_SFIXED64,
+        FieldDescriptor.TYPE_SINT32,
+        FieldDescriptor.TYPE_SINT64,
+        FieldDescriptor.TYPE_ENUM,
+    }
+)
 _ALIGN_TIMESTAMP_FIELD_PAIRS = (
     ("align_timestamp_ns", "sensor_timestamp_ns"),
     ("align_timestamps_ns", "sensor_timestamps_ns"),
@@ -54,6 +71,34 @@ class FieldMapping:
     value_type: str | None
     unit: str | None
     valid_when_equals: object
+
+
+def validate_valid_when_source(mapping: FieldMapping, source_name: str, source_type: int) -> None:
+    """Validate a ``valid_when`` comparand against its protobuf source type."""
+    if mapping.valid_when_equals is MISSING:
+        return
+
+    comparand = mapping.valid_when_equals
+    if source_type == FieldDescriptor.TYPE_BOOL and isinstance(comparand, bool):
+        return
+    if (
+        source_type in PROTOBUF_NUMERIC_TYPES
+        and isinstance(comparand, (int, float))
+        and not isinstance(comparand, bool)
+    ):
+        return
+
+    if source_type == FieldDescriptor.TYPE_BOOL:
+        expected = "a bool 'equals' value"
+    elif source_type in PROTOBUF_NUMERIC_TYPES:
+        expected = "a non-bool numeric or enum 'equals' value"
+    else:
+        expected = "a numeric, enum, or bool protobuf source"
+    msg = (
+        f"fields.{mapping.target_name}.valid_when.equals {comparand!r} is incompatible with protobuf source "
+        f"{source_name!r}; expected {expected}"
+    )
+    raise ValueError(msg)
 
 
 class ProtobufRowMapper[Target]:
@@ -159,6 +204,7 @@ class ProtobufRowMapper[Target]:
                     f"fields.{mapping.target_name}",
                     allow_terminal_repeated=not mapping.is_group,
                 )
+                validate_valid_when_source(mapping, source_name, source_field.type)
                 if (
                     mapping.value_type == "bool"
                     and mapping.valid_when_equals is MISSING
@@ -299,6 +345,9 @@ def parse_one_mapping(target_name: str, raw_mapping: object) -> FieldMapping:
     active = sum([source_name is not None, group is not None, has_default])
     if active != 1:
         msg = f"fields.{target_name} must specify exactly one of 'from', 'group', or 'default'"
+        raise ValueError(msg)
+    if has_default and raw_spec["default"] is None:
+        msg = f"fields.{target_name}.default must not be null; omit the field to leave an optional target absent"
         raise ValueError(msg)
 
     value_type = parse_optional_str(raw_spec.get("type"), f"fields.{target_name}.type")
@@ -575,14 +624,22 @@ def _timestamp_to_ns(value: object, unit: str, target_name: str) -> int:
     scale = _TIMESTAMP_UNITS_TO_NS[unit]
     if isinstance(value, int):
         return value * scale
-    scaled = value * scale
-    if not math.isfinite(scaled) or not scaled.is_integer():
+    if not math.isfinite(value):
         msg = (
             f"fields.{target_name} timestamp value {value!r} with unit {unit!r} cannot be converted to integer "
             "nanoseconds without losing information"
         )
         raise ValueError(msg)
-    return int(scaled)
+    numerator, denominator = value.as_integer_ratio()
+    scaled_numerator = numerator * scale
+    result, remainder = divmod(scaled_numerator, denominator)
+    if remainder:
+        msg = (
+            f"fields.{target_name} timestamp value {value!r} with unit {unit!r} cannot be converted to integer "
+            "nanoseconds without losing information"
+        )
+        raise ValueError(msg)
+    return result
 
 
 def _prepare_target_defaults(
@@ -600,7 +657,7 @@ def _prepare_target_defaults(
     for target_name in field_mappings:
         if not target_name.endswith("_valid"):
             continue
-        paired_name = _paired_target_name(target_name, target_names)
+        paired_name = paired_target_name(target_name, target_names)
         if paired_name in target_names and paired_name not in field_mappings:
             msg = f"fields.{target_name} maps validity for {paired_name!r}, but fields.{paired_name} is not mapped"
             raise ValueError(msg)
@@ -641,7 +698,7 @@ def _prepare_validity_defaults(
     for name, annotation in target_annotations.items():
         if name in field_mappings or not name.endswith("_valid") or not _is_bool_compatible_annotation(annotation):
             continue
-        paired_name = _paired_target_name(name, target_annotations)
+        paired_name = paired_target_name(name, target_annotations)
         if paired_name not in target_annotations or paired_name not in field_mappings:
             continue
         validity_collection = _collection_target(annotation)
@@ -665,7 +722,7 @@ def _prepare_validity_defaults(
     return scalar_defaults, tuple(collection_pairs)
 
 
-def _paired_target_name(validity_name: str, target_names: Collection[str]) -> str:
+def paired_target_name(validity_name: str, target_names: Collection[str]) -> str:
     """Return a validity field's paired value target, including its closest unit-suffixed name."""
     base_name = validity_name.removesuffix("_valid")
     if base_name in target_names:
@@ -793,4 +850,8 @@ def _parse_valid_when_equals(
     if len(valid_when) != 1 or "equals" not in valid_when:
         msg = f"fields.{target_name}.valid_when must specify exactly one supported predicate: 'equals'"
         raise ValueError(msg)
-    return valid_when["equals"]
+    equals = valid_when["equals"]
+    if equals is None:
+        msg = f"fields.{target_name}.valid_when.equals must not be null"
+        raise ValueError(msg)
+    return equals

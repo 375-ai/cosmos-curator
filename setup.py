@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -157,12 +157,27 @@ def build_package() -> None:
     )
 
     copy_required_files(src_sensors_dir, dst_sensors_dir, ("__init__.py",))
+    copy_required_files(
+        src_sensors_dir / "data",
+        dst_sensors_dir / "data",
+        ("__init__.py", "extrinsics.py", "gps_data.py", "imu_data.py"),
+    )
+    copy_required_files(
+        src_sensors_dir / "sampling",
+        dst_sensors_dir / "sampling",
+        ("__init__.py", "grid.py", "policy.py", "spec.py"),
+    )
+    copy_required_files(
+        src_sensors_dir / "sensors",
+        dst_sensors_dir / "sensors",
+        ("__init__.py", "gps_sensor.py", "imu_sensor.py"),
+    )
     copy_required_files(src_sensor_scripts_dir, dst_sensor_scripts_dir, ("__init__.py", "validate_protobuf_mapping.py"))
     copy_required_files(src_sensor_types_dir, dst_sensor_types_dir, ("__init__.py", "types.py"))
     copy_required_files(
         src_sensor_utils_dir,
         dst_sensor_utils_dir,
-        ("__init__.py", "io.py", "mcap.py", "protobuf_mapper.py", "protobuf_mapping_targets.py"),
+        ("__init__.py", "helpers.py", "io.py", "mcap.py", "protobuf_mapper.py", "validation.py"),
     )
 
     copy_required_files(src_storage_dir, dst_storage_dir, ("__init__.py", "zip_utils.py"))

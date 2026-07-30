@@ -46,6 +46,9 @@ fields:
     type: bool
 
   # Optional receiver metadata represented by both GpsSample and GpsData.
+  # Omitting a matching ``*_valid`` mapping defaults that scalar validity to true.
+  # Mapped scalar arrays are present in every sampling window; consult their
+  # validity masks before using values.
   satellites_used:
     from: satellites_used
     type: int

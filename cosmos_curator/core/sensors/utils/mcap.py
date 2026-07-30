@@ -515,7 +515,7 @@ def iter_decoded_protobuf_messages(
 ) -> Iterator[DecodedProtobufMessage]:
     """Yield decoded protobuf messages for one MCAP topic."""
     resolver = McapProtobufMessageResolver(expected_schema_name, schema_label=schema_label)
-    message_cls = resolver.resolve_from_summary(reader, topic)
+    resolver.resolve_from_summary(reader, topic)
     yielded = False
 
     for schema, channel, message in reader.iter_messages(topics=topic, log_time_order=log_time_order):

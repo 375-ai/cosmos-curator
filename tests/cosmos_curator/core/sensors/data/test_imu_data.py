@@ -45,6 +45,88 @@ def test_imu_data_accepts_required_fields() -> None:
     np.testing.assert_array_equal(imu_data.sensor_timestamps_ns, np.array([90, 210], dtype=np.int64))
 
 
+def test_imu_data_accepts_bias_vectors_and_validity() -> None:
+    """ImuData should preserve optional three-axis bias estimates and validity."""
+    angular_bias = np.array([[0.01, 0.02, 0.03], [np.nan, 0.05, 0.06]], dtype=np.float64)
+    acceleration_bias = np.array([[0.1, 0.2, 0.3], [0.4, np.nan, 0.6]], dtype=np.float64)
+    angular_valid = np.array([[True, True, True], [False, True, True]], dtype=np.bool_)
+    acceleration_valid = np.array([[True, True, True], [True, False, True]], dtype=np.bool_)
+
+    imu_data = _make_imu_data(
+        angular_velocity_bias_rad_s=angular_bias,
+        linear_acceleration_bias_m_s2=acceleration_bias,
+        angular_velocity_bias_valid=angular_valid,
+        linear_acceleration_bias_valid=acceleration_valid,
+    )
+
+    np.testing.assert_array_equal(imu_data.angular_velocity_bias_rad_s, angular_bias)
+    np.testing.assert_array_equal(imu_data.linear_acceleration_bias_m_s2, acceleration_bias)
+    np.testing.assert_array_equal(imu_data.angular_velocity_bias_valid, angular_valid)
+    np.testing.assert_array_equal(imu_data.linear_acceleration_bias_valid, acceleration_valid)
+
+
+def test_imu_data_accepts_temperature_validity() -> None:
+    """ImuData should preserve optional temperature validity."""
+    imu_data = _make_imu_data(
+        temperature_c=np.array([33.0, 33.5], dtype=np.float64),
+        temperature_valid=np.array([True, False], dtype=np.bool_),
+    )
+
+    np.testing.assert_array_equal(imu_data.temperature_c, np.array([33.0, 33.5], dtype=np.float64))
+    np.testing.assert_array_equal(imu_data.temperature_valid, np.array([True, False], dtype=np.bool_))
+
+
+def test_imu_data_accepts_nonfinite_raw_values_when_validity_false() -> None:
+    """Raw invalid IMU values may be non-finite when matching validity masks are false."""
+    imu_data = _make_imu_data(
+        angular_velocity_rad_s=np.array([[np.nan, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=np.float64),
+        linear_acceleration_m_s2=np.array([[np.nan, 2.0, 9.8], [1.1, 2.1, 9.7]], dtype=np.float64),
+        angular_velocity_valid=np.array([[False, True, True], [True, True, True]], dtype=np.bool_),
+        linear_acceleration_valid=np.array([[False, True, True], [True, True, True]], dtype=np.bool_),
+        temperature_c=np.array([np.nan, 33.5], dtype=np.float64),
+        temperature_valid=np.array([False, True], dtype=np.bool_),
+    )
+
+    assert np.isnan(imu_data.angular_velocity_rad_s[0, 0])
+    assert np.isnan(imu_data.linear_acceleration_m_s2[0, 0])
+    assert imu_data.temperature_c is not None
+    assert np.isnan(imu_data.temperature_c[0])
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "validity_name", "validity"),
+    [
+        (
+            "angular_velocity_rad_s",
+            np.array([[np.nan, 0.2, 0.3], [0.4, 0.5, 0.6]], dtype=np.float64),
+            "angular_velocity_valid",
+            np.array([[True, True, True], [True, True, True]], dtype=np.bool_),
+        ),
+        (
+            "linear_acceleration_m_s2",
+            np.array([[np.nan, 2.0, 9.8], [1.1, 2.1, 9.7]], dtype=np.float64),
+            "linear_acceleration_valid",
+            np.array([[True, True, True], [True, True, True]], dtype=np.bool_),
+        ),
+        (
+            "temperature_c",
+            np.array([np.nan, 33.5], dtype=np.float64),
+            "temperature_valid",
+            np.array([True, True], dtype=np.bool_),
+        ),
+    ],
+)
+def test_imu_data_rejects_nonfinite_raw_values_when_validity_true(
+    field_name: str,
+    value: npt.NDArray[Any],
+    validity_name: str,
+    validity: npt.NDArray[np.bool_],
+) -> None:
+    """Non-finite raw values still require a matching false validity-mask entry."""
+    with pytest.raises(ValueError, match="validity mask entries to be false"):
+        _make_imu_data(**{field_name: value, validity_name: validity})
+
+
 def test_imu_data_satisfies_sensor_data_protocol() -> None:
     """ImuData should be structurally usable anywhere SensorData is expected."""
     sensor_data: SensorData = _make_imu_data()
@@ -86,9 +168,14 @@ def test_imu_data_arrays_are_readonly() -> None:
         angular_velocity_valid=np.ones((2, 3), dtype=np.bool_),
         linear_acceleration_valid=np.ones((2, 3), dtype=np.bool_),
         orientation_valid=np.array([True, False], dtype=np.bool_),
+        angular_velocity_bias_rad_s=np.zeros((2, 3), dtype=np.float64),
+        linear_acceleration_bias_m_s2=np.zeros((2, 3), dtype=np.float64),
+        angular_velocity_bias_valid=np.ones((2, 3), dtype=np.bool_),
+        linear_acceleration_bias_valid=np.ones((2, 3), dtype=np.bool_),
         host_timestamps_ns=np.array([95, 215], dtype=np.int64),
         sequence_counter=np.array([7, 8], dtype=np.uint64),
         temperature_c=np.array([33.0, 33.5], dtype=np.float64),
+        temperature_valid=np.array([True, False], dtype=np.bool_),
     )
 
     arrays = [
@@ -103,9 +190,14 @@ def test_imu_data_arrays_are_readonly() -> None:
         imu_data.angular_velocity_valid,
         imu_data.linear_acceleration_valid,
         imu_data.orientation_valid,
+        imu_data.angular_velocity_bias_rad_s,
+        imu_data.linear_acceleration_bias_m_s2,
+        imu_data.angular_velocity_bias_valid,
+        imu_data.linear_acceleration_bias_valid,
         imu_data.host_timestamps_ns,
         imu_data.sequence_counter,
         imu_data.temperature_c,
+        imu_data.temperature_valid,
     ]
 
     for array in arrays:
@@ -180,11 +272,17 @@ def test_imu_data_rejects_invalid_required_fields(
         ("angular_velocity_valid", np.ones((2,), dtype=np.bool_), r"shape \(N, 3\)"),
         ("linear_acceleration_valid", np.ones((2, 3), dtype=np.int8), "dtype bool"),
         ("orientation_valid", np.ones((2, 1), dtype=np.bool_), r"shape \(N,\)"),
+        ("angular_velocity_bias_rad_s", np.ones((2, 2), dtype=np.float64), r"shape \(N, 3\)"),
+        ("linear_acceleration_bias_m_s2", np.ones((2, 3), dtype=np.float32), "dtype float64"),
+        ("angular_velocity_bias_valid", np.ones((2,), dtype=np.bool_), r"shape \(N, 3\)"),
+        ("linear_acceleration_bias_valid", np.ones((2, 3), dtype=np.int8), "dtype bool"),
         ("host_timestamps_ns", np.ones((2, 1), dtype=np.int64), r"shape \(N,\)"),
         ("host_timestamps_ns", np.ones(2, dtype=np.uint64), "dtype int64"),
         ("sequence_counter", np.ones(2, dtype=np.int64), "dtype uint64"),
         ("temperature_c", np.ones((2, 1), dtype=np.float64), r"shape \(N,\)"),
         ("temperature_c", np.array([32.0, np.inf], dtype=np.float64), "finite"),
+        ("temperature_valid", np.ones((2, 1), dtype=np.bool_), r"shape \(N,\)"),
+        ("temperature_valid", np.ones(2, dtype=np.int8), "dtype bool"),
     ],
 )
 def test_imu_data_rejects_invalid_optional_fields(
@@ -197,6 +295,26 @@ def test_imu_data_rejects_invalid_optional_fields(
         _make_imu_data(**{field_name: value})
 
 
+def test_imu_data_preserves_relative_covariance_symmetry_tolerance() -> None:
+    """Large covariance values should retain the historical relative symmetry tolerance."""
+    covariance = np.tile(
+        np.array(
+            [
+                [1_000.0, 100.0, 0.0],
+                [100.0 + 5e-8, 1_000.0, 0.0],
+                [0.0, 0.0, 1_000.0],
+            ],
+            dtype=np.float64,
+        ),
+        (2, 1, 1),
+    )
+
+    imu_data = _make_imu_data(angular_velocity_covariance=covariance)
+
+    assert imu_data.angular_velocity_covariance is not None
+    np.testing.assert_array_equal(imu_data.angular_velocity_covariance, covariance)
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
@@ -207,6 +325,8 @@ def test_imu_data_rejects_invalid_optional_fields(
         ("angular_velocity_valid", np.ones((1, 3), dtype=np.bool_)),
         ("linear_acceleration_valid", np.ones((1, 3), dtype=np.bool_)),
         ("orientation_valid", np.ones(1, dtype=np.bool_)),
+        ("angular_velocity_bias_rad_s", np.ones((1, 3), dtype=np.float64)),
+        ("linear_acceleration_bias_m_s2", np.ones((1, 3), dtype=np.float64)),
         ("host_timestamps_ns", np.ones(1, dtype=np.int64)),
         ("sequence_counter", np.ones(1, dtype=np.uint64)),
         ("temperature_c", np.ones(1, dtype=np.float64)),
@@ -217,5 +337,82 @@ def test_imu_data_rejects_optional_batch_length_mismatches(
     value: npt.NDArray[Any],
 ) -> None:
     """ImuData should require optional arrays to share the required batch length."""
+    overrides: dict[str, npt.NDArray[Any]] = {field_name: value}
+    if field_name == "orientation_valid":
+        overrides["orientation_quat_xyzw"] = np.array([[0.0, 0.0, 0.0, 1.0]], dtype=np.float64)
+
     with pytest.raises(ValueError, match="same length"):
-        _make_imu_data(**{field_name: value})
+        _make_imu_data(**overrides)
+
+
+def test_imu_data_rejects_temperature_valid_without_temperature_c() -> None:
+    """temperature_valid should not be present without matching temperature values."""
+    with pytest.raises(ValueError, match="temperature_valid requires temperature_c"):
+        _make_imu_data(temperature_valid=np.array([True, False], dtype=np.bool_))
+
+
+def test_imu_data_rejects_temperature_valid_batch_length_mismatch() -> None:
+    """temperature_valid should share the required IMU batch length."""
+    with pytest.raises(ValueError, match="same length"):
+        _make_imu_data(
+            temperature_c=np.array([33.0, 33.5], dtype=np.float64),
+            temperature_valid=np.array([True], dtype=np.bool_),
+        )
+
+
+@pytest.mark.parametrize(
+    ("value_name", "validity_name"),
+    [
+        ("angular_velocity_bias_rad_s", "angular_velocity_bias_valid"),
+        ("linear_acceleration_bias_m_s2", "linear_acceleration_bias_valid"),
+    ],
+)
+def test_imu_data_rejects_bias_valid_batch_length_mismatch(value_name: str, validity_name: str) -> None:
+    """Bias validity masks should share the required IMU batch length."""
+    with pytest.raises(ValueError, match="same length"):
+        _make_imu_data(
+            **{
+                value_name: np.zeros((2, 3), dtype=np.float64),
+                validity_name: np.ones((1, 3), dtype=np.bool_),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("value_name", "validity_name"),
+    [
+        ("angular_velocity_bias_rad_s", "angular_velocity_bias_valid"),
+        ("linear_acceleration_bias_m_s2", "linear_acceleration_bias_valid"),
+    ],
+)
+def test_imu_data_rejects_nonfinite_valid_bias(value_name: str, validity_name: str) -> None:
+    """Non-finite bias values require their corresponding axes to be invalid."""
+    values = np.array([[np.nan, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float64)
+    validity = np.ones((2, 3), dtype=np.bool_)
+
+    with pytest.raises(ValueError, match="validity mask entries to be false"):
+        _make_imu_data(**{value_name: values, validity_name: validity})
+
+
+@pytest.mark.parametrize(
+    ("value_name", "validity_name"),
+    [
+        ("angular_velocity_bias_rad_s", "angular_velocity_bias_valid"),
+        ("linear_acceleration_bias_m_s2", "linear_acceleration_bias_valid"),
+    ],
+)
+def test_imu_data_rejects_bias_valid_without_value(value_name: str, validity_name: str) -> None:
+    """A bias validity mask cannot be present without its paired value array."""
+    with pytest.raises(ValueError, match=rf"{validity_name} requires {value_name}"):
+        _make_imu_data(**{validity_name: np.ones((2, 3), dtype=np.bool_)})
+
+
+@pytest.mark.parametrize(
+    "value_name",
+    ["angular_velocity_bias_rad_s", "linear_acceleration_bias_m_s2"],
+)
+def test_imu_data_accepts_bias_value_without_validity(value_name: str) -> None:
+    """A finite bias value is accepted without an explicit validity mask."""
+    imu_data = _make_imu_data(**{value_name: np.zeros((2, 3), dtype=np.float64)})
+
+    np.testing.assert_array_equal(getattr(imu_data, value_name), np.zeros((2, 3), dtype=np.float64))

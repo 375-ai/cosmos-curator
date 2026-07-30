@@ -28,6 +28,14 @@ from mcap.exceptions import McapError
 from mcap.reader import McapReader, make_reader
 from mcap.records import Channel, Schema
 
+from cosmos_curator.core.sensors.sensors.gps_sensor import (
+    REQUIRED_GPS_MAPPING_FIELDS,
+    DecodedGpsSample,
+)
+from cosmos_curator.core.sensors.sensors.imu_sensor import (
+    REQUIRED_IMU_MAPPING_FIELDS,
+    DecodedImuSample,
+)
 from cosmos_curator.core.sensors.utils.mcap import (
     McapProtobufMessageResolver,
     channel_for_topic,
@@ -35,10 +43,11 @@ from cosmos_curator.core.sensors.utils.mcap import (
 )
 from cosmos_curator.core.sensors.utils.protobuf_mapper import (
     MISSING,
+    PROTOBUF_NUMERIC_TYPES,
     FieldMapping,
     ProtobufRowMapper,
-    _paired_target_name,
     load_spec,
+    paired_target_name,
     parse_one_mapping,
     parse_optional_str,
     path_segments,
@@ -48,33 +57,10 @@ from cosmos_curator.core.sensors.utils.protobuf_mapper import (
     target_metadata,
     validate_mapping_target_type,
     validate_target_class,
-)
-from cosmos_curator.core.sensors.utils.protobuf_mapping_targets import (
-    REQUIRED_GPS_MAPPING_FIELDS,
-    REQUIRED_IMU_MAPPING_FIELDS,
-    GpsMappingRow,
-    ImuMappingRow,
+    validate_valid_when_source,
 )
 
-_PROTOBUF_NUMERIC_TYPES = frozenset(
-    {
-        FieldDescriptor.TYPE_DOUBLE,
-        FieldDescriptor.TYPE_FLOAT,
-        FieldDescriptor.TYPE_INT64,
-        FieldDescriptor.TYPE_UINT64,
-        FieldDescriptor.TYPE_INT32,
-        FieldDescriptor.TYPE_FIXED64,
-        FieldDescriptor.TYPE_FIXED32,
-        FieldDescriptor.TYPE_UINT32,
-        FieldDescriptor.TYPE_SFIXED32,
-        FieldDescriptor.TYPE_SFIXED64,
-        FieldDescriptor.TYPE_SINT32,
-        FieldDescriptor.TYPE_SINT64,
-        FieldDescriptor.TYPE_ENUM,
-    }
-)
-_PROTOBUF_TIMESTAMP_TYPES = _PROTOBUF_NUMERIC_TYPES - {FieldDescriptor.TYPE_ENUM}
-_PROTOBUF_VALIDITY_TYPES = _PROTOBUF_NUMERIC_TYPES | {FieldDescriptor.TYPE_BOOL}
+_PROTOBUF_TIMESTAMP_TYPES = PROTOBUF_NUMERIC_TYPES - {FieldDescriptor.TYPE_ENUM}
 
 
 def _invalid(message: str, *, cause: Exception | None = None) -> Never:
@@ -208,7 +194,7 @@ class _ValidationCollector:
             if not target_name.endswith("_valid"):
                 continue
             try:
-                paired_name = _paired_target_name(target_name, self.target_annotations)
+                paired_name = paired_target_name(target_name, self.target_annotations)
             except ValueError as e:
                 self.add_problem(f"fields.{target_name}", str(e))
                 continue
@@ -354,16 +340,15 @@ def _conversion_label(mapping: FieldMapping) -> str:
 
 def _validate_source_type(mapping: FieldMapping, source_name: str, source_type: int) -> None:
     if mapping.valid_when_equals is not MISSING:
-        if source_type in _PROTOBUF_VALIDITY_TYPES:
-            return
-        expected = "a numeric, enum, or bool scalar"
-    elif (
-        (mapping.value_type in {"float", "int"} and source_type in _PROTOBUF_NUMERIC_TYPES)
+        validate_valid_when_source(mapping, source_name, source_type)
+        return
+    if (
+        (mapping.value_type in {"float", "int"} and source_type in PROTOBUF_NUMERIC_TYPES)
         or (mapping.value_type == "timestamp" and source_type in _PROTOBUF_TIMESTAMP_TYPES)
         or (mapping.value_type == "bool" and source_type == FieldDescriptor.TYPE_BOOL)
     ):
         return
-    elif mapping.value_type == "bool":
+    if mapping.value_type == "bool":
         _invalid(
             f"fields.{mapping.target_name} uses direct bool conversion for non-bool protobuf field "
             f"{source_name!r}; use valid_when"
@@ -382,8 +367,8 @@ INPUT_ERROR_EXIT_CODE = 2
 
 
 _TARGET_CONFIGS: dict[str, tuple[type[Any], frozenset[str]]] = {
-    "gps": (GpsMappingRow, REQUIRED_GPS_MAPPING_FIELDS),
-    "imu": (ImuMappingRow, REQUIRED_IMU_MAPPING_FIELDS),
+    "gps": (DecodedGpsSample, REQUIRED_GPS_MAPPING_FIELDS),
+    "imu": (DecodedImuSample, REQUIRED_IMU_MAPPING_FIELDS),
 }
 
 

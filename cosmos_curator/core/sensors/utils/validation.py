@@ -14,6 +14,7 @@
 # limitations under the License.
 """Validation helpers for sensor-library data structures and algorithms."""
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import attrs
@@ -24,6 +25,12 @@ if TYPE_CHECKING:
     AttrsAttribute = attrs.Attribute[Any]
 else:
     AttrsAttribute = attrs.Attribute
+
+AttrsValidator = Callable[[object, AttrsAttribute, Any], None]
+
+_QUATERNION_COLUMNS = 4
+_QUATERNION_NORM_TOLERANCE = 1e-6
+_COVARIANCE_TOLERANCE = 1e-9
 
 
 def _require_1d_int64(name: str, values: npt.NDArray[np.int64]) -> None:
@@ -66,6 +73,16 @@ def _require_1d_uint16(name: str, values: npt.NDArray[np.uint16]) -> None:
         raise ValueError(msg)
 
 
+def _require_1d_uint32(name: str, values: npt.NDArray[np.uint32]) -> None:
+    """Raise if *values* is not a 1-D ``uint32`` array."""
+    if values.ndim != 1:
+        msg = f"{name} must be 1-D, got ndim={values.ndim}"
+        raise ValueError(msg)
+    if values.dtype != np.uint32:
+        msg = f"{name} must have dtype uint32, got {values.dtype}"
+        raise ValueError(msg)
+
+
 def _require_1d_uint64(name: str, values: npt.NDArray[np.uint64]) -> None:
     """Raise if *values* is not a 1-D ``uint64`` array."""
     if values.ndim != 1:
@@ -104,6 +121,107 @@ def require_finite_float32_array(name: str, values: npt.NDArray[np.float32]) -> 
     if not np.all(np.isfinite(values)):
         msg = f"{name} must contain only finite values"
         raise ValueError(msg)
+
+
+def require_batch_shape(
+    name: str,
+    values: npt.NDArray[Any],
+    trailing_shape: tuple[int, ...],
+) -> None:
+    """Raise unless an array has a batch dimension followed by ``trailing_shape``."""
+    expected_ndim = len(trailing_shape) + 1
+    if values.ndim != expected_ndim or values.shape[1:] != trailing_shape:
+        dimensions = ", ".join(str(item) for item in trailing_shape)
+        msg = f"{name} must have shape (N, {dimensions}), got shape={values.shape}"
+        raise ValueError(msg)
+
+
+def float64_batch(
+    trailing_shape: tuple[int, ...],
+    *,
+    finite: bool = True,
+) -> AttrsValidator:
+    """Build an attrs validator for float64 batches with a fixed trailing shape."""
+
+    def _validator(
+        _instance: object,
+        attribute: AttrsAttribute,
+        value: npt.NDArray[np.float64],
+    ) -> None:
+        require_batch_shape(attribute.name, value, trailing_shape)
+        if value.dtype != np.float64:
+            msg = f"{attribute.name} must have dtype float64, got {value.dtype}"
+            raise ValueError(msg)
+        if finite and not np.all(np.isfinite(value)):
+            msg = f"{attribute.name} must contain only finite values"
+            raise ValueError(msg)
+
+    return _validator
+
+
+def bool_batch(trailing_shape: tuple[int, ...]) -> AttrsValidator:
+    """Build an attrs validator for bool batches with a fixed trailing shape."""
+
+    def _validator(
+        _instance: object,
+        attribute: AttrsAttribute,
+        value: npt.NDArray[np.bool_],
+    ) -> None:
+        require_batch_shape(attribute.name, value, trailing_shape)
+        if value.dtype != np.bool_:
+            msg = f"{attribute.name} must have dtype bool, got {value.dtype}"
+            raise ValueError(msg)
+
+    return _validator
+
+
+def unit_quaternion_batch(
+    _instance: object,
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.float64],
+) -> None:
+    """Validate finite unit quaternions with shape ``(N, 4)``."""
+    require_batch_shape(attribute.name, value, (_QUATERNION_COLUMNS,))
+    require_finite_float64_array(attribute.name, value)
+    norms = np.linalg.norm(value, axis=1)
+    if not np.all(np.isclose(norms, 1.0, rtol=0.0, atol=_QUATERNION_NORM_TOLERANCE)):
+        msg = f"{attribute.name} quaternion rows must have unit norm within tolerance"
+        raise ValueError(msg)
+
+
+def symmetric_psd_covariance_batch(
+    matrix_size: int,
+    *,
+    symmetry_rtol: float = 0.0,
+) -> AttrsValidator:
+    """Build an attrs validator for finite symmetric PSD covariance batches."""
+    if matrix_size <= 0:
+        msg = f"matrix_size must be positive, got {matrix_size}"
+        raise ValueError(msg)
+    if symmetry_rtol < 0.0:
+        msg = f"symmetry_rtol must be nonnegative, got {symmetry_rtol}"
+        raise ValueError(msg)
+
+    def _validator(
+        _instance: object,
+        attribute: AttrsAttribute,
+        value: npt.NDArray[np.float64],
+    ) -> None:
+        require_batch_shape(attribute.name, value, (matrix_size, matrix_size))
+        require_finite_float64_array(attribute.name, value)
+        if not np.allclose(
+            value,
+            np.swapaxes(value, 1, 2),
+            rtol=symmetry_rtol,
+            atol=_COVARIANCE_TOLERANCE,
+        ):
+            msg = f"{attribute.name} covariance matrices must be symmetric"
+            raise ValueError(msg)
+        if value.shape[0] and np.min(np.linalg.eigvalsh(value)) < -_COVARIANCE_TOLERANCE:
+            msg = f"{attribute.name} covariance matrices must be positive semidefinite"
+            raise ValueError(msg)
+
+    return _validator
 
 
 def require_strictly_increasing(name: str, values: npt.NDArray[np.int64]) -> None:
@@ -174,6 +292,15 @@ def uint16_array(
 ) -> None:
     """Attrs validator for a 1-D ``uint16`` array."""
     _require_1d_uint16(attribute.name, value)
+
+
+def uint32_array(
+    instance: object,  # noqa: ARG001
+    attribute: AttrsAttribute,
+    value: npt.NDArray[np.uint32],
+) -> None:
+    """Attrs validator for a 1-D ``uint32`` array."""
+    _require_1d_uint32(attribute.name, value)
 
 
 def uint64_array(

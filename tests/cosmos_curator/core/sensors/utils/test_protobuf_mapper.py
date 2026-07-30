@@ -26,7 +26,6 @@ from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf.message import Message
 
 from cosmos_curator.core.sensors.utils.protobuf_mapper import ProtobufRowMapper
-from cosmos_curator.core.sensors.utils.protobuf_mapping_targets import ImuMappingRow
 
 _FIELD = descriptor_pb2.FieldDescriptorProto
 _SCHEMA_NAME = "mapper_test.MapperMessage"
@@ -411,19 +410,18 @@ def test_protobuf_row_mapper_resolves_string_annotations_for_defaults() -> None:
     assert row.hdop_valid is True
 
 
-def test_protobuf_row_mapper_reports_explicit_null_defaults_as_mapped() -> None:
-    """Mapped target names include fields whose YAML default is ``null``."""
-    mapper = ProtobufRowMapper(
-        {
-            "fields": {
-                "count": {"from": "count", "type": "int"},
-                "note": {"default": None},
+def test_protobuf_row_mapper_rejects_explicit_null_defaults() -> None:
+    """Optional targets are omitted from YAML instead of mapped to ``null``."""
+    with pytest.raises(ValueError, match=r"fields\.note\.default must not be null"):
+        ProtobufRowMapper(
+            {
+                "fields": {
+                    "count": {"from": "count", "type": "int"},
+                    "note": {"default": None},
+                },
             },
-        },
-        target_cls=_NullableDefaultRow,
-    )
-
-    assert mapper.mapped_target_names == frozenset({"count", "note"})
+            target_cls=_NullableDefaultRow,
+        )
 
 
 def test_protobuf_row_mapper_uses_explicit_align_timestamp_mapping() -> None:
@@ -487,6 +485,22 @@ def test_protobuf_row_mapper_maps_validity_code_with_valid_when_equals() -> None
 
     assert mapper(_message(count=5)).flag is True
     assert mapper(_message(count=6)).flag is False
+
+
+def test_protobuf_row_mapper_rejects_incompatible_valid_when_equals_type() -> None:
+    """Validity predicates must use a comparand compatible with the protobuf source."""
+    with pytest.raises(ValueError, match=r"flag\.valid_when\.equals.*temperature"):
+        ProtobufRowMapper(
+            {
+                "fields": {
+                    "count": {"default": 1, "type": "int"},
+                    "flag": {"from": "temperature", "type": "bool", "valid_when": {"equals": "valid"}},
+                    "temperature": {"default": 0.0, "type": "float"},
+                },
+            },
+            target_cls=_MixedRow,
+            message_cls=_message_class(),
+        )
 
 
 def test_protobuf_row_mapper_applies_valid_when_equals_per_group_element() -> None:
@@ -633,6 +647,22 @@ def test_protobuf_row_mapper_rejects_fractional_nanosecond_timestamp_conversion(
         mapper(_message(temperature=1.5))
 
 
+def test_protobuf_row_mapper_rejects_imprecise_epoch_seconds_timestamp_conversion() -> None:
+    """Float epoch seconds must resolve exactly to an integer nanosecond count."""
+    mapper = ProtobufRowMapper(
+        {
+            "fields": {
+                "sensor_timestamp_ns": {"from": "temperature", "type": "timestamp", "unit": "s"},
+            },
+        },
+        target_cls=_TimestampRow,
+        message_cls=_message_class(),
+    )
+
+    with pytest.raises(ValueError, match="without losing information"):
+        mapper(_message(temperature=1_753_920_000.0000002))
+
+
 def test_protobuf_row_mapper_preserves_integer_timestamp_precision() -> None:
     """Integer timestamp conversion should not pass epoch-scale ns values through float."""
     mapper = ProtobufRowMapper(
@@ -744,23 +774,6 @@ def test_protobuf_row_mapper_rejects_ambiguous_unit_suffixed_validity_pair() -> 
             {"fields": {"value_valid": {"from": "flag", "type": "bool"}}},
             target_cls=_AmbiguousUnitValidityRow,
         )
-
-
-def test_imu_mapping_row_defaults_absent_optional_values_and_validity_to_none() -> None:
-    """The public IMU target never marks an absent optional value as valid."""
-    row = ImuMappingRow(
-        sensor_timestamp_ns=1,
-        align_timestamp_ns=1,
-        angular_velocity_rad_s=(0.0, 0.0, 0.0),
-        linear_acceleration_m_s2=(0.0, 0.0, 0.0),
-    )
-
-    assert row.angular_velocity_bias_rad_s is None
-    assert row.angular_velocity_bias_valid is None
-    assert row.linear_acceleration_bias_m_s2 is None
-    assert row.linear_acceleration_bias_valid is None
-    assert row.temperature_c is None
-    assert row.temperature_valid is None
 
 
 def test_protobuf_row_mapper_rejects_unknown_protobuf_field_with_descriptor() -> None:

@@ -31,7 +31,7 @@ from cosmos_curator.core.sensors.utils.validation import (
     strictly_increasing_int64_array,
     uint8_array,
     uint8_frame_batch,
-    uint16_array,
+    uint32_array,
     uint64_array,
 )
 
@@ -258,7 +258,7 @@ class _Uint8ArrayHolder:
     ("values", "match"),
     [
         (np.array([[1, 2]], dtype=np.uint8), r"values must be 1-D, got ndim=2"),
-        (np.array([1, 2], dtype=np.uint16), r"values must have dtype uint8, got uint16"),
+        (np.array([1, 2], dtype=np.uint32), r"values must have dtype uint8, got uint32"),
     ],
 )
 def test_uint8_array_rejects_invalid_inputs(values: np.ndarray, match: str) -> None:
@@ -275,29 +275,29 @@ def test_uint8_array_accepts_uint8_vector() -> None:
 
 
 @attrs.define
-class _Uint16ArrayHolder:
-    """Test fixture for the uint16 array attrs validator."""
+class _Uint32ArrayHolder:
+    """Test fixture for the uint32 array attrs validator."""
 
-    values: np.ndarray = attrs.field(validator=uint16_array)
+    values: np.ndarray = attrs.field(validator=uint32_array)
 
 
 @pytest.mark.parametrize(
     ("values", "match"),
     [
-        (np.array([[1, 2]], dtype=np.uint16), r"values must be 1-D, got ndim=2"),
-        (np.array([1, 2], dtype=np.uint8), r"values must have dtype uint16, got uint8"),
+        (np.array([[1, 2]], dtype=np.uint32), r"values must be 1-D, got ndim=2"),
+        (np.array([1, 2], dtype=np.uint8), r"values must have dtype uint32, got uint8"),
     ],
 )
-def test_uint16_array_rejects_invalid_inputs(values: np.ndarray, match: str) -> None:
-    """Uint16-array validator should reject non-vector or non-uint16 arrays."""
+def test_uint32_array_rejects_invalid_inputs(values: np.ndarray, match: str) -> None:
+    """Uint32-array validator should reject non-vector or non-uint32 arrays."""
     with pytest.raises(ValueError, match=match):
-        _Uint16ArrayHolder(values=values)
+        _Uint32ArrayHolder(values=values)
 
 
-def test_uint16_array_accepts_uint16_vector() -> None:
-    """Uint16-array validator should accept a 1-D uint16 array."""
-    values = np.array([1, 2], dtype=np.uint16)
-    holder = _Uint16ArrayHolder(values=values)
+def test_uint32_array_accepts_uint32_vector() -> None:
+    """Uint32-array validator should accept a 1-D uint32 array."""
+    values = np.array([1, 2], dtype=np.uint32)
+    holder = _Uint32ArrayHolder(values=values)
     np.testing.assert_array_equal(holder.values, values)
 
 
