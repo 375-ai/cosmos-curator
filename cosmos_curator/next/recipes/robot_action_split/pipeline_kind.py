@@ -1,0 +1,111 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Config-backed pipeline-kind surface for the ``robot-action-split`` recipe."""
+
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+from uuid import UUID, uuid4
+
+from cosmos_curator.next.core.pipeline_kind import PipelineKind, PipelineRunOutput, PreparedPipelineRun
+from cosmos_curator.next.recipes.robot_action_split.config import resolve_config
+
+
+def _template_yaml() -> str:
+    return """\
+schema_version: 1
+kind: robot-action-split
+
+input:
+  uris: [s3://example-bucket/robot_data/lerobot_v30/my_dataset/]
+  source_dataset: my_dataset
+
+output:
+  media_root: s3://example-bucket/robot_clips/
+  lance_uri: s3://example-bucket/robot_clips/lance/clips.lance
+"""
+
+
+def _template_payload() -> dict[str, Any]:
+    return {
+        "kind": "robot-action-split",
+        "description": "Extract subtask clips from a LeRobot/Mecka dataset and publish to Lance.",
+        "config": _template_yaml(),
+    }
+
+
+def _validate(config: Path, overrides: Sequence[str]) -> dict[str, object]:
+    resolve_config(config, overrides=list(overrides))
+    return {"ok": True}
+
+
+def _render(config: Path, overrides: Sequence[str]) -> str:
+    import json  # noqa: PLC0415
+
+    cfg = resolve_config(config, overrides=list(overrides))
+    return json.dumps(cfg.model_dump(mode="json"), indent=2) + "\n"
+
+
+def _schema_json() -> str:
+    import json  # noqa: PLC0415
+
+    from cosmos_curator.next.recipes.robot_action_split.config import (  # noqa: PLC0415
+        ResolvedRobotActionSplitConfig,
+    )
+
+    return json.dumps(ResolvedRobotActionSplitConfig.model_json_schema(), indent=2) + "\n"
+
+
+def _list_presets() -> list[dict[str, Any]]:
+    return []
+
+
+def _prepare_run(
+    config: Path,
+    *,
+    set_overrides: list[str],
+    attempt_id: UUID | None,
+) -> PreparedPipelineRun:
+    resolved_config = resolve_config(config, overrides=set_overrides)
+    resolved_attempt_id = attempt_id or uuid4()
+
+    def run() -> PipelineRunOutput:
+        from cosmos_curator.next.recipes.robot_action_split.pipeline import run as _run  # noqa: PLC0415
+
+        sys.stderr.write(f"Attempt ID: {resolved_attempt_id}\n")
+        summary = _run(str(config), config=resolved_config, attempt_id=str(resolved_attempt_id))
+        return PipelineRunOutput(
+            json_payload=summary,
+            message=(
+                f"robot-action-split: {summary.get('succeeded', 0)} clip(s) succeeded, "
+                f"{summary.get('failed', 0)} failed"
+            ),
+        )
+
+    return run
+
+
+ROBOT_ACTION_SPLIT_KIND = PipelineKind(
+    name="robot-action-split",
+    template_yaml=_template_yaml,
+    template_payload=_template_payload,
+    validate=_validate,
+    render=_render,
+    schema_json=_schema_json,
+    list_presets=_list_presets,
+    prepare_run=_prepare_run,
+)

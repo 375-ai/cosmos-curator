@@ -124,9 +124,33 @@ def _run_caption_judge(
     return run
 
 
+def _run_robot_action_split(
+    config: Path,
+    *,
+    set_overrides: list[str],
+) -> Callable[[], _RuntimeOutput]:
+    from cosmos_curator.next.recipes.robot_action_split.config import resolve_config  # noqa: PLC0415
+
+    resolved_config = resolve_config(config, overrides=set_overrides)
+
+    def run() -> _RuntimeOutput:
+        from cosmos_curator.next.recipes.robot_action_split.pipeline import run as _run  # noqa: PLC0415
+
+        summary = _run(str(config), config=resolved_config)
+        succeeded = summary.get("succeeded", 0)
+        failed = summary.get("failed", 0)
+        return _RuntimeOutput(
+            json_payload=summary,
+            message=f"robot-action-split: {succeeded} clip(s) succeeded, {failed} failed",
+        )
+
+    return run
+
+
 _RUNTIME_BUILDERS: dict[PipelineName, _RuntimeBuilder] = {
     "video_split": _run_video_split,
     "caption_judge": _run_caption_judge,
+    "robot_action_split": _run_robot_action_split,
 }
 
 

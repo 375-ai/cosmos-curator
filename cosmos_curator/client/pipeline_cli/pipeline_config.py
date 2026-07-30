@@ -20,8 +20,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-PipelineName = Literal["video_split", "caption_judge"]
-PIPELINE_NAMES = frozenset({"video_split", "caption_judge"})
+import yaml
+
+PipelineName = Literal["video_split", "caption_judge", "robot_action_split"]
+PIPELINE_NAMES = frozenset({"video_split", "caption_judge", "robot_action_split"})
 
 
 @dataclass(frozen=True)
@@ -37,13 +39,22 @@ class PipelineCliSpec:
 
 def load_pipeline_kind(config: Path) -> PipelineName:
     """Load and validate the ``kind`` field from a pipeline config file."""
-    from cosmos_curator.pipelines.ray_data.video_split.config import load_video_split_config_data  # noqa: PLC0415
+    with config.open(encoding="utf-8") as f:
+        if config.suffix.lower() in {".yaml", ".yml"}:
+            data = yaml.safe_load(f)
+        else:
+            import json  # noqa: PLC0415
 
-    data = load_video_split_config_data(config)
-    kind = data.get("kind")
+            data = json.load(f)
+    if not isinstance(data, dict):
+        msg = f"Config must be a YAML/JSON mapping, got {type(data).__name__}"
+        raise TypeError(msg)
+    # robot-action-split uses a hyphenated kind; normalize to underscore for lookup.
+    raw_kind = data.get("kind")
+    kind = raw_kind.replace("-", "_") if isinstance(raw_kind, str) else raw_kind
     if not isinstance(kind, str) or kind not in PIPELINE_NAMES:
         valid = ", ".join(sorted(PIPELINE_NAMES))
-        msg = f"Config must contain a valid 'kind' key (got: {kind!r}). Valid pipeline kinds: {valid}"
+        msg = f"Config must contain a valid 'kind' key (got: {raw_kind!r}). Valid pipeline kinds: {valid}"
         raise ValueError(msg)
     return cast("PipelineName", kind)
 
@@ -129,6 +140,36 @@ def _caption_judge_schema_json() -> str:
     return user_caption_judge_schema_json()
 
 
+def _robot_action_split_template_yaml() -> str:
+    from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND  # noqa: PLC0415
+
+    return ROBOT_ACTION_SPLIT_KIND.template_yaml()
+
+
+def _robot_action_split_template_payload() -> dict[str, Any]:
+    from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND  # noqa: PLC0415
+
+    return ROBOT_ACTION_SPLIT_KIND.template_payload()
+
+
+def _robot_action_split_validate(config: Path, overrides: Sequence[str]) -> dict[str, object]:
+    from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND  # noqa: PLC0415
+
+    return ROBOT_ACTION_SPLIT_KIND.validate(config, overrides)
+
+
+def _robot_action_split_render(config: Path, overrides: Sequence[str]) -> str:
+    from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND  # noqa: PLC0415
+
+    return ROBOT_ACTION_SPLIT_KIND.render(config, overrides)
+
+
+def _robot_action_split_schema_json() -> str:
+    from cosmos_curator.next.recipes.robot_action_split.pipeline_kind import ROBOT_ACTION_SPLIT_KIND  # noqa: PLC0415
+
+    return ROBOT_ACTION_SPLIT_KIND.schema_json()
+
+
 _PIPELINE_CLI_SPECS: dict[PipelineName, PipelineCliSpec] = {
     "video_split": PipelineCliSpec(
         template_yaml=_video_split_template_yaml,
@@ -143,5 +184,12 @@ _PIPELINE_CLI_SPECS: dict[PipelineName, PipelineCliSpec] = {
         validate=_caption_judge_validate,
         render=_caption_judge_render,
         schema_json=_caption_judge_schema_json,
+    ),
+    "robot_action_split": PipelineCliSpec(
+        template_yaml=_robot_action_split_template_yaml,
+        template_payload=_robot_action_split_template_payload,
+        validate=_robot_action_split_validate,
+        render=_robot_action_split_render,
+        schema_json=_robot_action_split_schema_json,
     ),
 }
