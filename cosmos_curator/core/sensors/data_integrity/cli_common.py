@@ -36,6 +36,7 @@ in :mod:`.cli`, the session rollup in :mod:`.report`.
 import argparse
 import enum
 import math
+import os
 import pathlib
 import time
 from collections.abc import Callable, Generator, Iterator
@@ -99,6 +100,18 @@ def non_negative_int(raw: str) -> int:
     return value
 
 
+def positive_int(raw: str) -> int:
+    """Argparse ``type=`` for flags that must be a positive integer (rejects 0 and negatives)."""
+    msg = f"expected a positive integer, got {raw!r}"
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(msg) from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(msg)
+    return value
+
+
 def validate_expected_hz(value: float | None) -> float | None:
     """Validate an already-typed expected sample rate at a library boundary.
 
@@ -120,6 +133,30 @@ def validate_non_negative_int(name: str, value: int) -> int:
         msg = f"{name} must be >= 0, got {value!r}"
         raise ValueError(msg)
     return value
+
+
+def validate_positive_int(name: str, value: int) -> int:
+    """Validate that an already-typed integer count (e.g. ``max_workers``) is at least one."""
+    if value < 1:
+        msg = f"{name} must be >= 1, got {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def available_cpu_count() -> int:
+    """How many CPUs this process may actually run on, never below one.
+
+    Prefers the scheduling affinity mask over the machine's core count, because
+    under ``docker --cpuset-cpus`` or ``taskset`` the two disagree and only the mask
+    bounds real parallelism. Affinity is Linux-only, hence the fallback. Note that a
+    CFS quota (``docker --cpus``) caps CPU *time* without narrowing the mask, so it
+    is not reflected here.
+    """
+    # Fetched dynamically because sched_getaffinity does not exist off Linux.
+    sched_getaffinity = getattr(os, "sched_getaffinity", None)
+    if sched_getaffinity is not None:
+        return max(1, len(sched_getaffinity(0)))
+    return max(1, os.cpu_count() or 1)
 
 
 class CheckStatus(enum.Enum):

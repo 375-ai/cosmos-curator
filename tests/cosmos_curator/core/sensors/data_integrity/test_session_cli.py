@@ -18,6 +18,8 @@
 import io
 import json
 import pathlib
+import sys
+import threading
 
 import pytest
 
@@ -150,6 +152,34 @@ def test_forwards_cloud_and_sampling_args(monkeypatch: pytest.MonkeyPatch) -> No
     assert captured["s3_profile_name"] == "prof"
 
 
+def test_max_workers_defaults_to_the_usable_cpu_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Omitting --max-workers scales concurrency to the host rather than a fixed number."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_session(session_path: str, **kwargs: object) -> SessionReport:
+        captured.update(kwargs)
+        return SessionReport(session_path, [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _fake_run_session)
+    monkeypatch.setattr(session_cli, "available_cpu_count", lambda: 12)
+    session_cli.main(["--session-path", "s"])
+    assert captured["max_workers"] == 12
+
+
+def test_explicit_max_workers_overrides_the_cpu_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit --max-workers wins over the detected CPU count."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_session(session_path: str, **kwargs: object) -> SessionReport:
+        captured.update(kwargs)
+        return SessionReport(session_path, [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _fake_run_session)
+    monkeypatch.setattr(session_cli, "available_cpu_count", lambda: 12)
+    session_cli.main(["--session-path", "s", "--max-workers", "2"])
+    assert captured["max_workers"] == 2
+
+
 def test_bogus_video_dir_is_error(tmp_path: pathlib.Path) -> None:
     """End-to-end (no mocks): a dir of undecodable mp4s discovers streams but exits ERROR."""
     (tmp_path / "a.mp4").write_bytes(b"not a real video")
@@ -214,6 +244,69 @@ def test_progress_survives_a_raising_size_lookup(capsys: pytest.CaptureFixture[s
     stream = wrapper(io.BytesIO(b"x" * 50))
     stream.read()
     assert "MB read" in capsys.readouterr().err
+
+
+def test_progress_drops_live_counter_when_streams_overlap(capsys: pytest.CaptureFixture[str]) -> None:
+    """Concurrent streams cannot share one redrawn line, so the in-place counter is off.
+
+    The byte total still has to reach the finish line, and nothing may emit a carriage
+    return that would stomp another stream's output.
+    """
+    progress = session_cli._Progress(size_lookup=lambda _s: 100, live_byte_counter=False)
+    wrapper = progress.make_wrapper(1, 2, "s3://bucket/clip.mp4")
+    stream = wrapper(io.BytesIO(b"x" * 50))
+    stream.read()
+    assert capsys.readouterr().err == ""
+
+    progress.finish(1, 2, _stream("s3://bucket/clip.mp4", CheckStatus.PASS))
+    err = capsys.readouterr().err
+    assert "\r" not in err
+    assert "MB read" in err
+
+
+def test_progress_skips_the_size_lookup_without_the_live_counter() -> None:
+    """No size lookup when nothing will display the total, which is the concurrent default.
+
+    Only the live counter reads the total; the finish line reports bytes actually read.
+    On a cloud source the lookup is a HEAD behind a freshly built client per stream, and
+    that construction holds the interpreter lock, so a dozen concurrent streams queue up
+    behind it -- measurably, for a value that would be thrown away.
+    """
+    looked_up: list[str] = []
+
+    progress = session_cli._Progress(size_lookup=looked_up.append, live_byte_counter=False)
+    progress.make_wrapper(1, 2, "s3://bucket/clip.mp4")(io.BytesIO(b"x" * 50)).read()
+    assert looked_up == []
+
+    # Still consulted when the counter is there to show it.
+    live = session_cli._Progress(size_lookup=looked_up.append, live_byte_counter=True)
+    live.make_wrapper(1, 1, "s3://bucket/clip.mp4")(io.BytesIO(b"x" * 50)).read()
+    assert looked_up == ["s3://bucket/clip.mp4"]
+
+
+def test_progress_writes_whole_lines_under_concurrent_hooks() -> None:
+    """Hooks run on worker threads, so a line must never be interleaved with another's."""
+    progress = session_cli._Progress(live_byte_counter=False)
+    written: list[str] = []
+    barrier = threading.Barrier(4, timeout=30)
+
+    def _start(index: int) -> None:
+        barrier.wait()
+        progress.start(index, 4, f"s3://bucket/clip{index}.mp4")
+
+    with io.StringIO() as buffer:
+        real_stderr, sys.stderr = sys.stderr, buffer
+        try:
+            threads = [threading.Thread(target=_start, args=(i,)) for i in range(1, 5)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            written = buffer.getvalue().splitlines()
+        finally:
+            sys.stderr = real_stderr
+
+    assert sorted(written) == sorted(f"[{i}/4] s3://bucket/clip{i}.mp4" for i in range(1, 5))
 
 
 def test_progress_falls_back_to_read_only_when_size_unknown(capsys: pytest.CaptureFixture[str]) -> None:

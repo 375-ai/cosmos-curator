@@ -42,11 +42,17 @@ credential flags, and reason strings.
 import argparse
 import io
 import sys
+import threading
 import time
 from collections.abc import Callable
 from typing import BinaryIO, cast
 
-from cosmos_curator.core.sensors.data_integrity.cli_common import non_negative_int, positive_finite_float
+from cosmos_curator.core.sensors.data_integrity.cli_common import (
+    available_cpu_count,
+    non_negative_int,
+    positive_finite_float,
+    positive_int,
+)
 from cosmos_curator.core.sensors.data_integrity.report import OverallStatus, StreamResult, render_text, to_json
 from cosmos_curator.core.sensors.data_integrity.session_runner import run_session
 from cosmos_curator.core.sensors.scripts._cli_cloud import (
@@ -113,6 +119,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="N",
         help="Cap the number of streams checked; 0 (default) means all. Useful for sampling a large session.",
     )
+    default_max_workers = available_cpu_count()
+    parser.add_argument(
+        "--max-workers",
+        type=positive_int,
+        default=default_max_workers,
+        metavar="N",
+        help=(
+            f"Streams to check concurrently (default: one per usable CPU, so {default_max_workers} here). "
+            "Each stream spends most of its time waiting on the source, so overlapping them helps most "
+            "on cloud sessions. Use 1 for serial checking and a live byte counter."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Emit the JSON report to stdout.")
     parser.add_argument(
         "--progress",
@@ -178,27 +196,50 @@ class _CountingReader(io.BufferedIOBase):
 class _Progress:
     """Per-stream progress printer for :func:`run_session` (stderr only).
 
-    Prints the source on start, an in-place refreshing ``N.N MB read`` counter as
-    the (cloud) stream is pulled, and the verdict on finish. All output goes to
-    stderr so the report / ``--json`` on stdout stays a clean single document.
+    Prints the source on start, the verdict on finish, and -- when checking one
+    stream at a time -- an in-place refreshing ``N.N MB read`` counter in between.
+    Concurrent streams cannot share that one redrawn line, so with several in flight
+    the counter is dropped and only the start/finish lines are printed; the byte
+    total still lands on the finish line. All output goes to stderr so the report /
+    ``--json`` on stdout stays a clean single document.
+
+    Hooks are called from :func:`run_session`'s worker threads, so writes are
+    serialised on a lock to keep lines from interleaving mid-write.
     """
 
-    def __init__(self, size_lookup: Callable[[str], int | None] | None = None) -> None:
+    def __init__(
+        self,
+        size_lookup: Callable[[str], int | None] | None = None,
+        *,
+        live_byte_counter: bool = True,
+    ) -> None:
         self._bytes: dict[int, int] = {}
         self._last_emit: dict[int, float] = {}
         self._size_lookup = size_lookup
+        self._live_byte_counter = live_byte_counter
+        self._lock = threading.Lock()
+
+    def _write(self, text: str) -> None:
+        with self._lock:
+            sys.stderr.write(text)
+            sys.stderr.flush()
 
     def start(self, index: int, total: int, source: str) -> None:
-        sys.stderr.write(f"[{index}/{total}] {source}\n")
-        sys.stderr.flush()
+        self._write(f"[{index}/{total}] {source}\n")
 
     def make_wrapper(self, index: int, total: int, source: str) -> Callable[[BinaryIO], BinaryIO]:
         # One cheap HEAD up front so the counter can show read / total (pct%);
         # None (unknown / lookup disabled) falls back to a bare "read" figure. The lookup
         # is injected, so guard it here instead of trusting every implementation to be
         # exception-safe -- a cosmetic byte count must never abandon the streams behind it.
+        #
+        # Skipped outright without the live counter, because that counter is the only
+        # thing that reads the total: the finish line reports bytes actually read. The
+        # lookup is not free enough to spend on a discarded value -- on a cloud source it
+        # builds a fresh client per stream, and that parsing holds the interpreter lock,
+        # so a dozen concurrent streams serialise behind it.
         total_bytes: int | None = None
-        if self._size_lookup is not None:
+        if self._live_byte_counter and self._size_lookup is not None:
             try:
                 total_bytes = self._size_lookup(source)
             except Exception:  # noqa: BLE001 - progress detail only; unknown size is fine
@@ -207,6 +248,8 @@ class _Progress:
         def _wrap(stream: BinaryIO) -> BinaryIO:
             def _on_bytes(count: int) -> None:
                 self._bytes[index] = count
+                if not self._live_byte_counter:
+                    return
                 now = time.monotonic()
                 if now - self._last_emit.get(index, 0.0) >= _PROGRESS_MIN_INTERVAL_S:
                     self._last_emit[index] = now
@@ -215,8 +258,7 @@ class _Progress:
                         detail = f"{count / 1e6:.1f}/{total_bytes / 1e6:.1f} MB ({pct}%)"
                     else:
                         detail = f"{count / 1e6:.1f} MB read"
-                    sys.stderr.write(f"\r[{index}/{total}]   {detail}")
-                    sys.stderr.flush()
+                    self._write(f"\r[{index}/{total}]   {detail}")
 
             return cast("BinaryIO", _CountingReader(stream, _on_bytes))
 
@@ -225,9 +267,10 @@ class _Progress:
     def finish(self, index: int, total: int, result: StreamResult) -> None:
         mb = self._bytes.get(index, 0) / 1e6
         tail = f" ({mb:.1f} MB read)" if mb else ""
-        # Leading \r + trailing pad overwrite any in-place byte counter on this line.
-        sys.stderr.write(f"\r[{index}/{total}] -> {result.status.value}{tail}          \n")
-        sys.stderr.flush()
+        # Leading \r + trailing pad overwrite the in-place byte counter on this line;
+        # with no counter drawn there is nothing to overwrite.
+        prefix, pad = ("\r", "          ") if self._live_byte_counter else ("", "")
+        self._write(f"{prefix}[{index}/{total}] -> {result.status.value}{tail}{pad}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -245,7 +288,7 @@ def main(argv: list[str] | None = None) -> int:
             endpoint_url=endpoint_url,
         )
 
-    progress = _Progress(size_lookup=_size_lookup) if args.progress else None
+    progress = _Progress(size_lookup=_size_lookup, live_byte_counter=args.max_workers == 1) if args.progress else None
     try:
         report = run_session(
             args.session_path,
@@ -255,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             s3_profile_name=args.s3_profile_name,
             azure_profile_name=args.azure_profile_name,
             endpoint_url=endpoint_url,
+            max_workers=args.max_workers,
             on_stream_start=progress.start if progress else None,
             on_stream_finish=progress.finish if progress else None,
             make_stream_wrapper=progress.make_wrapper if progress else None,

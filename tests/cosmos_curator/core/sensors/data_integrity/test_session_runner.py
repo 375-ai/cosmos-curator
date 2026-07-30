@@ -16,6 +16,8 @@
 """Unit tests for the session runner (run_stream + run_session)."""
 
 import pathlib
+import threading
+import time
 from collections.abc import Iterator
 from fractions import Fraction
 from types import SimpleNamespace
@@ -221,3 +223,68 @@ def test_run_session_rejects_negative_batch_size_before_io(tmp_path: pathlib.Pat
     """run_session validates batch_size at the boundary, even for an empty session (no I/O)."""
     with pytest.raises(ValueError, match="batch_size"):
         run_session(str(tmp_path), batch_size=-1)
+
+
+@pytest.mark.parametrize("bad_workers", [0, -1])
+def test_run_session_rejects_non_positive_max_workers_before_io(tmp_path: pathlib.Path, bad_workers: int) -> None:
+    """run_session validates max_workers at the boundary, even for an empty session (no I/O)."""
+    with pytest.raises(ValueError, match="max_workers"):
+        run_session(str(tmp_path), max_workers=bad_workers)
+
+
+@pytest.mark.parametrize("max_workers", [1, 4])
+def test_run_session_keeps_discovery_order_regardless_of_completion_order(
+    monkeypatch: pytest.MonkeyPatch, max_workers: int
+) -> None:
+    """Concurrency must not reorder the report: slow streams still land in discovery order."""
+    sources = ["a", "b", "c", "d"]
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: sources)
+
+    def _one(source: str, **_kwargs: object) -> StreamResult:
+        # Reverse the completion order relative to submission.
+        time.sleep(0.02 * (len(sources) - sources.index(source)))
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "_run_one_stream", _one)
+
+    report = run_session("sess", max_workers=max_workers)
+
+    assert [s.source for s in report.streams] == sources
+
+
+def test_run_session_overlaps_streams_when_given_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Streams genuinely run at the same time, rather than merely reporting as if they had.
+
+    Each stream waits on a barrier that only trips once all four are inside it, so this
+    cannot pass unless four are in flight together.
+    """
+    workers = 4
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: ["a", "b", "c", "d"])
+    barrier = threading.Barrier(workers, timeout=30)
+
+    def _one(source: str, **_kwargs: object) -> StreamResult:
+        barrier.wait()
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "_run_one_stream", _one)
+
+    report = run_session("sess", max_workers=workers)
+
+    assert report.status is OverallStatus.PASS
+    assert len(report.streams) == workers
+
+
+def test_run_session_serial_does_not_use_worker_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default keeps the work on the caller's thread, so hooks stay where callers expect."""
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: ["a"])
+    threads: list[str] = []
+
+    def _one(source: str, **_kwargs: object) -> StreamResult:
+        threads.append(threading.current_thread().name)
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "_run_one_stream", _one)
+
+    run_session("sess")
+
+    assert threads == [threading.current_thread().name]

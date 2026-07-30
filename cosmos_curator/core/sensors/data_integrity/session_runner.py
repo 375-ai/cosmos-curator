@@ -28,6 +28,7 @@ already-open sensor, packaging its output as a :class:`StreamResult`.
 """
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import BinaryIO
 
 from loguru import logger
@@ -43,6 +44,7 @@ from cosmos_curator.core.sensors.data_integrity.cli_common import (
     run_metrics,
     validate_expected_hz,
     validate_non_negative_int,
+    validate_positive_int,
 )
 from cosmos_curator.core.sensors.data_integrity.discovery import discover_streams
 from cosmos_curator.core.sensors.data_integrity.report import SessionReport, StreamResult
@@ -151,6 +153,7 @@ def run_session(  # noqa: PLR0913
     s3_profile_name: str | None = None,
     azure_profile_name: str = "default",
     endpoint_url: str | None = None,
+    max_workers: int = 1,
     on_stream_start: Callable[[int, int, str], None] | None = None,
     on_stream_finish: Callable[[int, int, StreamResult], None] | None = None,
     make_stream_wrapper: Callable[[int, int, str], Callable[[BinaryIO], BinaryIO]] | None = None,
@@ -167,10 +170,16 @@ def run_session(  # noqa: PLR0913
         s3_profile_name: optional AWS profile for ``s3://`` sources.
         azure_profile_name: Azure profile for ``az://`` sources.
         endpoint_url: optional S3 endpoint override for S3-compatible stores.
+        max_workers: how many streams to check concurrently. ``1`` (default) keeps
+            everything on the calling thread. Higher values overlap the per-stream
+            waits, which dominate on cloud sources. Hooks are then called from
+            worker threads and must be thread-safe; results stay in discovery order
+            either way.
         on_stream_start: optional progress hook called *before* each stream is
-            opened, with ``(index, total, source)`` (``index`` is 1-based). Streams
-            are processed serially, so this is the point at which a slow open/decode
-            begins; callers use it to show live progress.
+            opened, with ``(index, total, source)`` (``index`` is 1-based). This is
+            the point at which a slow open/decode begins; callers use it to show
+            live progress. With ``max_workers`` above 1 several streams are in
+            flight at once, so these interleave with ``on_stream_finish``.
         on_stream_finish: optional progress hook called *after* each stream, with
             ``(index, total, result)``.
         make_stream_wrapper: optional factory called with ``(index, total, source)``
@@ -181,13 +190,15 @@ def run_session(  # noqa: PLR0913
         A :class:`SessionReport` with one :class:`StreamResult` per discovered stream.
 
     Raises:
-        ValueError: if ``expected_hz``, ``batch_size``, or ``limit`` is invalid.
+        ValueError: if ``expected_hz``, ``batch_size``, ``limit``, or ``max_workers``
+            is invalid.
 
     """
     # Fail fast at the public boundary, before any discovery / I/O, so an invalid
     # config errors deterministically even for a session with zero streams.
     expected_hz = validate_expected_hz(expected_hz)
     batch_size = validate_non_negative_int("batch_size", batch_size)
+    max_workers = validate_positive_int("max_workers", max_workers)
     sources = discover_streams(
         session_path,
         limit=limit,
@@ -196,8 +207,9 @@ def run_session(  # noqa: PLR0913
         endpoint_url=endpoint_url,
     )
     total = len(sources)
-    streams: list[StreamResult] = []
-    for index, source in enumerate(sources, start=1):
+
+    def _check(numbered: tuple[int, str]) -> StreamResult:
+        index, source = numbered
         if on_stream_start is not None:
             on_stream_start(index, total, source)
         stream_wrapper = make_stream_wrapper(index, total, source) if make_stream_wrapper is not None else None
@@ -211,7 +223,20 @@ def run_session(  # noqa: PLR0913
             endpoint_url=endpoint_url,
             stream_wrapper=stream_wrapper,
         )
-        streams.append(result)
         if on_stream_finish is not None:
             on_stream_finish(index, total, result)
+        return result
+
+    work = list(enumerate(sources, start=1))
+    if max_workers == 1:
+        # Kept distinct from the pool so the default stays free of worker threads and
+        # the hooks keep firing on the caller's own thread.
+        streams = [_check(item) for item in work]
+    else:
+        # Threads, not processes: the time goes to network waits and to libav, both of
+        # which release the GIL, and each stream builds its own cloud client and
+        # decoder rather than sharing one. ``map`` yields in submission order, so the
+        # report stays deterministic regardless of completion order.
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="di-stream") as pool:
+            streams = list(pool.map(_check, work))
     return SessionReport(session_path=session_path, streams=streams)

@@ -22,7 +22,6 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from fractions import Fraction
-from itertools import islice
 from typing import (
     Any,
     BinaryIO,
@@ -617,8 +616,17 @@ def _get_video_index_from_header(
 # A composition offset, when present, manifests on the earliest packets, so a
 # small prefix is enough; this keeps the FROM_HEADER fast path from degrading
 # into a full demux. The bound is the residual gap the AUTO heuristic accepts:
-# an offset that first appears only after this many packets is not detected.
+# an offset that first appears only after this prefix is not detected.
+#
+# Two bounds apply, whichever is reached first. The packet count bounds how much
+# of the timeline is examined; the byte budget bounds what examining it costs to
+# fetch, which matters because mean packet size varies by orders of magnitude
+# between sources. At a few KB per packet the count is reached first and the
+# budget never binds, so short-packet streams keep the full 300-packet window.
+# Without the budget, a 165 KB-per-packet camera stream pulls ~50 MB over the
+# wire purely to decide that it may use the free header index.
 _AUTO_COMPOSITION_PROBE_PACKETS = 300
+_AUTO_COMPOSITION_PROBE_BYTES = 4 * 1024 * 1024
 
 
 def _has_composition_offset(container: InputContainer, stream_idx: int) -> bool:
@@ -626,15 +634,28 @@ def _has_composition_offset(container: InputContainer, stream_idx: int) -> bool:
 
     A composition offset means ``PTS = DTS + offset`` for some packets, so the
     DTS-based ``FROM_HEADER`` index would not match presentation order even when
-    no B-frames are signaled. Detected by checking the first
-    :data:`_AUTO_COMPOSITION_PROBE_PACKETS` packets that carry both timestamps for
-    any ``pts != dts`` (packets missing PTS or DTS are ignored, and the bound
-    applies to packets actually inspected).
+    no B-frames are signaled. Detected by scanning a bounded prefix for any
+    ``pts != dts``; packets missing either timestamp are not inspected, though
+    they are still charged against the byte budget because demuxing them cost
+    that much to fetch.
+
+    The scan stops at :data:`_AUTO_COMPOSITION_PROBE_PACKETS` inspected packets or
+    :data:`_AUTO_COMPOSITION_PROBE_BYTES` demuxed bytes, whichever comes first. The
+    byte budget is checked after each packet rather than before, so the true
+    ceiling is the budget plus one packet: a bound cannot be enforced on a packet
+    whose size is only known once it has been read.
     """
-    timed_packets = (
-        packet for packet in container.demux(video=stream_idx) if packet.pts is not None and packet.dts is not None
-    )
-    return any(packet.pts != packet.dts for packet in islice(timed_packets, _AUTO_COMPOSITION_PROBE_PACKETS))
+    inspected = 0
+    remaining = _AUTO_COMPOSITION_PROBE_BYTES
+    for packet in container.demux(video=stream_idx):
+        if packet.pts is not None and packet.dts is not None:
+            if packet.pts != packet.dts:
+                return True
+            inspected += 1
+        remaining -= packet.size
+        if inspected >= _AUTO_COMPOSITION_PROBE_PACKETS or remaining <= 0:
+            break
+    return False
 
 
 def _resolve_auto_index_method(

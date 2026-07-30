@@ -1688,10 +1688,28 @@ def test_make_index_and_metadata_auto_routes_by_b_frames(h264_video: Callable[..
     assert auto_n == header_n  # no B-frames → AUTO takes the fast FROM_HEADER path
 
 
-def _fake_container(pts_dts: list[tuple[int | None, int | None]]) -> SimpleNamespace:
+def _fake_container(pts_dts: list[tuple[int | None, int | None]], size: int = 1) -> SimpleNamespace:
     """Return a stand-in container whose ``demux`` yields packets with the given pts/dts."""
-    packets = [SimpleNamespace(pts=pts, dts=dts) for pts, dts in pts_dts]
+    packets = [SimpleNamespace(pts=pts, dts=dts, size=size) for pts, dts in pts_dts]
     return SimpleNamespace(demux=lambda **_kw: iter(packets))
+
+
+def _endless_container(size: int, *, timed: bool = True) -> tuple[SimpleNamespace, Callable[[], int]]:
+    """Return a never-ending container of equal packets, plus a count of those demuxed.
+
+    Packets always carry ``pts == dts`` so the probe never short-circuits on a
+    detection; only its bounds can stop it, and an unbounded probe hangs.
+    """
+    consumed = 0
+
+    def gen() -> Iterator[SimpleNamespace]:
+        nonlocal consumed
+        while True:
+            consumed += 1
+            stamp = consumed if timed else None
+            yield SimpleNamespace(pts=stamp, dts=stamp, size=size)
+
+    return SimpleNamespace(demux=lambda **_kw: gen()), lambda: consumed
 
 
 def test_has_composition_offset_detects_pts_dts_gap() -> None:
@@ -1712,16 +1730,37 @@ def test_has_composition_offset_skips_packets_missing_timestamps() -> None:
 def test_has_composition_offset_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     """The probe stops after the bounded prefix instead of scanning the whole stream."""
     monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._AUTO_COMPOSITION_PROBE_PACKETS", 4)
-    consumed = 0
+    container, consumed = _endless_container(size=1)  # tiny packets: the count binds, not the budget
 
-    def gen() -> object:
-        nonlocal consumed
-        while True:
-            consumed += 1
-            yield SimpleNamespace(pts=consumed, dts=consumed)  # always equal → never short-circuits
+    assert _has_composition_offset(container, 0) is False
+    assert consumed() == 4  # stopped at the bound, did not run the infinite stream
 
-    assert _has_composition_offset(SimpleNamespace(demux=lambda **_kw: gen()), 0) is False
-    assert consumed == 4  # stopped at the bound, did not run the infinite stream
+
+def test_has_composition_offset_stops_on_the_byte_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Large packets exhaust the byte budget long before the packet count is reached.
+
+    This is the case that made a 300-packet probe fetch half of a 165 KB-per-packet
+    camera file just to clear the stream for the free header index.
+    """
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._AUTO_COMPOSITION_PROBE_PACKETS", 300)
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._AUTO_COMPOSITION_PROBE_BYTES", 1000)
+    container, consumed = _endless_container(size=400)
+
+    assert _has_composition_offset(container, 0) is False
+    assert consumed() == 3  # 3 x 400 B overruns the 1000 B budget; the packet count never binds
+
+
+def test_has_composition_offset_charges_untimed_packets_to_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Packets without timestamps still cost bytes, so they cannot extend the scan.
+
+    They are not inspected and so never advance the packet count; if they were also
+    exempt from the budget, a stream of them would leave the probe unbounded.
+    """
+    monkeypatch.setattr("cosmos_curator.core.sensors.utils.video._AUTO_COMPOSITION_PROBE_BYTES", 1000)
+    container, consumed = _endless_container(size=400, timed=False)
+
+    assert _has_composition_offset(container, 0) is False
+    assert consumed() == 3
 
 
 def test_resolve_auto_uses_full_demux_on_composition_offset(
