@@ -48,10 +48,19 @@ from collections.abc import Callable
 from typing import BinaryIO, cast
 
 from cosmos_curator.core.sensors.data_integrity.cli_common import (
+    ERROR_EXIT_CODE,
+    FAIL_EXIT_CODE,
+    PASS_EXIT_CODE,
+    add_threshold_args,
     available_cpu_count,
+    interrupt_guard,
     non_negative_int,
     positive_finite_float,
     positive_int,
+    raise_if_interrupted,
+    report_error,
+    report_interrupted,
+    thresholds_from_args,
 )
 from cosmos_curator.core.sensors.data_integrity.report import OverallStatus, StreamResult, render_text, to_json
 from cosmos_curator.core.sensors.data_integrity.session_runner import run_session
@@ -63,11 +72,7 @@ from cosmos_curator.core.sensors.scripts._cli_cloud import (
     resolve_s3_endpoint_url,
 )
 
-PASS_EXIT_CODE = 0
-FAIL_EXIT_CODE = 1
-ERROR_EXIT_CODE = 2
-
-# Session verdict -> process exit code. Mirrors the single-video CLI's contract:
+# Session verdict -> process exit code. Uses the shared CLI exit-code contract:
 # PASS = 0, FAIL = 1, and anything that could not be checked (ERROR) = 2.
 _EXIT_CODES = {
     OverallStatus.PASS: PASS_EXIT_CODE,
@@ -81,8 +86,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         prog="di-session",
         description="Run every data-integrity metric against every stream of a single session.",
         epilog=(
-            "Exit codes: 0 = every stream PASS; 1 = at least one stream FAIL and none errored; "
-            "2 = a stream could not be opened/decoded, no streams were discovered, or an input error occurred. "
+            "Exit codes: 0 = every stream PASS; 1 = at least one stream FAIL; 2 = an error occurred; "
+            "130 = interrupted with Ctrl-C. "
             "A stream that could not be measured outranks a FAIL, since the session verdict stays incomplete."
         ),
     )
@@ -141,6 +146,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "(default: on). stdout stays a clean report / JSON payload. Use --no-progress to silence."
         ),
     )
+    add_threshold_args(parser)
     add_cloud_credential_args(parser)
     return parser.parse_args(argv)
 
@@ -186,11 +192,14 @@ class _CountingReader(io.BufferedIOBase):
     def tell(self) -> int:
         return self._raw.tell()
 
+    # Delegated rather than hardcoded to True, for the reason given on the cancellable
+    # reader: a wrapper that overstates its stream's capabilities defeats the sensor
+    # library's own precondition check.
     def seekable(self) -> bool:
-        return True
+        return self._raw.seekable()
 
     def readable(self) -> bool:
-        return True
+        return self._raw.readable()
 
 
 class _Progress:
@@ -289,31 +298,59 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     progress = _Progress(size_lookup=_size_lookup, live_byte_counter=args.max_workers == 1) if args.progress else None
+    with interrupt_guard() as interrupted:
+        try:
+            return _run(args, endpoint_url, progress, interrupted)
+        # Caught out here rather than inside _run so that an abort recognised *while*
+        # another failure is being handled still lands on it: a handler cannot be caught
+        # by its own siblings.
+        except KeyboardInterrupt:
+            return report_interrupted()
+
+
+def _run(
+    args: argparse.Namespace, endpoint_url: str | None, progress: "_Progress | None", interrupted: threading.Event
+) -> int:
+    """Body of :func:`main`, split out so the interrupt guard wraps the whole attempt.
+
+    Raises:
+        KeyboardInterrupt: If the operator aborted, including when libav disguised the
+            abort as a decode error. :func:`main` turns it into the exit code.
+
+    """
     try:
         report = run_session(
             args.session_path,
             expected_hz=args.expected_hz,
+            thresholds=thresholds_from_args(args),
             batch_size=args.batch_size,
             limit=args.limit,
             s3_profile_name=args.s3_profile_name,
             azure_profile_name=args.azure_profile_name,
             endpoint_url=endpoint_url,
             max_workers=args.max_workers,
+            cancel=interrupted,
             on_stream_start=progress.start if progress else None,
             on_stream_finish=progress.finish if progress else None,
             make_stream_wrapper=progress.make_wrapper if progress else None,
         )
+        # Checked after a *successful* run too, and not only inside the runner: libav
+        # can swallow the abort and finish off a truncated stream, while discovery
+        # never reaches a read at all, so a returned report is not evidence that the
+        # operator still wants it.
+        raise_if_interrupted(interrupted)
         # Rendering and writing stay inside the handler: serializing a report can fail
         # (non-finite measurements) and so can the write itself (a closed pipe), and both
         # owe the caller exit code 2 rather than a traceback.
         sys.stdout.write((to_json(report) if args.json else render_text(report)) + "\n")
         return _EXIT_CODES[report.status]
     except (CloudCliError, FileNotFoundError) as e:
-        sys.stderr.write(f"error: {e}\n")
-        return ERROR_EXIT_CODE
+        return report_error(str(e))
     except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"error: could not check session {args.session_path!r}: {e}\n")
-        return ERROR_EXIT_CODE
+        # A Ctrl-C inside a libav read arrives here as a decode error rather than a
+        # KeyboardInterrupt, so trust the recorded signal over the exception type.
+        raise_if_interrupted(interrupted)
+        return report_error(f"could not check session {args.session_path!r}: {e}")
 
 
 if __name__ == "__main__":

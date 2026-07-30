@@ -27,6 +27,7 @@ per-stream ``ERROR``, and aggregates the results into a :class:`SessionReport`.
 already-open sensor, packaging its output as a :class:`StreamResult`.
 """
 
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import BinaryIO
@@ -40,6 +41,8 @@ from cosmos_curator.core.sensors.data_integrity.cli_common import (
     ResolvedConfig,
     Thresholds,
     VideoInfo,
+    cancellable_reader,
+    raise_if_interrupted,
     run_checks,
     run_metrics,
     validate_expected_hz,
@@ -110,8 +113,15 @@ def _run_one_stream(  # noqa: PLR0913
     azure_profile_name: str,
     endpoint_url: str | None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
+    cancel: threading.Event | None = None,
 ) -> StreamResult:
-    """Open a single stream and run the integrity metrics, capturing failures as ERROR."""
+    """Open a single stream and run the integrity metrics, capturing failures as ERROR.
+
+    Raises:
+        KeyboardInterrupt: If *cancel* was set, rather than reporting the aborted read
+            as this stream's verdict.
+
+    """
     try:
         metrics, video_info, resolved_cfg = run_checks(
             source,
@@ -129,6 +139,10 @@ def _run_one_stream(  # noqa: PLR0913
     # is reported as ERROR. The traceback is logged at DEBUG so a genuine bug in the
     # engine is still diagnosable rather than flattened into a one-line message.
     except Exception as exc:  # noqa: BLE001 - see above; per-stream isolation is the contract
+        # An abort is a casualty, not a diagnosis: cancelling makes the reader report EOF,
+        # which libav raises as a decode error, so every stream still in flight would log
+        # an annotated traceback and bury the interrupt message that follows.
+        raise_if_interrupted(cancel)
         logger.opt(exception=True).debug("data-integrity run failed for {}", source)
         return StreamResult(
             source=source,
@@ -154,6 +168,7 @@ def run_session(  # noqa: PLR0913
     azure_profile_name: str = "default",
     endpoint_url: str | None = None,
     max_workers: int = 1,
+    cancel: threading.Event | None = None,
     on_stream_start: Callable[[int, int, str], None] | None = None,
     on_stream_finish: Callable[[int, int, StreamResult], None] | None = None,
     make_stream_wrapper: Callable[[int, int, str], Callable[[BinaryIO], BinaryIO]] | None = None,
@@ -175,6 +190,12 @@ def run_session(  # noqa: PLR0913
             waits, which dominate on cloud sources. Hooks are then called from
             worker threads and must be thread-safe; results stay in discovery order
             either way.
+        cancel: optional event that asks the session to stop. Cloud reads abort at
+            their next boundary once it is set, and no further stream is opened; the
+            run then ends by raising ``KeyboardInterrupt``, since a session stopped
+            part-way has no verdict to report. CLIs pass the event that their SIGINT
+            handler sets (see
+            :func:`~cosmos_curator.core.sensors.data_integrity.cli_common.interrupt_guard`).
         on_stream_start: optional progress hook called *before* each stream is
             opened, with ``(index, total, source)`` (``index`` is 1-based). This is
             the point at which a slow open/decode begins; callers use it to show
@@ -192,6 +213,8 @@ def run_session(  # noqa: PLR0913
     Raises:
         ValueError: if ``expected_hz``, ``batch_size``, ``limit``, or ``max_workers``
             is invalid.
+        KeyboardInterrupt: on cancellation, so the caller owns the exit status rather
+            than receiving a report for a session that never finished.
 
     """
     # Fail fast at the public boundary, before any discovery / I/O, so an invalid
@@ -208,11 +231,25 @@ def run_session(  # noqa: PLR0913
     )
     total = len(sources)
 
+    def _wrapper_for(index: int, source: str) -> Callable[[BinaryIO], BinaryIO] | None:
+        """Compose the caller's stream wrapper, if any, with cancellation."""
+        caller_wrapper = make_stream_wrapper(index, total, source) if make_stream_wrapper is not None else None
+        if cancel is None:
+            return caller_wrapper
+        # Cancellation goes outermost so its check runs before the caller's wrapper
+        # forwards the read, and applies whether or not a caller supplied one.
+        return lambda stream: cancellable_reader(
+            caller_wrapper(stream) if caller_wrapper is not None else stream, cancel
+        )
+
     def _check(numbered: tuple[int, str]) -> StreamResult:
         index, source = numbered
+        # Raised from worker threads too: the exception is stored on that stream's
+        # future, and ``Executor.map`` re-raises it on the caller while abandoning
+        # the backlog.
+        raise_if_interrupted(cancel)
         if on_stream_start is not None:
             on_stream_start(index, total, source)
-        stream_wrapper = make_stream_wrapper(index, total, source) if make_stream_wrapper is not None else None
         result = _run_one_stream(
             source,
             expected_hz=expected_hz,
@@ -221,8 +258,13 @@ def run_session(  # noqa: PLR0913
             s3_profile_name=s3_profile_name,
             azure_profile_name=azure_profile_name,
             endpoint_url=endpoint_url,
-            stream_wrapper=stream_wrapper,
+            stream_wrapper=_wrapper_for(index, source),
+            cancel=cancel,
         )
+        # Checked again because the stream may have *succeeded* despite the abort: libav
+        # can swallow it and finish off a truncated source, and that verdict is no more
+        # reportable than the aborted one, nor are the streams still queued behind it.
+        raise_if_interrupted(cancel)
         if on_stream_finish is not None:
             on_stream_finish(index, total, result)
         return result

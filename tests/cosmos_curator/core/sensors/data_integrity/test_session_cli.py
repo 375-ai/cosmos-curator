@@ -18,13 +18,23 @@
 import io
 import json
 import pathlib
+import signal
 import sys
 import threading
 
 import pytest
 
 from cosmos_curator.core.sensors.data_integrity import session_cli
-from cosmos_curator.core.sensors.data_integrity.cli_common import CheckResult, CheckStatus
+from cosmos_curator.core.sensors.data_integrity.cli_common import (
+    DEFAULT_THRESHOLDS,
+    ERROR_EXIT_CODE,
+    FAIL_EXIT_CODE,
+    INTERRUPTED_EXIT_CODE,
+    PASS_EXIT_CODE,
+    CheckResult,
+    CheckStatus,
+    Thresholds,
+)
 from cosmos_curator.core.sensors.data_integrity.report import SessionReport, StreamResult
 from cosmos_curator.core.sensors.scripts._cli_cloud import CloudCliError
 
@@ -58,7 +68,7 @@ def test_exit_code_pass(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureF
         session_cli, "run_session", lambda *_a, **_k: SessionReport("s", [_stream("a", CheckStatus.PASS)])
     )
     code = session_cli.main(["--session-path", "s"])
-    assert code == session_cli.PASS_EXIT_CODE
+    assert code == PASS_EXIT_CODE
     assert "Session overall: PASS" in capsys.readouterr().out
 
 
@@ -67,7 +77,7 @@ def test_exit_code_fail(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         session_cli, "run_session", lambda *_a, **_k: SessionReport("s", [_stream("a", CheckStatus.FAIL)])
     )
-    assert session_cli.main(["--session-path", "s"]) == session_cli.FAIL_EXIT_CODE
+    assert session_cli.main(["--session-path", "s"]) == FAIL_EXIT_CODE
 
 
 def test_unmeasured_stream_exits_error_even_alongside_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -79,7 +89,83 @@ def test_unmeasured_stream_exits_error_even_alongside_a_failure(monkeypatch: pyt
     """
     report = SessionReport("s", [_stream("a", CheckStatus.FAIL), _stream("b", CheckStatus.PASS, error="boom")])
     monkeypatch.setattr(session_cli, "run_session", lambda *_a, **_k: report)
-    assert session_cli.main(["--session-path", "s"]) == session_cli.ERROR_EXIT_CODE
+    assert session_cli.main(["--session-path", "s"]) == ERROR_EXIT_CODE
+
+
+def test_threshold_flags_reach_the_session_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Policy flags are forwarded to the runner, and default to the neutral policy."""
+    seen: dict[str, object] = {}
+
+    def _run(*_a: object, **kwargs: object) -> SessionReport:
+        seen.update(kwargs)
+        return SessionReport("s", [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _run)
+
+    assert session_cli.main(["--session-path", "s"]) == PASS_EXIT_CODE
+    assert seen["thresholds"] == DEFAULT_THRESHOLDS
+
+    assert session_cli.main(["--session-path", "s", "--max-gaps", "4", "--allow-frame-reordering"]) == 0
+    assert seen["thresholds"] == Thresholds(max_gaps=4, allow_frame_reordering=True)
+
+
+def test_interrupt_exits_without_a_report(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """Ctrl-C exits 130 and writes no report.
+
+    A session cut short has an unknown verdict, so emitting a partial report would
+    invite reading it as the whole session; the exit code carries the outcome instead.
+    """
+
+    def _interrupt(*_a: object, **_k: object) -> SessionReport:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(session_cli, "run_session", _interrupt)
+
+    assert session_cli.main(["--session-path", "s"]) == INTERRUPTED_EXIT_CODE
+    captured = capsys.readouterr()
+    assert "interrupted" in captured.err
+    assert captured.out == ""
+
+
+def test_interrupt_masked_as_a_decode_error_still_reports_an_interruption(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A Ctrl-C that libav reports as a decode error is still reported as an abort."""
+
+    def _fail_as_libav_would(*_a: object, **_k: object) -> SessionReport:
+        signal.raise_signal(signal.SIGINT)
+        msg = "Invalid data found when processing input"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(session_cli, "run_session", _fail_as_libav_would)
+
+    assert session_cli.main(["--session-path", "s"]) == INTERRUPTED_EXIT_CODE
+    captured = capsys.readouterr()
+    assert "interrupted" in captured.err
+    assert "Invalid data" not in captured.err
+    assert captured.out == ""
+
+
+def test_interrupt_swallowed_by_libav_still_reports_an_interruption(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A session that returns a report despite the Ctrl-C reports the abort instead.
+
+    libav can absorb the abort in its seek callback, retry, and finish the stream, and a
+    discovery listing never reaches a read so cannot notice the event at all. In neither
+    case is a returned report evidence that the operator still wants the answer.
+    """
+
+    def _finish_anyway(*_a: object, **_k: object) -> SessionReport:
+        signal.raise_signal(signal.SIGINT)  # cooperative: sets the flag, does not raise
+        return SessionReport("s", [_stream("a", CheckStatus.PASS)])
+
+    monkeypatch.setattr(session_cli, "run_session", _finish_anyway)
+
+    assert session_cli.main(["--session-path", "s"]) == INTERRUPTED_EXIT_CODE
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "interrupted" in captured.err
 
 
 def test_render_failure_exits_error(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -93,14 +179,14 @@ def test_render_failure_exits_error(monkeypatch: pytest.MonkeyPatch, capsys: pyt
         raise ValueError(msg)
 
     monkeypatch.setattr(session_cli, "render_text", _boom)
-    assert session_cli.main(["--session-path", "s"]) == session_cli.ERROR_EXIT_CODE
+    assert session_cli.main(["--session-path", "s"]) == ERROR_EXIT_CODE
     assert "error:" in capsys.readouterr().err
 
 
 def test_exit_code_error_on_empty_session(monkeypatch: pytest.MonkeyPatch) -> None:
     """A session with no discovered streams exits 2 (ERROR)."""
     monkeypatch.setattr(session_cli, "run_session", lambda *_a, **_k: SessionReport("s", []))
-    assert session_cli.main(["--session-path", "s"]) == session_cli.ERROR_EXIT_CODE
+    assert session_cli.main(["--session-path", "s"]) == ERROR_EXIT_CODE
 
 
 def test_json_output_is_valid(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
@@ -117,7 +203,7 @@ def test_json_output_is_valid(monkeypatch: pytest.MonkeyPatch, capsys: pytest.Ca
 def test_missing_local_path_exits_error(capsys: pytest.CaptureFixture[str]) -> None:
     """A nonexistent local session path is a clean ERROR exit, not a traceback."""
     code = session_cli.main(["--session-path", "/no/such/session/dir"])
-    assert code == session_cli.ERROR_EXIT_CODE
+    assert code == ERROR_EXIT_CODE
     assert "error:" in capsys.readouterr().err
 
 
@@ -183,7 +269,7 @@ def test_explicit_max_workers_overrides_the_cpu_default(monkeypatch: pytest.Monk
 def test_bogus_video_dir_is_error(tmp_path: pathlib.Path) -> None:
     """End-to-end (no mocks): a dir of undecodable mp4s discovers streams but exits ERROR."""
     (tmp_path / "a.mp4").write_bytes(b"not a real video")
-    assert session_cli.main(["--session-path", str(tmp_path)]) == session_cli.ERROR_EXIT_CODE
+    assert session_cli.main(["--session-path", str(tmp_path)]) == ERROR_EXIT_CODE
 
 
 def test_progress_lines_go_to_stderr(tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]) -> None:

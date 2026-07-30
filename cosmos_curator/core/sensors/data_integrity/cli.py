@@ -42,17 +42,27 @@ argument surface, and the exit-code contract.
 import argparse
 import json
 import sys
+import threading
 import time
 
 from cosmos_curator.core.sensors.data_integrity.cli_common import (
+    FAIL_EXIT_CODE,
+    PASS_EXIT_CODE,
     CheckResult,
     CheckStatus,
     ResolvedConfig,
     VideoInfo,
+    add_threshold_args,
+    cancellable_reader,
+    interrupt_guard,
     non_negative_int,
     overall_status,
     positive_finite_float,
+    raise_if_interrupted,
+    report_error,
+    report_interrupted,
     run_checks,
+    thresholds_from_args,
 )
 from cosmos_curator.core.sensors.scripts._cli_cloud import (
     CloudCliError,
@@ -60,10 +70,6 @@ from cosmos_curator.core.sensors.scripts._cli_cloud import (
     resolve_s3_endpoint_url,
     validate_source,
 )
-
-PASS_EXIT_CODE = 0
-FAIL_EXIT_CODE = 1
-ERROR_EXIT_CODE = 2
 
 
 def _format_expected_hz_line(resolved_cfg: ResolvedConfig) -> str:
@@ -156,7 +162,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         description="Run every data-integrity metric against a single video and print the verdict.",
         epilog=(
             "Exit codes: 0 = every check PASS or SKIPPED; 1 = at least one FAIL; "
-            "2 = input, credential, or runtime error."
+            "2 = input, credential, or runtime error; 130 = interrupted with Ctrl-C."
         ),
     )
     parser.add_argument(
@@ -196,6 +202,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="Emit per-phase wall-clock timings to stderr after the report.",
     )
+    add_threshold_args(parser)
     add_cloud_credential_args(parser)
     return parser.parse_args(argv)
 
@@ -204,18 +211,42 @@ def main(argv: list[str] | None = None) -> int:
     """Run every data-integrity metric on the supplied video and print the report."""
     args = _parse_args(argv)
     stats: dict[str, float] | None = {} if args.perf_profile else None
+    with interrupt_guard() as interrupted:
+        try:
+            return _run(args, stats, interrupted)
+        # Caught out here rather than inside _run so that an abort recognised *while*
+        # another failure is being handled still lands on it: a handler cannot be caught
+        # by its own siblings.
+        except KeyboardInterrupt:
+            return report_interrupted()
+
+
+def _run(args: argparse.Namespace, stats: dict[str, float] | None, interrupted: threading.Event) -> int:
+    """Body of :func:`main`, split out so the interrupt guard wraps the whole attempt.
+
+    Raises:
+        KeyboardInterrupt: If the operator aborted, including when libav disguised the
+            abort as a decode error. :func:`main` turns it into the exit code.
+
+    """
     try:
         validate_source(args.source)
         results, video_info, resolved_cfg = run_checks(
             args.source,
             expected_hz=args.expected_hz,
+            thresholds=thresholds_from_args(args),
             stream_idx=args.stream_idx,
             batch_size=args.batch_size,
             s3_profile_name=args.s3_profile_name,
             azure_profile_name=args.azure_profile_name,
             endpoint_url=resolve_s3_endpoint_url(args.endpoint_url),
             stats=stats,
+            stream_wrapper=lambda stream: cancellable_reader(stream, interrupted),
         )
+        # Checked after a *successful* run too: libav can swallow the abort and finish
+        # off a truncated source, and a report the operator has already walked away
+        # from is worse than none.
+        raise_if_interrupted(interrupted)
 
         # Rendering and writing stay inside the handler: serializing a report can fail
         # (non-finite measurements) and so can the write itself (a closed pipe), and both
@@ -236,11 +267,12 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(_render_perf(stats, video_info=video_info, batch_size=args.batch_size))
         return FAIL_EXIT_CODE if overall_status(results) is CheckStatus.FAIL else PASS_EXIT_CODE
     except CloudCliError as e:
-        sys.stderr.write(f"error: {e}\n")
-        return ERROR_EXIT_CODE
+        return report_error(str(e))
     except Exception as e:  # noqa: BLE001
-        sys.stderr.write(f"error: could not evaluate data integrity for {args.source!r}: {e}\n")
-        return ERROR_EXIT_CODE
+        # A Ctrl-C inside a libav read arrives here as a decode error rather than a
+        # KeyboardInterrupt, so trust the recorded signal over the exception type.
+        raise_if_interrupted(interrupted)
+        return report_error(f"could not evaluate data integrity for {args.source!r}: {e}")
 
 
 if __name__ == "__main__":

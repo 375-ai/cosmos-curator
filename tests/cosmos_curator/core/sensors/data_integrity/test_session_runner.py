@@ -15,19 +15,26 @@
 
 """Unit tests for the session runner (run_stream + run_session)."""
 
+import io
 import pathlib
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from fractions import Fraction
 from types import SimpleNamespace
+from typing import BinaryIO
 
 import numpy as np
 import pytest
 from numpy.typing import NDArray
 
 from cosmos_curator.core.sensors.data_integrity import session_runner
-from cosmos_curator.core.sensors.data_integrity.cli_common import CheckResult, CheckStatus, ExpectedHzSource
+from cosmos_curator.core.sensors.data_integrity.cli_common import (
+    DEFAULT_THRESHOLDS,
+    CheckResult,
+    CheckStatus,
+    ExpectedHzSource,
+)
 from cosmos_curator.core.sensors.data_integrity.report import OverallStatus, StreamResult
 from cosmos_curator.core.sensors.data_integrity.session_runner import run_session, run_stream
 
@@ -272,6 +279,141 @@ def test_run_session_overlaps_streams_when_given_workers(monkeypatch: pytest.Mon
 
     assert report.status is OverallStatus.PASS
     assert len(report.streams) == workers
+
+
+def test_cancelling_aborts_in_flight_reads_instead_of_waiting_for_them(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cancelled session stops at its next read boundary, not at the end of the download.
+
+    A thread inside libav cannot be preempted, so without a check on the read path the
+    pool's shutdown waits for every stream in flight -- on a wide session that is the
+    whole tail of a dozen large downloads, arriving long after the operator asked to
+    stop. The reader wrapper is what bounds that wait to one read.
+    """
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: ["a", "b", "c", "d"])
+    cancel = threading.Event()
+    reads_after_cancel = 0
+
+    class _Endless(io.RawIOBase):
+        """A source that never runs out, standing in for a large object."""
+
+        def read(self, _size: int | None = -1) -> bytes:
+            nonlocal reads_after_cancel
+            if cancel.is_set():
+                reads_after_cancel += 1
+            return b"\0" * 4096
+
+        def readable(self) -> bool:
+            return True
+
+    def _one(source: str, *, stream_wrapper: object = None, **_kwargs: object) -> StreamResult:
+        assert callable(stream_wrapper), "run_session must install a cancellation wrapper"
+        reader = stream_wrapper(_Endless())  # type: ignore[operator]
+        assert reader.read(4096) != b"", "reads must pass through until cancelled"
+        cancel.set()  # stand in for the SIGINT landing mid-read
+        # EOF, rather than an exception, is what stops the demuxer quietly.
+        assert reader.read(4096) == b""
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "_run_one_stream", _one)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_session("sess", max_workers=2, cancel=cancel)
+
+    assert reads_after_cancel == 0, "kept reading the source after the cancellation"
+
+
+def test_cancelling_wraps_the_callers_own_stream_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation composes with a caller's wrapper rather than displacing it.
+
+    The session CLI supplies a byte-counting reader for its progress display, so a
+    wrapper that replaced it would silently drop the download counter.
+    """
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: ["a"])
+    counted: list[int] = []
+
+    def _make_counter(_index: int, _total: int, _source: str) -> Callable[[BinaryIO], BinaryIO]:
+        def _wrap(stream: BinaryIO) -> BinaryIO:
+            counted.append(id(stream))
+            return stream
+
+        return _wrap
+
+    def _one(source: str, *, stream_wrapper: object = None, **_kwargs: object) -> StreamResult:
+        assert callable(stream_wrapper)
+        stream_wrapper(io.BytesIO(b"x"))  # type: ignore[operator]
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "_run_one_stream", _one)
+
+    run_session("sess", cancel=threading.Event(), make_stream_wrapper=_make_counter)
+
+    assert len(counted) == 1, "the caller's wrapper was not applied"
+
+
+def test_a_cancelled_stream_is_not_logged_as_a_failed_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An aborted read propagates instead of being diagnosed as this stream's failure.
+
+    Cancelling makes the reader report EOF, which libav raises as a decode error, so
+    without this every stream still in flight logs an annotated traceback and buries the
+    interrupt message: a real Ctrl-C on a 12-stream session produced ~450 lines of them.
+    """
+    cancel = threading.Event()
+    cancel.set()
+    logged: list[str] = []
+
+    def _explode(*_a: object, **_k: object) -> tuple[object, object, object]:
+        msg = "Invalid data found when processing input"
+        raise ValueError(msg)
+
+    monkeypatch.setattr(session_runner, "run_checks", _explode)
+    monkeypatch.setattr(session_runner.logger, "opt", lambda **_k: SimpleNamespace(debug=logged.append))
+
+    with pytest.raises(KeyboardInterrupt):
+        session_runner._run_one_stream(
+            "s3://b/k.mp4",
+            expected_hz=None,
+            thresholds=DEFAULT_THRESHOLDS,
+            batch_size=0,
+            s3_profile_name=None,
+            azure_profile_name="default",
+            endpoint_url=None,
+            cancel=cancel,
+        )
+
+    assert logged == [], "diagnosed an operator abort as a failed run"
+
+
+def test_interrupt_stops_starting_queued_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt propagates and the pool abandons its backlog rather than draining it.
+
+    This is a property of ``Executor.map``, which cancels its outstanding futures as it
+    unwinds; pinning it here guards the behaviour operators actually feel, since
+    dispatching the same work by hand (``submit`` plus ``as_completed``) would instead
+    download the entire backlog before exiting and look like a hang.
+    """
+    sources = ["boom", *[f"s{i}" for i in range(199)]]
+    monkeypatch.setattr(session_runner, "discover_streams", lambda *_a, **_k: sources)
+    started: list[str] = []
+    lock = threading.Lock()
+
+    def _one(source: str, **_kwargs: object) -> StreamResult:
+        with lock:
+            started.append(source)
+        if source == "boom":
+            raise KeyboardInterrupt
+        # Slow enough that burning through the backlog would take far longer than the
+        # microseconds the caller needs to flag the cancellation.
+        time.sleep(0.05)
+        return _canned(source, CheckStatus.PASS)
+
+    monkeypatch.setattr(session_runner, "_run_one_stream", _one)
+
+    with pytest.raises(KeyboardInterrupt):
+        run_session("sess", max_workers=2)
+
+    # Only streams already running when the interrupt landed may have started; the
+    # remaining ~190 are cancelled while still queued.
+    assert len(started) <= 10, f"kept starting streams after the interrupt: {started}"
 
 
 def test_run_session_serial_does_not_use_worker_threads(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -35,10 +35,15 @@ in :mod:`.cli`, the session rollup in :mod:`.report`.
 
 import argparse
 import enum
+import io
 import math
 import os
 import pathlib
+import signal
+import sys
+import threading
 import time
+import types
 from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager
 from typing import BinaryIO, Protocol, cast
@@ -75,6 +80,16 @@ NAME_REORDERING = "frame_reordering_present"
 # Reason attached to a rate-dependent check that has no usable expected rate.
 REASON_MISSING_HZ = "skipped: --expected-hz not provided and container header lacks a nominal frame rate"
 
+# Shared process exit codes for both CLIs. Keep them together so a wrapper can
+# depend on one contract: PASS / FAIL / ERROR / interrupted, never two variants
+# of the same status.
+# INTERRUPTED = 128 + SIGINT: the shell convention for "terminated by Ctrl-C".
+# Distinct from ERROR so a wrapper can tell an operator abort from a genuine failure to evaluate.
+PASS_EXIT_CODE = 0
+FAIL_EXIT_CODE = 1
+ERROR_EXIT_CODE = 2
+INTERRUPTED_EXIT_CODE = 130
+
 
 def positive_finite_float(raw: str) -> float:
     """Argparse ``type=`` for flags that must be strictly positive and finite (rejects 0, NaN, inf)."""
@@ -84,6 +99,22 @@ def positive_finite_float(raw: str) -> float:
     except ValueError:
         raise argparse.ArgumentTypeError(msg) from None
     if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError(msg)
+    return value
+
+
+def non_negative_finite_float(raw: str) -> float:
+    """Argparse ``type=`` for flags that must be non-negative and finite (rejects negatives, NaN, inf).
+
+    Distinct from :func:`positive_finite_float` because zero is meaningful for a
+    tolerance: ``--max-jitter-percent 0`` asks for an exactly uniform cadence.
+    """
+    msg = f"expected a non-negative finite number, got {raw!r}"
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(msg) from None
+    if not math.isfinite(value) or value < 0.0:
         raise argparse.ArgumentTypeError(msg)
     return value
 
@@ -141,6 +172,147 @@ def validate_positive_int(name: str, value: int) -> int:
         msg = f"{name} must be >= 1, got {value!r}"
         raise ValueError(msg)
     return value
+
+
+@contextmanager
+def interrupt_guard() -> Generator[threading.Event]:
+    """Turn SIGINT into a cooperative stop request, yielding the event that carries it.
+
+    The first Ctrl-C only sets the event; it deliberately does not raise. Python's
+    default handler raises ``KeyboardInterrupt`` wherever the interpreter happens to
+    be, and under this CLI that is usually inside one of libav's IO callbacks -- which
+    cannot carry a Python exception back out. What the operator gets instead is a
+    swallowed exception printed as a traceback, followed by libav either relabelling
+    the abort as an ``InvalidDataError`` (blaming the file) or recovering and finishing
+    the run as though nothing had been asked of it. Neither is an interruption.
+
+    So the stop is cooperative: readers abandon their source at the next boundary they
+    control (:func:`cancellable_reader`) and callers consult the event to decide the
+    outcome. Nothing is raised through libav, so nothing is printed by it.
+
+    A second Ctrl-C raises ``KeyboardInterrupt`` in the classic way, on the assumption
+    that an operator pressing it again wants out regardless of the mess -- the escape
+    hatch for anything that never reaches a read, such as a stalled bucket listing.
+
+    An event rather than a flag because worker threads read it too: only the main
+    thread receives the signal. The previous handler is restored on exit, keeping this
+    usable inside a library caller's process, and installation is only valid on the
+    main thread, which is where :mod:`signal` permits it.
+    """
+    interrupted = threading.Event()
+
+    def _on_sigint(_signum: int, _frame: types.FrameType | None) -> None:
+        if interrupted.is_set():
+            raise KeyboardInterrupt
+        interrupted.set()
+
+    previous = signal.signal(signal.SIGINT, _on_sigint)
+    try:
+        yield interrupted
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def raise_if_interrupted(cancel: threading.Event | None) -> None:
+    """Raise ``KeyboardInterrupt`` when a cooperative stop has been requested.
+
+    Call after a unit of work so a swallowed abort is not mistaken for a finished
+    run: libav can absorb the signal and return successfully on a truncated source.
+    ``None`` is a no-op so library callers that never install a handler stay quiet.
+    """
+    if cancel is not None and cancel.is_set():
+        raise KeyboardInterrupt
+
+
+def report_interrupted() -> int:
+    """Write the operator-abort message to stderr and return :data:`INTERRUPTED_EXIT_CODE`.
+
+    No report body is emitted: a partial or truncated verdict would be easy to
+    misread as the real answer. The leading newline clears the terminal's echoed
+    ``^C`` (and any progress line left mid-redraw).
+    """
+    sys.stderr.write("\ninterrupted: no report written\n")
+    return INTERRUPTED_EXIT_CODE
+
+
+def report_error(message: str) -> int:
+    """Write a one-line operator-facing error to stderr and return :data:`ERROR_EXIT_CODE`.
+
+    Shared so the ``error: `` prefix that wrappers grep for stays identical across both
+    CLIs and across every failure mode within them. Callers pass only the description;
+    what could not be done belongs at the call site, which knows what it was attempting.
+    """
+    sys.stderr.write(f"error: {message}\n")
+    return ERROR_EXIT_CODE
+
+
+class _CancellableReader(io.BufferedIOBase):
+    """Binary stream wrapper that reads as an exhausted source once a cancel event is set.
+
+    A thread blocked in libav cannot be preempted, so a cancellation is only as prompt
+    as the next boundary the reader itself controls. Checking one flag before each read
+    turns an abandoned session's tail from "as long as the largest in-flight file still
+    needs" into a single read's worth of latency. The check precedes the call so no
+    further range request is issued; the read already in progress still has to return.
+
+    Cancellation surfaces as end-of-file rather than as an exception because libav
+    cannot carry a Python exception out of its read callback: raising leaves the process
+    printing an unraisable-exception traceback for every abandoned stream, whereas a
+    short read is something a demuxer already knows how to end on. Reporting a source
+    as shorter than it is would be dangerous if anyone trusted the resulting index, so
+    it is safe only because the caller re-checks the same event and discards the result
+    (see :func:`~cosmos_curator.core.sensors.data_integrity.session_runner.run_session`).
+
+    ``read1`` / ``readinto`` route through ``read`` so the check holds whichever access
+    pattern PyAV uses, ``readable`` / ``seekable`` report the wrapped stream's own
+    capabilities rather than asserting both, and ``close`` is left alone because the
+    wrapped stream belongs to :func:`open_source`'s context manager.
+    """
+
+    def __init__(self, raw: BinaryIO, cancel: threading.Event) -> None:
+        super().__init__()
+        self._raw = raw
+        self._cancel = cancel
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._cancel.is_set():
+            return b""
+        return self._raw.read(size if size is not None else -1)
+
+    def read1(self, size: int = -1) -> bytes:
+        return self.read(size)
+
+    def readinto(self, b: "memoryview | bytearray") -> int:  # type: ignore[override]
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if self._cancel.is_set():
+            # Skipped, not forwarded: on a cloud source a seek opens a fresh ranged GET,
+            # which is the very round trip the cancellation is trying to avoid. The
+            # honest current position is returned so the demuxer sees the seek fail
+            # rather than being told it landed somewhere it did not.
+            return self._raw.tell()
+        return self._raw.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    # Delegated rather than hardcoded to True: the sensor library rejects a stream that is
+    # not readable and seekable, and claiming both would smuggle an unusable stream past
+    # that guard into an opaque failure inside libav instead of the clear one up front.
+    def seekable(self) -> bool:
+        return self._raw.seekable()
+
+    def readable(self) -> bool:
+        return self._raw.readable()
+
+
+def cancellable_reader(stream: BinaryIO, cancel: threading.Event) -> BinaryIO:
+    """Wrap ``stream`` so it reads as an empty source once ``cancel`` is set."""
+    return cast("BinaryIO", _CancellableReader(stream, cancel))
 
 
 def available_cpu_count() -> int:
@@ -220,6 +392,73 @@ class Thresholds:
 
 
 DEFAULT_THRESHOLDS = Thresholds()
+
+
+def add_threshold_args(parser: argparse.ArgumentParser) -> None:
+    """Add the pass/fail policy flags, one per :class:`Thresholds` field.
+
+    Shared by both CLIs so a policy flag never means two different things, and so
+    adding a threshold is a change in one place. Defaults come from
+    :data:`DEFAULT_THRESHOLDS` rather than being repeated as literals, keeping the
+    help text honest if a default is ever retuned.
+    """
+    group = parser.add_argument_group(
+        "thresholds",
+        "Pass/fail policy. Defaults are neutral first-principles limits, not values tuned on a dataset.",
+    )
+    group.add_argument(
+        "--max-strict-violations",
+        type=non_negative_int,
+        default=DEFAULT_THRESHOLDS.max_strict_violations,
+        metavar="N",
+        help=(
+            "Ordering violations (backward or duplicate timestamps) tolerated "
+            f"(default: {DEFAULT_THRESHOLDS.max_strict_violations}, i.e. require strictly increasing)."
+        ),
+    )
+    group.add_argument(
+        "--max-rate-deviation-percent",
+        type=non_negative_finite_float,
+        default=DEFAULT_THRESHOLDS.max_rate_deviation_percent,
+        metavar="PCT",
+        help=(
+            "Mean-period deviation from the expected cadence tolerated, in percent "
+            f"(default: {DEFAULT_THRESHOLDS.max_rate_deviation_percent})."
+        ),
+    )
+    group.add_argument(
+        "--max-gaps",
+        type=non_negative_int,
+        default=DEFAULT_THRESHOLDS.max_gaps,
+        metavar="N",
+        help=f"Inferred gaps (missing samples) tolerated (default: {DEFAULT_THRESHOLDS.max_gaps}).",
+    )
+    group.add_argument(
+        "--max-jitter-percent",
+        type=non_negative_finite_float,
+        default=DEFAULT_THRESHOLDS.max_jitter_percent,
+        metavar="PCT",
+        help=(
+            "Inter-sample jitter tolerated, as a percent of the expected period "
+            f"(default: {DEFAULT_THRESHOLDS.max_jitter_percent})."
+        ),
+    )
+    group.add_argument(
+        "--allow-frame-reordering",
+        action="store_true",
+        help="Treat a frame-reordering (B-frame) stream as acceptable instead of failing that check.",
+    )
+
+
+def thresholds_from_args(args: argparse.Namespace) -> Thresholds:
+    """Build a :class:`Thresholds` from a namespace populated by :func:`add_threshold_args`."""
+    return Thresholds(
+        max_strict_violations=args.max_strict_violations,
+        max_rate_deviation_percent=args.max_rate_deviation_percent,
+        max_gaps=args.max_gaps,
+        max_jitter_percent=args.max_jitter_percent,
+        allow_frame_reordering=args.allow_frame_reordering,
+    )
 
 
 @attrs.define(frozen=True)
@@ -391,7 +630,7 @@ def video_info(sensor: IntegritySensor) -> VideoInfo:
     return VideoInfo(
         codec_name=sensor.codec_name,
         has_bframes=sensor.has_bframes,
-        num_samples=int(sensor.timestamps_ns.size),
+        num_samples=sensor.timestamps_ns.size,
         start_ns=sensor.start_ns if has_samples else None,
         end_ns=sensor.end_ns if has_samples else None,
     )
@@ -573,11 +812,12 @@ def run_metrics(
 
 
 def _as_data_source(stream: BinaryIO) -> DataSource:
-    """Cast a ``BinaryIO`` from ``open_cloud_source`` to a ``DataSource``.
+    """Cast a ``BinaryIO`` from :func:`open_source` to a ``DataSource``.
 
-    ``smart_open``'s S3 / Azure readers are seekable ``io.BufferedIOBase``
-    subclasses, so they satisfy the ``DataSource`` union at runtime even though
-    static typing only sees ``BinaryIO`` (mirrors ``check_video_index``).
+    ``smart_open``'s S3 / Azure readers and a plain ``Path.open("rb")`` handle are all
+    seekable ``io.BufferedIOBase`` subclasses, so they satisfy the ``DataSource`` union
+    at runtime even though static typing only sees ``BinaryIO`` (mirrors
+    ``check_video_index``).
     """
     return cast("DataSource", stream)
 
@@ -590,13 +830,19 @@ def open_source(
     azure_profile_name: str,
     endpoint_url: str | None = None,
     stream_wrapper: Callable[[BinaryIO], BinaryIO] | None = None,
-) -> Generator[pathlib.Path | BinaryIO]:
-    """Yield a :class:`Path` for local sources and a fresh :class:`BinaryIO` for cloud URIs.
+) -> Generator[BinaryIO]:
+    """Yield a fresh readable stream for ``source``, cloud URI or local path alike.
 
-    ``stream_wrapper``, when given, wraps the cloud :class:`BinaryIO` before it is
-    yielded (for example a byte-counting reader used to report download progress).
-    It is a no-op for local sources, which are handed to the sensor as a
-    :class:`Path` and read directly off disk.
+    ``stream_wrapper``, when given, wraps that stream before it is yielded (a
+    byte-counting reader for download progress, a cancellable one for Ctrl-C).
+
+    Local paths are opened here rather than handed to the sensor as a :class:`Path` so
+    that they get the same wrappers: the sensor library opens a ``Path`` into a Python
+    handle anyway (``open_file``), so libav sees the same callbacks either way and this
+    costs nothing measurable, while a path on a shared filesystem can be every bit as
+    slow to read as a cloud object. The trade is that the sensor now borrows one
+    stateful handle instead of being able to re-open the file, which matches what every
+    cloud source has always given it.
     """
     if is_cloud_uri(source):
         with open_cloud_source(
@@ -604,10 +850,11 @@ def open_source(
             s3_profile_name=s3_profile_name,
             azure_profile_name=azure_profile_name,
             endpoint_url=endpoint_url,
-        ) as stream:
-            yield stream_wrapper(stream) if stream_wrapper is not None else stream
+        ) as cloud_stream:
+            yield stream_wrapper(cloud_stream) if stream_wrapper is not None else cloud_stream
     else:
-        yield pathlib.Path(source)
+        with pathlib.Path(source).open("rb") as local_stream:
+            yield stream_wrapper(local_stream) if stream_wrapper is not None else local_stream
 
 
 def run_checks(  # noqa: PLR0913
@@ -642,9 +889,9 @@ def run_checks(  # noqa: PLR0913
         endpoint_url: optional S3 endpoint override for S3-compatible stores.
         stats: optional out-parameter; ``sensor_init_ms`` is recorded here in
             addition to the ``stream_ms`` / ``evaluate_ms`` from :func:`run_metrics`.
-        stream_wrapper: optional wrapper applied to the cloud stream before the
-            sensor reads it (e.g. a byte-counting reader for progress); no-op for
-            local sources.
+        stream_wrapper: optional wrapper applied to the stream before the sensor
+            reads it (e.g. a byte-counting reader for progress), for local paths
+            as well as cloud URIs.
 
     Returns:
         The tuple returned by :func:`run_metrics`.
@@ -657,9 +904,8 @@ def run_checks(  # noqa: PLR0913
         endpoint_url=endpoint_url,
         stream_wrapper=stream_wrapper,
     ) as src:
-        data: DataSource = src if isinstance(src, pathlib.Path) else _as_data_source(src)
         t0 = time.perf_counter()
-        sensor = CameraSensor(data, stream_idx=stream_idx)
+        sensor = CameraSensor(_as_data_source(src), stream_idx=stream_idx)
         if stats is not None:
             stats["sensor_init_ms"] = (time.perf_counter() - t0) * 1000
         return run_metrics(sensor, expected_hz=expected_hz, thresholds=thresholds, batch_size=batch_size, stats=stats)
