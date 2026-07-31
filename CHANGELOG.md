@@ -2,15 +2,77 @@
 
 ## Latest
 
+## [2.4.0]
+
+### Released
+
+- 2026-07-30
+
+### Added
+
+- Add opt-in OTLP metrics push for pipeline runs.
+- Add sensor data-integrity tooling with configurable thresholds and interrupt handling, MCAP
+  protobuf mapping support, and expanded sensor data/timeline support.
+- Add the Curator Next robot-action-split recipe and supporting media/Lance utilities.
+- Add a style-transfer stage.
+- Add Slurm launch controls for dry runs, non-interactive execution, environment sourcing, and
+  node-local mount preparation.
+
+### Changed
+
+- Reduce local Docker launch privileges and make Docker network selection explicit.
+- Improve sensor data-integrity session checks with concurrent stream processing and bounded video
+  index probes.
+- Upgrade vLLM dependencies to 0.24.0.
+
+## [2.3.0]
+
+### Released
+
+- 2026-07-30
+
 ### Breaking Changes
 
-- Remove legacy NVCF `pexec`/`legacy_cf` invocation selection; function invokes and status
-  checks now use the direct invocation endpoints.
+- Remove legacy NVCF `pexec`/`legacy_cf`, asset, and `clusterGroup` support; function invokes and
+  status checks now use the direct invocation endpoints.
+- Raise the Python baseline to 3.13.
 
 ### Added
 
 - Add `--include-logs`/`--no-include-logs` support to NVCF `invoke-batch` status polling
   without requiring full downloads - useful for status checking loops.
+- Add optional JSON log formatting for Ray worker and pipeline logs.
+- Add the Ray Data caption judge pipeline and supporting config/reporting code.
+- Add split-comparison summary histogram output and Lance metadata support.
+- Add a `--xenna-streaming-scheduler` CLI option for selecting the saturation-aware streaming
+  scheduler, plus benchmark wiring for that scheduler.
+
+### Fixed
+
+- Fix sensor video indexing/decoding for b-frame and open-GOP inputs.
+- Improve GPU cleanup and `cosmos-xenna` actor teardown/setup behavior.
+- Fix SeedVR import resolution.
+- Apply Cosmos3 vLLM generation defaults, disable Qwen thinking by default, and handle truncated
+  reasoning captions.
+- Avoid dedup KMeans failures on small inputs.
+- Align split-comparison windows with updated nanosecond metadata.
+- Scrub launcher and Slurm-submit Pixi environment variables before dispatch.
+
+### Changed
+
+- Consolidate video pipeline frame extraction, motion-vector extraction, and clip metadata timing
+  around `CameraSensor` and nanosecond timestamps.
+- Default Ray Data captions to model preprocessing.
+- Upgrade Ray to 2.56.0 and enable Ray Data map logical-memory and transient map-error retry
+  settings.
+- Upgrade vLLM dependencies to 0.23.0.
+- Update FFmpeg, Starlette, PyArrow, CUDA dependency pins, and Pixi CUDA platform settings.
+
+### Documentation
+
+- Define the Cosmos Curator Next direction.
+- Add sensor-library LiDAR data design documentation.
+- Propose the Ray Data video workflow migration.
 
 ## [2.2.0]
 
