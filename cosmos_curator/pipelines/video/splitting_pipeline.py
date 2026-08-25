@@ -113,6 +113,7 @@ from cosmos_curator.pipelines.video.filtering.motion.motion_builders import (
     MotionFilterConfig,
     build_motion_filter_stages,
 )
+from cosmos_curator.pipelines.video.read_write.mcap_writer_stage import consolidate_mcap_fragments
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import (
     ClipWriterStage,
     consolidate_lance_fragments,
@@ -1052,6 +1053,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
         )
 
     # --- Output (always) ---
+    generate_mcap = args.generate_mcap
     stages.extend(
         build_output_stages(
             OutputConfig(
@@ -1074,6 +1076,8 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 caption_quality_flags_enabled=caption_quality_flags_enabled,
                 generate_cosmos_predict_dataset=args.generate_cosmos_predict_dataset,
                 sam3_output_format=args.sam3_output_format,
+                generate_mcap=generate_mcap,
+                mcap_num_workers_per_node=args.num_mcap_writer_workers_per_node,
                 num_workers_per_node=args.num_clip_writer_workers_per_node,
                 verbose=args.verbose,
                 perf_profile=args.perf_profile,
@@ -1187,6 +1191,11 @@ def _split(args: argparse.Namespace) -> None:
 
     if args.upload_clip_info_in_lance:
         consolidate_lance_fragments(args.output_clip_path, args.output_s3_profile_name)
+
+    # Never consolidate on dry runs or stage replays: it overwrites final MCAPs and
+    # deletes fragments, which would destroy leftovers from an interrupted real run.
+    if args.generate_mcap and not args.dry_run and not args.stage_replay:
+        consolidate_mcap_fragments(args.output_clip_path, args.output_s3_profile_name)
 
     summary_start = time.time()
 
@@ -1338,6 +1347,15 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Generate Cosmos-Predict2 post-training dataset.",
+    )
+    parser.add_argument(
+        "--generate-mcap",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Write one MCAP file per input video (clip frames, captions, embeddings, audio) "
+            "after the clip writer stage."
+        ),
     )
     parser.add_argument(
         "--write-all-caption-json",
@@ -2442,6 +2460,12 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
         type=int,
         default=8,
         help="Number of workers to use for writing clips.",
+    )
+    parser.add_argument(
+        "--num-mcap-writer-workers-per-node",
+        type=int,
+        default=4,
+        help="Number of workers to use for writing MCAP fragments (with --generate-mcap).",
     )
     parser.add_argument(
         "--dry-run",
