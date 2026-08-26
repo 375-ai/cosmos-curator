@@ -93,12 +93,13 @@ def select_clip_embedding(clip: Clip, embedding_algorithm: str) -> npt.NDArray[n
 def drop_clip_intermediate_data(clip: Clip, *, keep_mcap_payloads: bool = False) -> None:
     """Drop clip payloads (encoded data, embeddings, window artifacts) after the final write.
 
-    ``keep_mcap_payloads`` retains only what a downstream ``McapWriterStage`` reads
-    (clip mp4 bytes, clip embeddings, window captions); everything else is dropped
-    either way to keep the extra stage hop cheap.
+    ``keep_mcap_payloads`` retains only the small annotations a downstream
+    ``McapWriterStage`` reads (clip embeddings, window captions). The mp4 bytes are
+    dropped either way — the MCAP writer reads clips back from the written
+    ``clips/`` output instead of carrying them through the object store.
     """
+    clip.encoded_data.drop()
     if not keep_mcap_payloads:
-        clip.encoded_data.drop()
         clip.intern_video_2_embedding = None
         clip.cosmos_embed1_embedding = None
         clip.openai_embedding = None
@@ -695,8 +696,8 @@ class ClipWriterStage(CuratorStage):
         output_file = f"{video_span_uuid}_{window[0]}_{window[1]}.{file_type}"
         return get_full_path(path_prefix, output_file)
 
+    @staticmethod
     def _get_clip_uri(
-        self,
         video_span_uuid: uuid.UUID,
         path_prefix: str,
         file_type: str,
@@ -709,6 +710,20 @@ class ClipWriterStage(CuratorStage):
         else:
             output_clip_file = f"{video_span_uuid}{suffix}.{file_type}"
         return get_full_path(path_prefix, output_clip_file)
+
+    @staticmethod
+    def get_clip_mp4_uri(
+        output_path: str,
+        clip_uuid: uuid.UUID,
+        relative_path: str = "",
+    ) -> storage_client.StoragePrefix | pathlib.Path:
+        """URI of a written clip mp4 (the naming ``_write_clip_mp4`` uses)."""
+        return ClipWriterStage._get_clip_uri(
+            clip_uuid,
+            ClipWriterStage.get_output_path_clips(output_path),
+            "mp4",
+            relative_path,
+        )
 
     def _get_video_uri(self, input_video_path: str) -> storage_client.StoragePrefix | pathlib.Path:
         assert input_video_path.startswith(self._input_path)

@@ -409,11 +409,12 @@ def test_retain_clip_data_preserves_mcap_payloads(tmp_path: Path) -> None:
     result = stage.process_data([task])
     assert result == [task]
 
-    # The MCAP writer's inputs survive the extra stage hop.
-    assert bytes(clip.encoded_data.resolve()) == b"clip-bytes"
+    # The MCAP writer's annotation inputs survive the extra stage hop.
     assert clip.intern_video_2_embedding is not None
     assert main_window.caption == {"qwen": "main caption"}
-    # Everything the MCAP writer does not read is still dropped.
+    # Everything the MCAP writer does not carry in memory is still dropped — including
+    # the mp4 bytes, which it reads back from the written clips/ output instead.
+    assert clip.encoded_data.resolve() is None
     assert main_window.webp_bytes.resolve() is None
     assert main_window.enhanced_caption == {}
     assert main_window.caption_status is None

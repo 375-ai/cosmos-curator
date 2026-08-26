@@ -59,10 +59,11 @@ class OutputConfig:
     generate_cosmos_predict_dataset: bool = False
     sam3_output_format: Sam3OutputFormat = "native"
     # Also appends an McapWriterStage after the clip writer, which then retains the
-    # clip payloads the MCAP writer consumes. Keeping both on one knob guarantees a
-    # retaining ClipWriterStage is never built without its downstream consumer.
+    # clip annotations (captions/embeddings) the MCAP writer consumes; clip mp4s are
+    # read back from the written clips/ output rather than retained. Keeping both on
+    # one knob guarantees a retaining ClipWriterStage always has its consumer.
     generate_mcap: bool = False
-    mcap_num_workers_per_node: int = 4
+    mcap_num_workers_per_node: int = 2
     num_workers_per_node: int = 8
     num_run_attempts: int = 5
     verbose: bool = False
@@ -87,6 +88,9 @@ def build_ingest_stages(config: IngestConfig) -> list[CuratorStage | CuratorStag
 
 def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStageSpec]:
     """Construct and return the clip writer stage (plus the MCAP writer when enabled)."""
+    if config.generate_mcap and not config.upload_clips:
+        msg = "generate_mcap requires upload_clips: the MCAP writer reads clip mp4s back from the clips/ output"
+        raise ValueError(msg)
     stages: list[CuratorStage | CuratorStageSpec] = [
         CuratorStageSpec(
             ClipWriterStage(
@@ -130,7 +134,7 @@ def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStag
                     verbose=config.verbose,
                     log_stats=config.perf_profile,
                 ),
-                # Defaults below the clip writer: each worker holds clip mp4s while remuxing.
+                # Defaults below the clip writer: each worker holds one clip mp4 while remuxing.
                 num_workers_per_node=config.mcap_num_workers_per_node,
                 num_run_attempts_python=config.num_run_attempts,
             ),

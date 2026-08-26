@@ -28,7 +28,6 @@ import pytest
 from mcap.reader import make_reader
 from mcap.records import Channel, Message, Metadata, Schema
 
-from cosmos_curator.core.utils.data.bytes_transport import bytes_to_numpy
 from cosmos_curator.pipelines.video.read_write import mcap_schemas
 from cosmos_curator.pipelines.video.read_write.mcap_writer_stage import (
     McapWriterStage,
@@ -87,21 +86,26 @@ def _make_mp4(*, with_audio: bool = False) -> bytes:
 
 
 def _make_clip(
+    tmp_path: Path,
     video_path: Path,
     *,
-    mp4_bytes: bytes,
+    mp4_bytes: bytes | None,
     start_s: float = 0.0,
     with_annotations: bool = True,
 ) -> Clip:
+    """Build a post-ClipWriterStage clip, writing its mp4 to the clips/ output the stage reads."""
     clip = Clip(
         uuid=uuid.uuid4(),
         source_video=video_path.as_posix(),
         span=(start_s, start_s + CLIP_DURATION_S),
-        encoded_data=bytes_to_numpy(mp4_bytes),
         windows=[Window(start_frame=0, end_frame=NUM_FRAMES - 1, caption={"qwen": "a test scene"})]
         if with_annotations
         else [],
     )
+    if mp4_bytes is not None:
+        clip_file = tmp_path / "output" / "clips" / f"{clip.uuid}.mp4"
+        clip_file.parent.mkdir(parents=True, exist_ok=True)
+        clip_file.write_bytes(mp4_bytes)
     clip.pts_ns = (np.arange(NUM_FRAMES) * (NS_PER_SECOND // FPS)).astype(np.int64)
     clip.start_ns = round(start_s * NS_PER_SECOND)
     clip.end_ns = clip.start_ns + round(CLIP_DURATION_S * NS_PER_SECOND)
@@ -179,7 +183,7 @@ def _fragment_path(tmp_path: Path, video_path: Path, chunk_index: int) -> Path:
 def test_fragment_writes_expected_channels(tmp_path: Path) -> None:
     """Chunk-0 fragment carries media, annotations, embedding, and one-shot session records."""
     video_path = tmp_path / "input" / "video.mp4"
-    clip = _make_clip(video_path, mp4_bytes=_make_mp4())
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
     video = _make_video(video_path, [clip])
 
     _process(tmp_path, video)
@@ -238,8 +242,7 @@ def test_fragment_writes_expected_channels(tmp_path: Path) -> None:
     assert session_metadata.metadata["source-video"] == video_path.as_posix()
     assert session_metadata.metadata["num-clip-chunks"] == "1"
 
-    # Payloads dropped after the stage.
-    assert clip.encoded_data.resolve() is None
+    # Retained annotations dropped after the stage.
     assert clip.intern_video_2_embedding is None
     assert clip.windows[0].caption == {}
 
@@ -247,7 +250,7 @@ def test_fragment_writes_expected_channels(tmp_path: Path) -> None:
 def test_fragment_audio_channel(tmp_path: Path) -> None:
     """A clip with an audio track adds pcm-s16 RawAudio messages; one without does not."""
     video_path = tmp_path / "input" / "video.mp4"
-    video = _make_video(video_path, [_make_clip(video_path, mp4_bytes=_make_mp4(with_audio=True))])
+    video = _make_video(video_path, [_make_clip(tmp_path, video_path, mp4_bytes=_make_mp4(with_audio=True))])
 
     _process(tmp_path, video)
     assert "McapWriterStage" not in video.errors
@@ -265,7 +268,7 @@ def test_fragment_audio_channel(tmp_path: Path) -> None:
 def test_chunk1_fragment_omits_session_records(tmp_path: Path) -> None:
     """Only chunk 0 writes session metadata, camera-info, and tf-static."""
     video_path = tmp_path / "input" / "video.mp4"
-    clip = _make_clip(video_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)
     video = _make_video(video_path, [clip], clip_chunk_index=1, num_clip_chunks=2)
 
     _process(tmp_path, video)
@@ -301,7 +304,7 @@ def test_zero_clip_chunks(tmp_path: Path) -> None:
 def test_span_fallback_when_pts_missing(tmp_path: Path) -> None:
     """Clips without decoded timestamps fall back to span seconds for the base offset."""
     video_path = tmp_path / "input" / "video.mp4"
-    clip = _make_clip(video_path, mp4_bytes=_make_mp4(), start_s=1.0)
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4(), start_s=1.0)
     clip.pts_ns = None
     clip.start_ns = None
     clip.end_ns = None
@@ -320,9 +323,9 @@ def test_secondary_video_keeps_sam3_annotations(tmp_path: Path) -> None:
     """Secondary cameras keep their per-camera SAM3 detections; absent data yields no channel."""
     primary_path = tmp_path / "input" / "cam0.mp4"
     secondary_path = tmp_path / "input" / "cam1.mp4"
-    primary = _make_video(primary_path, [_make_clip(primary_path, mp4_bytes=_make_mp4())])
+    primary = _make_video(primary_path, [_make_clip(tmp_path, primary_path, mp4_bytes=_make_mp4())])
     # Secondary cameras carry SAM3 detections but no captions/embeddings.
-    secondary_clip = _make_clip(secondary_path, mp4_bytes=_make_mp4(), with_annotations=False)
+    secondary_clip = _make_clip(tmp_path, secondary_path, mp4_bytes=_make_mp4(), with_annotations=False)
     secondary_clip.sam3_frames = [
         {"frame_idx": 2, "timestamp_s": 2 / FPS, "detections": [{"prompt": "truck", "object_id": 7}]},
     ]
@@ -345,11 +348,11 @@ def test_consolidate_merges_fragments(tmp_path: Path) -> None:
     """Two chunk fragments merge into one MCAP named after the input video's relative path."""
     video_path = tmp_path / "input" / "video.mp4"
 
-    chunk0_clip = _make_clip(video_path, mp4_bytes=_make_mp4())
+    chunk0_clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
     chunk0 = _make_video(video_path, [chunk0_clip], clip_chunk_index=0, num_clip_chunks=2)
     _process(tmp_path, chunk0)
 
-    chunk1_clip = _make_clip(video_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)
+    chunk1_clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)
     chunk1 = _make_video(video_path, [chunk1_clip], clip_chunk_index=1, num_clip_chunks=2)
     _process(tmp_path, chunk1)
 
@@ -387,7 +390,7 @@ def test_consolidate_merges_fragments(tmp_path: Path) -> None:
 def test_consolidate_single_fragment(tmp_path: Path) -> None:
     """A single-fragment video is validated and rewritten to the final MCAP, fragment removed."""
     video_path = tmp_path / "input" / "video.mp4"
-    _process(tmp_path, _make_video(video_path, [_make_clip(video_path, mp4_bytes=_make_mp4())]))
+    _process(tmp_path, _make_video(video_path, [_make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())]))
 
     fragment = _fragment_path(tmp_path, video_path, 0)
     fragment_messages, fragment_metadata = _read_mcap(fragment)
@@ -407,7 +410,7 @@ def test_consolidate_skips_incomplete_fragment_sets(tmp_path: Path) -> None:
     tail_missing_path = tmp_path / "input" / "tail_missing.mp4"
     chunk0 = _make_video(
         tail_missing_path,
-        [_make_clip(tail_missing_path, mp4_bytes=_make_mp4())],
+        [_make_clip(tmp_path, tail_missing_path, mp4_bytes=_make_mp4())],
         clip_chunk_index=0,
         num_clip_chunks=2,
     )
@@ -417,7 +420,7 @@ def test_consolidate_skips_incomplete_fragment_sets(tmp_path: Path) -> None:
     head_missing_path = tmp_path / "input" / "head_missing.mp4"
     chunk1 = _make_video(
         head_missing_path,
-        [_make_clip(head_missing_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)],
+        [_make_clip(tmp_path, head_missing_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)],
         clip_chunk_index=1,
         num_clip_chunks=2,
     )
@@ -445,18 +448,34 @@ def test_consolidate_raises_on_corrupt_fragment(tmp_path: Path) -> None:
 
 
 def test_write_failure_propagates_with_payloads_intact(tmp_path: Path) -> None:
-    """A fragment-write failure raises (enabling Xenna run attempts) and keeps clip payloads."""
+    """A fragment-write failure raises (enabling Xenna run attempts) and keeps annotations."""
     video_path = tmp_path / "input" / "video.mp4"
-    clip = _make_clip(video_path, mp4_bytes=b"not-an-mp4")
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=b"not-an-mp4")
     video = _make_video(video_path, [clip])
 
     with pytest.raises(av.FFmpegError):
         _process(tmp_path, video)
 
-    # Payloads survive the failure so a retry can re-produce the fragment.
-    assert clip.encoded_data.resolve() is not None
+    # Annotations survive the failure so a retry can re-produce the fragment
+    # (the clip mp4 itself is re-read from the clips/ output on retry).
     assert clip.windows[0].caption == {"qwen": "a test scene"}
     assert clip.intern_video_2_embedding is not None
+
+
+def test_missing_clip_mp4_skips_media(tmp_path: Path) -> None:
+    """A clip whose mp4 was never written still contributes annotations, without failing."""
+    video_path = tmp_path / "input" / "video.mp4"
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=None)
+    video = _make_video(video_path, [clip])
+
+    _process(tmp_path, video)
+    assert "McapWriterStage" not in video.errors
+
+    messages, _ = _read_mcap(_fragment_path(tmp_path, video_path, 0))
+    by_topic = _messages_by_topic(messages)
+    assert mcap_schemas.TOPIC_IMAGE_RAW not in by_topic
+    assert len(by_topic[mcap_schemas.TOPIC_SCENE_ANNOTATION]) == 3
+    assert len(by_topic[mcap_schemas.TOPIC_CLIP_EMBEDDING]) == 1
 
 
 def test_consolidate_no_fragments_is_noop(tmp_path: Path) -> None:

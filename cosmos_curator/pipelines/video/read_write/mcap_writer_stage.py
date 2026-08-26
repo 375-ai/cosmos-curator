@@ -52,7 +52,6 @@ from mcap.writer import CompressionType, Writer
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageResource
 from cosmos_curator.core.sensors.utils.video import pts_to_ns
-from cosmos_curator.core.utils.data.ref_resolver import prefetch
 from cosmos_curator.core.utils.infra.performance_utils import StageTimer
 from cosmos_curator.core.utils.misc.retry_utils import do_with_retries
 from cosmos_curator.core.utils.storage import storage_client, storage_utils
@@ -60,6 +59,7 @@ from cosmos_curator.core.utils.storage.storage_utils import (
     StorageWriter,
     get_files_relative,
     get_full_path,
+    read_bytes,
 )
 from cosmos_curator.pipelines.video.read_write import mcap_schemas
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import (
@@ -140,10 +140,12 @@ class _McapChannels:
 class McapWriterStage(CuratorStage):
     """Write one MCAP fragment per (video, clip-chunk) with clip media and annotations.
 
-    Runs after ``ClipWriterStage`` (which must be constructed with
-    ``retain_clip_data=True`` so clip payloads survive that stage's cleanup —
-    ``build_output_stages`` wires this pairing); this stage drops the payloads
-    itself once the fragment is written.
+    Runs after ``ClipWriterStage`` (constructed with ``retain_clip_data=True`` so the
+    small annotations — captions and embeddings — survive that stage's cleanup;
+    ``build_output_stages`` wires this pairing). Clip mp4 bytes are deliberately NOT
+    retained: this stage reads each clip back from the just-written ``clips/`` output
+    (a page-cache hit locally), so the feature adds no clip payloads to the Ray
+    object store and each worker holds at most one clip in memory at a time.
     """
 
     def __init__(  # noqa: PLR0913
@@ -174,12 +176,16 @@ class McapWriterStage(CuratorStage):
     @property
     def resources(self) -> CuratorStageResource:
         """Get the resource requirements for this stage."""
-        return CuratorStageResource(cpus=1.0)
+        return CuratorStageResource(cpus=0.5)
 
     def stage_setup(self) -> None:
-        """Initialize the fragment storage writer."""
+        """Initialize the fragment storage writer and the clip read client."""
         self._fragments_writer = StorageWriter(
             ClipWriterStage.get_output_path_mcap_fragments(self._output_path),
+            profile_name=self._output_s3_profile_name,
+        )
+        self._storage_client = storage_utils.get_storage_client(
+            self._output_path,
             profile_name=self._output_s3_profile_name,
         )
 
@@ -216,7 +222,6 @@ class McapWriterStage(CuratorStage):
         if self._dry_run:
             logger.info(f"Dry-run: skipping MCAP fragment for {video.input_path} chunk {video.clip_chunk_index}")
             return
-        prefetch([clip.encoded_data for clip in video.clips])
         sub_path = f"{self._relative_video_path(video)}/{video.clip_chunk_index}.mcap"
         with self._fragments_writer.open_writer(sub_path, mode="wb") as out_file:
             self._write_chunk_mcap(out_file, video)
@@ -237,9 +242,22 @@ class McapWriterStage(CuratorStage):
                 self._write_session_start(writer, channels, video)
             for clip in video.clips:
                 base_ns = _clip_base_ns(clip)
-                _write_clip_media(channels, clip, base_ns)
+                media = self._read_clip_mp4(clip, video.relative_path)
+                if media is not None:
+                    _write_clip_media(channels, clip, base_ns, media)
                 self._write_clip_annotations(channels, clip, base_ns)
                 self._write_clip_embedding(channels, clip, base_ns)
+
+    def _read_clip_mp4(self, clip: Clip, relative_path: str) -> bytes | None:
+        """Read one clip's mp4 back from the ``clips/`` output written by ClipWriterStage."""
+        clip_uri = ClipWriterStage.get_clip_mp4_uri(self._output_path, clip.uuid, relative_path)
+        try:
+            return read_bytes(clip_uri, self._storage_client)
+        except FileNotFoundError:
+            # Mirrors the pre-existing "clip has no data" path: the writer already
+            # logged why the mp4 is missing; the MCAP keeps annotations only.
+            logger.warning(f"Clip {clip.uuid} from {clip.source_video} has no written mp4; skipping MCAP media")
+            return None
 
     def _session_metadata(self, video: Video) -> dict[str, str]:
         meta = video.metadata
@@ -338,13 +356,9 @@ def _select_window_caption(window: Window, caption_models: list[str]) -> str | N
     return None
 
 
-def _write_clip_media(channels: _McapChannels, clip: Clip, base_ns: int) -> None:
+def _write_clip_media(channels: _McapChannels, clip: Clip, base_ns: int, media: bytes) -> None:
     """Demux one clip mp4 and write its video packets and decoded audio blocks."""
-    encoded_data = clip.encoded_data.resolve()
-    if encoded_data is None:
-        logger.warning(f"Clip {clip.uuid} from {clip.source_video} has no encoded data; skipping MCAP media")
-        return
-    with av.open(io.BytesIO(encoded_data), mode="r") as container:
+    with av.open(io.BytesIO(media), mode="r") as container:
         maybe_writers = (
             _ClipVideoWriter.create(channels, container, clip, base_ns),
             _ClipAudioWriter.create(channels, container, base_ns),

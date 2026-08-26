@@ -2464,7 +2464,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     parser.add_argument(
         "--num-mcap-writer-workers-per-node",
         type=int,
-        default=4,
+        default=2,
         help="Number of workers to use for writing MCAP fragments (with --generate-mcap).",
     )
     parser.add_argument(
