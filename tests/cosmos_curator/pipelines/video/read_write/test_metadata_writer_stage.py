@@ -193,7 +193,9 @@ def _build_video(
     )
 
 
-def _stage_with_main_clip(tmp_path: Path) -> tuple[ClipWriterStage, SplitPipeTask, Clip, Window, Path]:
+def _stage_with_main_clip(
+    tmp_path: Path, **overrides: object
+) -> tuple[ClipWriterStage, SplitPipeTask, Clip, Window, Path]:
     """Create a standard stage/task/clip tuple for integration testing."""
     input_dir = tmp_path / "input"
     output_dir = tmp_path / "output"
@@ -201,7 +203,7 @@ def _stage_with_main_clip(tmp_path: Path) -> tuple[ClipWriterStage, SplitPipeTas
     video_path = input_dir / "video.mp4"
     video_path.write_bytes(b"input-video")
 
-    stage = _create_stage(output_dir, input_dir)
+    stage = _create_stage(output_dir, input_dir, **overrides)
 
     main_window = Window(
         start_frame=0,
@@ -211,6 +213,7 @@ def _stage_with_main_clip(tmp_path: Path) -> tuple[ClipWriterStage, SplitPipeTas
         enhanced_caption={"qwen_plus": "enhanced view"},
         webp_bytes=b"webp-content",
         t5_xxl_embedding={"default": np.array([1, 2, 3], dtype=np.int32)},
+        model_input={"qwen": {"frames": "leftover-model-input"}},
     )
     filtered_window = Window(
         start_frame=0,
@@ -242,6 +245,7 @@ def _assert_payloads_cleared(clip: Clip, window: Window) -> None:
     assert clip.encoded_data.resolve() is None
     assert clip.intern_video_2_embedding is None
     assert window.webp_bytes.resolve() is None
+    assert window.model_input == {}
     assert window.caption == {}
     assert window.enhanced_caption == {}
     assert window.caption_status is None
@@ -388,6 +392,38 @@ def test_process_data_cleanup_resets_caption_quality_flags(tmp_path: Path) -> No
     assert main_window.flag_length_outlier is None
     assert main_window.flag_repetition is None
     assert main_window.flag_near_duplicate is None
+
+
+def test_retain_clip_data_preserves_mcap_payloads(tmp_path: Path) -> None:
+    """With retain_clip_data the writer keeps the MCAP writer's inputs but drops everything else."""
+    stage, task, clip, main_window, output_dir = _stage_with_main_clip(tmp_path, retain_clip_data=True)
+    filtered_clip = Clip(
+        uuid=uuid.uuid4(),
+        source_video=clip.source_video,
+        span=(2.0, 4.0),
+        encoded_data=bytes_to_numpy(b"filtered-bytes"),
+        windows=[Window(start_frame=0, end_frame=30, caption={"qwen": "filtered caption"})],
+    )
+    task.video.filtered_clips.append(filtered_clip)
+
+    result = stage.process_data([task])
+    assert result == [task]
+
+    # The MCAP writer's annotation inputs survive the extra stage hop.
+    assert clip.intern_video_2_embedding is not None
+    assert main_window.caption == {"qwen": "main caption"}
+    # Everything the MCAP writer does not carry in memory is still dropped — including
+    # the mp4 bytes, which it reads back from the written clips/ output instead.
+    assert clip.encoded_data.resolve() is None
+    assert main_window.webp_bytes.resolve() is None
+    assert main_window.enhanced_caption == {}
+    assert main_window.caption_status is None
+    assert main_window.model_input == {}
+    # Filtered clips are never read by the MCAP writer and drop fully.
+    assert filtered_clip.encoded_data.resolve() is None
+    assert filtered_clip.windows[0].caption == {}
+    # Outputs are still written as usual.
+    assert (output_dir / "clips" / f"{clip.uuid}.mp4").read_bytes() == b"clip-bytes"
 
 
 def test_process_data_writes_filter_window_errors(tmp_path: Path) -> None:

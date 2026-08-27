@@ -18,6 +18,7 @@ import attrs
 
 from cosmos_curator.core.interfaces.stage_interface import CuratorStage, CuratorStageSpec
 from cosmos_curator.pipelines.video.read_write.download_stages import VideoDownloader
+from cosmos_curator.pipelines.video.read_write.mcap_writer_stage import McapWriterStage
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
 from cosmos_curator.pipelines.video.tracking.serialization import Sam3OutputFormat
 
@@ -57,6 +58,12 @@ class OutputConfig:
     caption_quality_flags_enabled: bool = True
     generate_cosmos_predict_dataset: bool = False
     sam3_output_format: Sam3OutputFormat = "native"
+    # Also appends an McapWriterStage after the clip writer, which then retains the
+    # clip annotations (captions/embeddings) the MCAP writer consumes; clip mp4s are
+    # read back from the written clips/ output rather than retained. Keeping both on
+    # one knob guarantees a retaining ClipWriterStage always has its consumer.
+    generate_mcap: bool = False
+    mcap_num_workers_per_node: int = 2
     num_workers_per_node: int = 8
     num_run_attempts: int = 5
     verbose: bool = False
@@ -80,8 +87,11 @@ def build_ingest_stages(config: IngestConfig) -> list[CuratorStage | CuratorStag
 
 
 def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStageSpec]:
-    """Construct and return the clip writer stage."""
-    return [
+    """Construct and return the clip writer stage (plus the MCAP writer when enabled)."""
+    if config.generate_mcap and not config.upload_clips:
+        msg = "generate_mcap requires upload_clips: the MCAP writer reads clip mp4s back from the clips/ output"
+        raise ValueError(msg)
+    stages: list[CuratorStage | CuratorStageSpec] = [
         CuratorStageSpec(
             ClipWriterStage(
                 output_path=config.output_path,
@@ -102,6 +112,7 @@ def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStag
                 caption_quality_flags_enabled=config.caption_quality_flags_enabled,
                 generate_cosmos_predict_dataset=config.generate_cosmos_predict_dataset,
                 sam3_output_format=config.sam3_output_format,
+                retain_clip_data=config.generate_mcap,
                 verbose=config.verbose,
                 log_stats=config.perf_profile,
             ),
@@ -109,3 +120,23 @@ def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStag
             num_run_attempts_python=config.num_run_attempts,
         ),
     ]
+    if config.generate_mcap:
+        stages.append(
+            CuratorStageSpec(
+                McapWriterStage(
+                    output_path=config.output_path,
+                    input_path=config.input_path,
+                    output_s3_profile_name=config.output_s3_profile_name,
+                    embedding_algorithm=config.embedding_algorithm,
+                    embedding_model_version=config.embedding_model_version,
+                    caption_models=config.caption_models,
+                    dry_run=config.dry_run,
+                    verbose=config.verbose,
+                    log_stats=config.perf_profile,
+                ),
+                # Defaults below the clip writer: each worker holds one clip mp4 while remuxing.
+                num_workers_per_node=config.mcap_num_workers_per_node,
+                num_run_attempts_python=config.num_run_attempts,
+            ),
+        )
+    return stages

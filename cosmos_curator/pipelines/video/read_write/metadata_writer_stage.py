@@ -79,7 +79,46 @@ from cosmos_curator.pipelines.video.utils.data_model import (
 from cosmos_curator.pipelines.video.utils.ns_timing import frame_pts_bounds_ns
 
 
-def _window_ns_bounds(clip: Clip, window: Window) -> tuple[int | None, int | None]:
+def select_clip_embedding(clip: Clip, embedding_algorithm: str) -> npt.NDArray[np.float32] | None:
+    """Return the clip embedding matching *embedding_algorithm*, or ``None``."""
+    if embedding_algorithm == "internvideo2":
+        return clip.intern_video_2_embedding
+    if embedding_algorithm.startswith("cosmos-embed1-"):
+        return clip.cosmos_embed1_embedding
+    if embedding_algorithm == "openai":
+        return clip.openai_embedding
+    return None
+
+
+def drop_clip_intermediate_data(clip: Clip, *, keep_mcap_payloads: bool = False) -> None:
+    """Drop clip payloads (encoded data, embeddings, window artifacts) after the final write.
+
+    ``keep_mcap_payloads`` retains only the small annotations a downstream
+    ``McapWriterStage`` reads (clip embeddings, window captions). The mp4 bytes are
+    dropped either way — the MCAP writer reads clips back from the written
+    ``clips/`` output instead of carrying them through the object store.
+    """
+    clip.encoded_data.drop()
+    if not keep_mcap_payloads:
+        clip.intern_video_2_embedding = None
+        clip.cosmos_embed1_embedding = None
+        clip.openai_embedding = None
+    for window in clip.windows:
+        window.mp4_bytes.drop()
+        window.model_input.clear()
+        if not keep_mcap_payloads:
+            window.caption.clear()
+        window.token_counts.clear()
+        window.enhanced_caption.clear()
+        window.caption_status = None
+        window.caption_failure_reason = None
+        window.flag_length_outlier = None
+        window.flag_repetition = None
+        window.flag_near_duplicate = None
+        window.webp_bytes.drop()
+
+
+def window_ns_bounds(clip: Clip, window: Window) -> tuple[int | None, int | None]:
     """Map a window's frame range to clip-relative nanoseconds via the clip's PTS.
 
     Returns ``(None, None)`` when the clip has no decoded timestamps (e.g. an
@@ -118,6 +157,7 @@ class ClipWriterStage(CuratorStage):
         caption_quality_flags_enabled: bool = True,
         generate_cosmos_predict_dataset: bool = False,
         sam3_output_format: Sam3OutputFormat = "native",
+        retain_clip_data: bool = False,
         verbose: bool = False,
         log_stats: bool = False,
     ) -> None:
@@ -152,6 +192,9 @@ class ClipWriterStage(CuratorStage):
             msg = f"unknown sam3_output_format {sam3_output_format!r}; expected one of {SAM3_OUTPUT_FORMATS}"
             raise ValueError(msg)
         self._sam3_output_format = sam3_output_format
+        # A downstream stage (e.g. the MCAP writer) still needs the clip payloads;
+        # it becomes responsible for dropping them once done.
+        self._retain_clip_data = retain_clip_data
         self._verbose = verbose
         self._log_stats = log_stats
         self._embedding_buffer: list[dict[str, Any]] = []
@@ -348,6 +391,16 @@ class ClipWriterStage(CuratorStage):
         return uuid.uuid5(uuid.NAMESPACE_URL, f"{input_video_path}")
 
     @staticmethod
+    def get_output_path_mcap_fragments(output_path: str) -> str:
+        """Get path to store per-chunk MCAP fragments (consolidated post-pipeline)."""
+        return ClipWriterStage._get_output_path(output_path, "mcap_fragments")
+
+    @staticmethod
+    def get_output_path_mcap(output_path: str) -> str:
+        """Get path to store the final per-input-video MCAP files."""
+        return ClipWriterStage._get_output_path(output_path, "mcap")
+
+    @staticmethod
     def get_output_path_cosmos_predict_dataset(output_path: str) -> str:
         """Get path to store generated cosmos predict dataset."""
         return ClipWriterStage._get_output_path(output_path, "cosmos_predict2_video2world_dataset")
@@ -491,25 +544,12 @@ class ClipWriterStage(CuratorStage):
                 for future_n in futures_no_rt:
                     future_n.result()
 
-            # clean up intermediate data
-            for clip in video.clips + video.filtered_clips:
-                clip.encoded_data.drop()
-                clip.intern_video_2_embedding = None
-                clip.cosmos_embed1_embedding = None
-                clip.openai_embedding = None
-                for window in clip.windows:
-                    window.mp4_bytes.drop()
-                    for model_variant in window.model_input:
-                        del window.model_input[model_variant]
-                    window.caption.clear()
-                    window.token_counts.clear()
-                    window.enhanced_caption.clear()
-                    window.caption_status = None
-                    window.caption_failure_reason = None
-                    window.flag_length_outlier = None
-                    window.flag_repetition = None
-                    window.flag_near_duplicate = None
-                    window.webp_bytes.drop()
+            # clean up intermediate data (retain only the MCAP writer's inputs when one
+            # follows; the MCAP writer never reads filtered clips, so those drop fully)
+            for clip in video.clips:
+                drop_clip_intermediate_data(clip, keep_mcap_payloads=self._retain_clip_data)
+            for clip in video.filtered_clips:
+                drop_clip_intermediate_data(clip)
 
     def process_data(self, tasks: list[SplitPipeTask]) -> list[SplitPipeTask] | None:  # type: ignore[override]
         """Save clip bytes and metadata."""
@@ -656,8 +696,8 @@ class ClipWriterStage(CuratorStage):
         output_file = f"{video_span_uuid}_{window[0]}_{window[1]}.{file_type}"
         return get_full_path(path_prefix, output_file)
 
+    @staticmethod
     def _get_clip_uri(
-        self,
         video_span_uuid: uuid.UUID,
         path_prefix: str,
         file_type: str,
@@ -670,6 +710,20 @@ class ClipWriterStage(CuratorStage):
         else:
             output_clip_file = f"{video_span_uuid}{suffix}.{file_type}"
         return get_full_path(path_prefix, output_clip_file)
+
+    @staticmethod
+    def get_clip_mp4_uri(
+        output_path: str,
+        clip_uuid: uuid.UUID,
+        relative_path: str = "",
+    ) -> storage_client.StoragePrefix | pathlib.Path:
+        """URI of a written clip mp4 (the naming ``_write_clip_mp4`` uses)."""
+        return ClipWriterStage._get_clip_uri(
+            clip_uuid,
+            ClipWriterStage.get_output_path_clips(output_path),
+            "mp4",
+            relative_path,
+        )
 
     def _get_video_uri(self, input_video_path: str) -> storage_client.StoragePrefix | pathlib.Path:
         assert input_video_path.startswith(self._input_path)
@@ -896,13 +950,7 @@ class ClipWriterStage(CuratorStage):
             )
 
     def _get_clip_embedding(self, clip: Clip) -> npt.NDArray[np.float32] | None:
-        if self._embedding_algorithm == "internvideo2":
-            return clip.intern_video_2_embedding
-        if self._embedding_algorithm.startswith("cosmos-embed1-"):
-            return clip.cosmos_embed1_embedding
-        if self._embedding_algorithm == "openai":
-            return clip.openai_embedding
-        return None
+        return select_clip_embedding(clip, self._embedding_algorithm)
 
     def _add_clip_embedding_to_buffer(self, clip: Clip) -> None:
         embedding_to_write = self._get_clip_embedding(clip)
@@ -993,7 +1041,7 @@ class ClipWriterStage(CuratorStage):
         data["windows"] = []
         data["filtered_windows"] = []
         for window in clip.filter_windows:
-            filter_start_ns, filter_end_ns = _window_ns_bounds(clip, window)
+            filter_start_ns, filter_end_ns = window_ns_bounds(clip, window)
             curr_filter_window: dict[str, Any] = {
                 "start_ns": filter_start_ns,
                 "end_ns": filter_end_ns,
@@ -1007,7 +1055,7 @@ class ClipWriterStage(CuratorStage):
         total_output_tokens = 0
         num_caption_windows = 0
         for window in clip.windows:
-            window_start_ns, window_end_ns = _window_ns_bounds(clip, window)
+            window_start_ns, window_end_ns = window_ns_bounds(clip, window)
             curr_window: dict[str, Any] = {
                 "start_ns": window_start_ns,
                 "end_ns": window_end_ns,
