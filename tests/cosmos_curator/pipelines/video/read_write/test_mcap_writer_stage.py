@@ -482,3 +482,201 @@ def test_consolidate_no_fragments_is_noop(tmp_path: Path) -> None:
     """Consolidation returns quietly when there is nothing to merge."""
     consolidate_mcap_fragments(str(tmp_path / "missing-output"), "default")
     assert not (tmp_path / "missing-output").exists()
+
+
+_SCENE3D_CALIBRATION = {
+    "width": 640,
+    "height": 360,
+    "K": [554.256, 0.0, 320.0, 0.0, 554.256, 180.0, 0.0, 0.0, 1.0],
+    "D": [0.0, 0.0, 0.0, 0.0, 0.0],
+    "R": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    "P": [554.256, 0.0, 320.0, 0.0, 0.0, 554.256, 180.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    "translation": [0.0, 0.0, 8.25],
+    "rotation": [0.0, 0.17364818, 0.0, 0.98480775],
+    "estimated": True,
+    "ground_inlier_frac": 0.82,
+    "source": "ground-fit",
+}
+
+
+def _add_scene3d(clip: Clip, *, num_points: int = 4) -> np.ndarray:
+    """Attach a Scene3DStage-shaped reconstruction to *clip* and return its packed cloud."""
+    packed = np.arange(num_points * 7, dtype=np.float32).reshape(num_points, 7)
+    clip.scene3d_calibration = dict(_SCENE3D_CALIBRATION)
+    clip.scene3d_background = packed  # type: ignore[assignment]
+    clip.scene3d_objects = [
+        {
+            "timestamp_s": 0.0,
+            "entities": [
+                {
+                    "id": "obj_1",
+                    "lifetime_ns": 400_000_000,
+                    "cube": {
+                        "position": (12.0, 3.0, 0.75),
+                        "size": (4.5, 1.8, 1.5),
+                        "yaw": 0.0,
+                        "color": (0.2, 0.55, 1.0, 0.75),
+                    },
+                    "arrow": {
+                        "position": (12.0, 3.0, 1.8),
+                        "yaw": 0.0,
+                        "length": 4.0,
+                        "color": (0.1, 0.85, 1.0, 1.0),
+                    },
+                    "text": {"position": (12.0, 3.0, 2.2), "value": "car #1", "font_size": 0.5},
+                    "metadata": {"class": "car", "speed_mps": "11.2"},
+                }
+            ],
+        },
+        {"timestamp_s": 5 / FPS, "entities": []},
+    ]
+    return packed
+
+
+def test_scene3d_channels_and_real_calibration(tmp_path: Path) -> None:
+    """A reconstructed clip adds the two 3D channels and upgrades the session records."""
+    video_path = tmp_path / "input" / "video.mp4"
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
+    packed = _add_scene3d(clip)
+    video = _make_video(video_path, [clip])
+
+    _process(tmp_path, video)
+
+    messages, metadata_records = _read_mcap(_fragment_path(tmp_path, video_path, 0))
+    by_topic = _messages_by_topic(messages)
+    assert mcap_schemas.TOPIC_SCENE_BACKGROUND in by_topic
+    assert mcap_schemas.TOPIC_SCENE_OBJECTS in by_topic
+
+    # Background: exactly one cloud per clip, at the clip start, round-tripping intact.
+    ((background_schema, background_message),) = by_topic[mcap_schemas.TOPIC_SCENE_BACKGROUND]
+    assert background_schema is not None
+    assert background_schema.name == "foxglove.PointCloud"
+    assert background_message.log_time == clip.start_ns
+    payload = json.loads(background_message.data)
+    assert payload["frame_id"] == mcap_schemas.MAP_FRAME_ID
+    raw = base64.b64decode(payload["data"])
+    assert len(raw) == packed.shape[0] * mcap_schemas.POINT_CLOUD_STRIDE_BYTES
+    npt.assert_allclose(np.frombuffer(raw, dtype="<f4").reshape(-1, 7), packed)
+
+    # Objects: the empty frame is skipped, so only the populated record is written.
+    object_messages = by_topic[mcap_schemas.TOPIC_SCENE_OBJECTS]
+    assert len(object_messages) == 1
+    objects_schema, objects_message = object_messages[0]
+    assert objects_schema is not None
+    assert objects_schema.name == "foxglove.SceneUpdate"
+    assert objects_message.log_time == clip.start_ns
+    (entity,) = json.loads(objects_message.data)["entities"]
+    assert entity["id"] == "obj_1"
+    assert entity["frame_id"] == mcap_schemas.MAP_FRAME_ID
+
+    # Session records carry the estimate instead of the identity placeholders.
+    ((_, calibration_message),) = by_topic[mcap_schemas.TOPIC_CAMERA_INFO]
+    calibration = json.loads(calibration_message.data)
+    assert calibration["K"][0] == pytest.approx(554.256)
+    assert (calibration["width"], calibration["height"]) == (640, 360)
+    ((_, transform_message),) = by_topic[mcap_schemas.TOPIC_TF_STATIC]
+    transform = json.loads(transform_message.data)["transforms"][0]
+    assert transform["translation"]["z"] == pytest.approx(8.25)
+    assert transform["rotation"]["w"] == pytest.approx(0.98480775)
+
+    session = {record.name: record.metadata for record in metadata_records}["session-metadata"]
+    assert session["scene3d-camera-height-m"] == "8.25"
+    assert session["scene3d-calibration-source"] == "ground-fit"
+
+    # The MCAP is the last consumer, so the payloads are released afterwards.
+    assert clip.scene3d_background.resolve() is None
+    assert clip.scene3d_objects is None
+    assert clip.scene3d_calibration is None
+
+
+def test_scene3d_channels_absent_without_reconstruction(tmp_path: Path) -> None:
+    """Lazy channel registration keeps the 3D topics out of a non-scene3d run."""
+    video_path = tmp_path / "input" / "video.mp4"
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
+    video = _make_video(video_path, [clip])
+
+    _process(tmp_path, video)
+
+    messages, _ = _read_mcap(_fragment_path(tmp_path, video_path, 0))
+    by_topic = _messages_by_topic(messages)
+    assert mcap_schemas.TOPIC_SCENE_BACKGROUND not in by_topic
+    assert mcap_schemas.TOPIC_SCENE_OBJECTS not in by_topic
+    # And the placeholder calibration is untouched.
+    ((_, transform_message),) = by_topic[mcap_schemas.TOPIC_TF_STATIC]
+    transform = json.loads(transform_message.data)["transforms"][0]
+    assert transform["translation"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+
+
+def test_scene3d_background_only_when_objects_missing(tmp_path: Path) -> None:
+    """--scene3d without tracked boxes still yields a cloud and a real calibration."""
+    video_path = tmp_path / "input" / "video.mp4"
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
+    _add_scene3d(clip)
+    clip.scene3d_objects = None
+    video = _make_video(video_path, [clip])
+
+    _process(tmp_path, video)
+
+    by_topic = _messages_by_topic(_read_mcap(_fragment_path(tmp_path, video_path, 0))[0])
+    assert mcap_schemas.TOPIC_SCENE_BACKGROUND in by_topic
+    assert mcap_schemas.TOPIC_SCENE_OBJECTS not in by_topic
+
+
+def test_scene3d_calibration_survives_a_failed_chunk_zero(tmp_path: Path) -> None:
+    """A later chunk's 3D geometry must not float against an identity map frame.
+
+    Chunks are written independently, so if every clip in chunk 0 failed to
+    reconstruct, chunk 1 has to publish the calibration itself or the merged file
+    keeps the identity transform while carrying fitted-frame point clouds.
+    """
+    video_path = tmp_path / "input" / "video.mp4"
+    chunk0_clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
+    chunk1_clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4(), start_s=CLIP_DURATION_S)
+    _add_scene3d(chunk1_clip)
+
+    _process(tmp_path, _make_video(video_path, [chunk0_clip], clip_chunk_index=0, num_clip_chunks=2))
+    _process(tmp_path, _make_video(video_path, [chunk1_clip], clip_chunk_index=1, num_clip_chunks=2))
+
+    chunk1 = _messages_by_topic(_read_mcap(_fragment_path(tmp_path, video_path, 1))[0])
+    ((_, transform_message),) = chunk1[mcap_schemas.TOPIC_TF_STATIC]
+    transform = json.loads(transform_message.data)["transforms"][0]
+    assert transform["translation"]["z"] == pytest.approx(8.25)
+    # Session metadata still belongs to chunk 0 only.
+    assert _read_mcap(_fragment_path(tmp_path, video_path, 1))[1] == []
+
+    # The merged file is what a viewer opens, so check the contradiction is resolved
+    # there: the placeholder and the fitted model must not share a timestamp on a
+    # latched topic, and the fitted one must be the later of the two.
+    consolidate_mcap_fragments(str(tmp_path / "output"), "default")
+    merged = _messages_by_topic(_read_mcap(tmp_path / "output" / "mcap" / "video.mp4.mcap")[0])
+    transforms = sorted(
+        (message.log_time, json.loads(message.data)["transforms"][0])
+        for _, message in merged[mcap_schemas.TOPIC_TF_STATIC]
+    )
+    assert len(transforms) == 2
+    (placeholder_time, placeholder), (fitted_time, fitted) = transforms
+    assert placeholder_time == 0
+    assert placeholder["translation"] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert fitted_time > placeholder_time
+    assert fitted_time == chunk1_clip.start_ns
+    assert fitted["translation"]["z"] == pytest.approx(8.25)
+
+
+def test_tf_static_is_published_without_frame_dimensions(tmp_path: Path) -> None:
+    """A transform needs no frame size, and Foxglove cannot place the image without one."""
+    video_path = tmp_path / "input" / "video.mp4"
+    clip = _make_clip(tmp_path, video_path, mp4_bytes=_make_mp4())
+    video = _make_video(video_path, [clip])
+    video.metadata.width = None
+    video.metadata.height = None
+
+    _process(tmp_path, video)
+
+    by_topic = _messages_by_topic(_read_mcap(_fragment_path(tmp_path, video_path, 0))[0])
+    # Intrinsics genuinely need a frame size, so that topic is omitted...
+    assert mcap_schemas.TOPIC_CAMERA_INFO not in by_topic
+    # ...but the identity transform is still published.
+    ((_, transform_message),) = by_topic[mcap_schemas.TOPIC_TF_STATIC]
+    transform = json.loads(transform_message.data)["transforms"][0]
+    assert transform["child_frame_id"] == "camera"
+    assert transform["translation"] == {"x": 0.0, "y": 0.0, "z": 0.0}

@@ -238,8 +238,21 @@ class McapWriterStage(CuratorStage):
         """
         with _open_mcap_writer(out_file) as writer:
             channels = _McapChannels(writer)
+            calibration = _video_scene3d_calibration(video)
             if video.clip_chunk_index == 0:
-                self._write_session_start(writer, channels, video)
+                self._write_session_start(writer, channels, video, calibration)
+            elif calibration is not None:
+                # Chunks are written independently, so a later chunk cannot know whether
+                # chunk 0 had a reconstruction to publish. Re-emitting the calibration
+                # keeps this chunk's 3D geometry anchored to a real map frame even when
+                # every clip in chunk 0 failed and published a placeholder.
+                #
+                # Stamped at this chunk's first clip rather than 0: the merged file would
+                # otherwise carry two contradictory models at the same instant on a
+                # latched topic, and which one a viewer picks would be undefined. A later
+                # timestamp makes the measured model deterministically supersede the
+                # placeholder from the point its clips begin.
+                self._write_calibration(channels, video, calibration, log_time=_chunk_base_ns(video))
             for clip in video.clips:
                 base_ns = _clip_base_ns(clip)
                 media = self._read_clip_mp4(clip, video.relative_path)
@@ -247,6 +260,7 @@ class McapWriterStage(CuratorStage):
                     _write_clip_media(channels, clip, base_ns, media)
                 self._write_clip_annotations(channels, clip, base_ns)
                 self._write_clip_embedding(channels, clip, base_ns)
+                _write_clip_scene3d(channels, clip, base_ns)
 
     def _read_clip_mp4(self, clip: Clip, relative_path: str) -> bytes | None:
         """Read one clip's mp4 back from the ``clips/`` output written by ClipWriterStage."""
@@ -259,7 +273,7 @@ class McapWriterStage(CuratorStage):
             logger.warning(f"Clip {clip.uuid} from {clip.source_video} has no written mp4; skipping MCAP media")
             return None
 
-    def _session_metadata(self, video: Video) -> dict[str, str]:
+    def _session_metadata(self, video: Video, calibration: dict[str, Any] | None) -> dict[str, str]:
         meta = video.metadata
         values: dict[str, Any] = {
             "source-video": video.input_path,
@@ -278,27 +292,60 @@ class McapWriterStage(CuratorStage):
             "embedding-model-version": self._embedding_model_version,
             "curator-version": _curator_version(),
         }
+        if calibration is not None:
+            values["scene3d-camera-height-m"] = round(float(calibration["translation"][2]), 4)
+            values["scene3d-focal-px"] = round(float(calibration["K"][0]), 4)
+            values["scene3d-calibration-source"] = str(calibration.get("source", "unknown"))
+            values["scene3d-ground-inlier-frac"] = round(float(calibration.get("ground_inlier_frac", 0.0)), 4)
         return {key: str(value) for key, value in values.items() if value is not None}
 
-    def _write_session_start(self, writer: Writer, channels: _McapChannels, video: Video) -> None:
+    def _write_session_start(
+        self,
+        writer: Writer,
+        channels: _McapChannels,
+        video: Video,
+        calibration: dict[str, Any] | None,
+    ) -> None:
         """Write the one-shot records: session metadata, camera calibration, static transform.
 
         Emitted at log_time 0 (the source-video start on the 0-based timeline),
-        from chunk 0 only so the merged file carries them exactly once.
+        from chunk 0 only so the merged file carries the metadata exactly once.
         """
-        writer.add_metadata(mcap_schemas.SESSION_METADATA_RECORD_NAME, self._session_metadata(video))
-        if video.metadata.width and video.metadata.height:
+        writer.add_metadata(mcap_schemas.SESSION_METADATA_RECORD_NAME, self._session_metadata(video, calibration))
+        self._write_calibration(channels, video, calibration)
+
+    def _write_calibration(
+        self,
+        channels: _McapChannels,
+        video: Video,
+        calibration: dict[str, Any] | None,
+        *,
+        log_time: int = 0,
+    ) -> None:
+        """Write ``/camera/camera-info`` and ``/tf-static``.
+
+        Falls back to a placeholder camera model when the video was not reconstructed,
+        so both records describe the same camera. Intrinsics need a frame size, so a
+        video with neither an estimate nor known dimensions publishes no calibration
+        rather than one full of zeroes — but the transform does not depend on frame
+        size and is always published, since without it Foxglove cannot place the image
+        stream in the 3D panel at all.
+        """
+        model = calibration
+        if model is None and video.metadata.width and video.metadata.height:
+            model = mcap_schemas.placeholder_camera_model(video.metadata.width, video.metadata.height)
+        if model is not None:
             channels.add_message(
                 mcap_schemas.TOPIC_CAMERA_INFO,
-                0,
-                mcap_schemas.camera_calibration_message(
-                    0, DEFAULT_FRAME_ID, video.metadata.width, video.metadata.height
-                ),
+                log_time,
+                mcap_schemas.camera_calibration_message(log_time, DEFAULT_FRAME_ID, model),
             )
         channels.add_message(
             mcap_schemas.TOPIC_TF_STATIC,
-            0,
-            mcap_schemas.frame_transforms_message(0, DEFAULT_FRAME_ID),
+            log_time,
+            mcap_schemas.frame_transforms_message(
+                log_time, DEFAULT_FRAME_ID, model or mcap_schemas.IDENTITY_CAMERA_POSE
+            ),
         )
 
     def _write_clip_annotations(self, channels: _McapChannels, clip: Clip, base_ns: int) -> None:
@@ -339,6 +386,55 @@ class McapWriterStage(CuratorStage):
             mcap_schemas.clip_embedding_message(
                 base_ns, self._embedding_algorithm, self._embedding_model_version, embedding
             ),
+        )
+
+
+def _chunk_base_ns(video: Video) -> int:
+    """Source-timeline start of a chunk: the earliest base of the clips it holds."""
+    return min((_clip_base_ns(clip) for clip in video.clips), default=0)
+
+
+def _video_scene3d_calibration(video: Video) -> dict[str, Any] | None:
+    """Return the video's 3D calibration, taken from its first reconstructed clip.
+
+    One transform per video is the right granularity: ``/tf-static`` and
+    ``/camera/camera-info`` are session-level records written once from chunk 0,
+    and a clip that fails reconstruction should not leave the file without a
+    camera model.
+    """
+    for clip in video.clips:
+        calibration: dict[str, Any] | None = clip.scene3d_calibration
+        if calibration is not None:
+            return calibration
+    return None
+
+
+def _write_clip_scene3d(channels: _McapChannels, clip: Clip, base_ns: int) -> None:
+    """Write the clip's 3D background cloud and per-frame object cuboids.
+
+    The cloud is emitted once at the clip start; Foxglove's 3D panel shows the
+    most recent one, so the backdrop follows clip boundaries. Cuboid timestamps use
+    the same clip-relative arithmetic as the SAM3 annotations, keeping every
+    per-frame topic on one timeline.
+    """
+    background = clip.scene3d_background.resolve()
+    if background is not None and background.size:
+        channels.add_message(
+            mcap_schemas.TOPIC_SCENE_BACKGROUND,
+            base_ns,
+            mcap_schemas.point_cloud_message(base_ns, mcap_schemas.MAP_FRAME_ID, background),
+        )
+    for record in clip.scene3d_objects or []:
+        entities = record.get("entities") or []
+        if not entities:
+            continue
+        timestamp_s = record.get("timestamp_s")
+        offset_ns = seconds_to_ns(float(timestamp_s)) if timestamp_s is not None else 0
+        log_time = base_ns + offset_ns
+        channels.add_message(
+            mcap_schemas.TOPIC_SCENE_OBJECTS,
+            log_time,
+            mcap_schemas.scene_update_message(log_time, mcap_schemas.MAP_FRAME_ID, entities),
         )
 
 

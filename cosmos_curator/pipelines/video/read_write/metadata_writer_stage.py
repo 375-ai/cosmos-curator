@@ -93,16 +93,22 @@ def select_clip_embedding(clip: Clip, embedding_algorithm: str) -> npt.NDArray[n
 def drop_clip_intermediate_data(clip: Clip, *, keep_mcap_payloads: bool = False) -> None:
     """Drop clip payloads (encoded data, embeddings, window artifacts) after the final write.
 
-    ``keep_mcap_payloads`` retains only the small annotations a downstream
-    ``McapWriterStage`` reads (clip embeddings, window captions). The mp4 bytes are
-    dropped either way — the MCAP writer reads clips back from the written
-    ``clips/`` output instead of carrying them through the object store.
+    ``keep_mcap_payloads`` retains only the annotations a downstream
+    ``McapWriterStage`` reads (clip embeddings, window captions, and the 3D scene
+    payloads). The mp4 bytes are dropped either way — the MCAP writer reads clips
+    back from the written ``clips/`` output instead of carrying them through the
+    object store.
     """
     clip.encoded_data.drop()
     if not keep_mcap_payloads:
         clip.intern_video_2_embedding = None
         clip.cosmos_embed1_embedding = None
         clip.openai_embedding = None
+        # The background cloud is the largest of these, so releasing it once the
+        # MCAP is written matters.
+        clip.scene3d_background.drop()
+        clip.scene3d_objects = None
+        clip.scene3d_calibration = None
     for window in clip.windows:
         window.mp4_bytes.drop()
         window.model_input.clear()
@@ -157,6 +163,7 @@ class ClipWriterStage(CuratorStage):
         caption_quality_flags_enabled: bool = True,
         generate_cosmos_predict_dataset: bool = False,
         sam3_output_format: Sam3OutputFormat = "native",
+        scene3d_write_json: bool = False,
         retain_clip_data: bool = False,
         verbose: bool = False,
         log_stats: bool = False,
@@ -192,6 +199,7 @@ class ClipWriterStage(CuratorStage):
             msg = f"unknown sam3_output_format {sam3_output_format!r}; expected one of {SAM3_OUTPUT_FORMATS}"
             raise ValueError(msg)
         self._sam3_output_format = sam3_output_format
+        self._scene3d_write_json = scene3d_write_json
         # A downstream stage (e.g. the MCAP writer) still needs the clip payloads;
         # it becomes responsible for dropping them once done.
         self._retain_clip_data = retain_clip_data
@@ -386,6 +394,11 @@ class ClipWriterStage(CuratorStage):
         return ClipWriterStage._get_output_path(output_path, "style_transfer")
 
     @staticmethod
+    def get_output_path_scene3d(output_path: str) -> str:
+        """Get path to store per-clip ``scene3d/<uuid>.json`` reconstruction sidecars."""
+        return ClipWriterStage._get_output_path(output_path, "scene3d")
+
+    @staticmethod
     def get_video_uuid(input_video_path: str) -> uuid.UUID:
         """Get a UUID for the video based on its input path."""
         return uuid.uuid5(uuid.NAMESPACE_URL, f"{input_video_path}")
@@ -500,6 +513,10 @@ class ClipWriterStage(CuratorStage):
                     # is empty), so ``is not None`` is the canonical "did SAM3 run?" signal.
                     if any(clip.sam3_instances is not None for clip in video.clips):
                         futures_clips += [executor.submit(self._write_clip_sam3, clip) for clip in video.clips]
+                    # Scene3DStage sets ``scene3d_calibration`` on every clip it reconstructs,
+                    # so it is the canonical "did the 3D stage run?" signal.
+                    if self._scene3d_write_json and any(clip.scene3d_calibration is not None for clip in video.clips):
+                        futures_clips += [executor.submit(self._write_clip_scene3d, clip) for clip in video.clips]
                     # StyleTransferStage populates style_transfer_video only when it runs; the
                     # resolve() inside the writer no-ops for clips without it.
                     if any(clip.style_transfer_video.resolve() is not None for clip in video.clips):
@@ -884,6 +901,25 @@ class ClipWriterStage(CuratorStage):
                 clip.source_video,
             )
 
+        return clip_stats
+
+    def _write_clip_scene3d(self, clip: Clip) -> ClipStats:
+        """Write the per-clip ``scene3d/<uuid>.json`` reconstruction sidecar.
+
+        Carries the estimated calibration and the per-frame cuboids. The background
+        point cloud is deliberately excluded: tens of thousands of packed floats belong
+        in the MCAP's binary channel, not in JSON.
+        """
+        clip_stats = ClipStats()
+        if self._dry_run or clip.scene3d_calibration is None:
+            return clip_stats
+        dest = self._get_clip_uri(clip.uuid, self.get_output_path_scene3d(self._output_path), "json")
+        self._write_json_data(
+            {"calibration": clip.scene3d_calibration, "frames": clip.scene3d_objects or []},
+            dest,
+            f"scene3d {clip.uuid}",
+            clip.source_video,
+        )
         return clip_stats
 
     def _write_clip_sam3_frames(self, clip: Clip, source_video: str) -> None:

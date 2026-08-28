@@ -127,6 +127,14 @@ from cosmos_curator.pipelines.video.read_write.read_write_builders import (
 from cosmos_curator.pipelines.video.read_write.summary_writers import (
     write_split_summary,
 )
+from cosmos_curator.pipelines.video.scene3d.calibration import CameraOverrides, GroundFitParams
+from cosmos_curator.pipelines.video.scene3d.cli_args import add_scene3d_args
+from cosmos_curator.pipelines.video.scene3d.lifting import CloudParams
+from cosmos_curator.pipelines.video.scene3d.object_lift import ObjectLiftParams
+from cosmos_curator.pipelines.video.scene3d.scene3d_builders import (
+    Scene3DConfig,
+    build_scene3d_stages,
+)
 from cosmos_curator.pipelines.video.style_transfer.style_transfer_builders import (
     STYLE_TRANSFER_CONTROL_PRESETS,
     STYLE_TRANSFER_CONTROLS,
@@ -1006,6 +1014,59 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
             )
         )
 
+    # --- 3D scene reconstruction (optional) ---
+    # Placed after SAM3 (whose tracks become the cuboids) and before the writers,
+    # because it needs clip.encoded_data, which ClipWriterStage drops.
+    if args.scene3d:
+        if not args.sam3:
+            logger.warning(
+                "--scene3d without --sam3: the MCAP will carry /scene/background and the estimated "
+                "camera calibration, but /scene/objects needs tracked boxes and will be empty."
+            )
+        if not args.generate_mcap and not args.scene3d_write_json:
+            logger.warning(
+                "--scene3d without --generate-mcap or --scene3d-write-json: the reconstruction "
+                "would be computed and then discarded."
+            )
+        stages.extend(
+            build_scene3d_stages(
+                Scene3DConfig(
+                    depth_variant=args.scene3d_depth_variant,
+                    depth_long_side=args.scene3d_depth_long_side,
+                    target_fps=args.scene3d_target_fps,
+                    max_clip_duration_s=args.scene3d_max_clip_duration_s,
+                    camera=CameraOverrides(
+                        hfov_deg=args.scene3d_hfov_deg,
+                        focal_px=args.scene3d_focal_px,
+                        camera_height_m=args.scene3d_camera_height_m,
+                        camera_tilt_deg=args.scene3d_camera_tilt_deg,
+                        camera_roll_deg=args.scene3d_camera_roll_deg,
+                    ),
+                    ground=GroundFitParams(
+                        inlier_tol_m=args.scene3d_ground_inlier_tol_m,
+                        min_inlier_frac=args.scene3d_ground_min_inlier_frac,
+                    ),
+                    cloud=CloudParams(
+                        max_range_m=args.scene3d_max_range_m,
+                        max_points=args.scene3d_max_points,
+                    ),
+                    objects=ObjectLiftParams(
+                        dimension_mode=args.scene3d_dimension_mode,
+                        snap_to_ground=args.scene3d_snap_to_ground,
+                        max_range_m=args.scene3d_max_range_m,
+                        min_track_points=args.scene3d_min_track_points,
+                        min_net_displacement_m=args.scene3d_min_net_displacement_m,
+                        max_speed_mps=args.scene3d_max_speed_mps,
+                    ),
+                    background_mode=args.scene3d_background_mode,
+                    object_depth_mode=args.scene3d_object_depth,
+                    gpus_per_worker=args.scene3d_gpus_per_worker,
+                    num_workers_per_node=args.num_scene3d_workers_per_node,
+                    verbose=args.verbose,
+                )
+            )
+        )
+
     # --- T5 encoding (optional) ---
     if args.generate_cosmos_predict_dataset:
         stages.extend(
@@ -1076,6 +1137,7 @@ def _assemble_stages(  # noqa: C901, PLR0912, PLR0915
                 caption_quality_flags_enabled=caption_quality_flags_enabled,
                 generate_cosmos_predict_dataset=args.generate_cosmos_predict_dataset,
                 sam3_output_format=args.sam3_output_format,
+                scene3d_write_json=args.scene3d and args.scene3d_write_json,
                 generate_mcap=generate_mcap,
                 mcap_num_workers_per_node=args.num_mcap_writer_workers_per_node,
                 num_workers_per_node=args.num_clip_writer_workers_per_node,
@@ -1367,6 +1429,7 @@ def _setup_parser(parser: argparse.ArgumentParser) -> None:  # noqa: PLR0915
     # --- SAM3 tracking + per-event VLM captioning (optional) ---
     add_sam3_args(parser)
     add_event_caption_args(parser)
+    add_scene3d_args(parser)
     parser.add_argument(
         "--splitting-algorithm",
         type=str,

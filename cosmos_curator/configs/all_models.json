@@ -91,6 +91,20 @@
         "precision": "BF16",
         "nvcf_model_id": "cosmos3_super_64b"
     },
+    "depth_anything_v2_metric_indoor": {
+        "model_id": "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
+        "version": "d2fc6a93601aabb1139a3bf0ebfcb4e89c67817f",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "depth_anything_v2_metric_indoor_large"
+    },
+    "depth_anything_v2_metric_outdoor": {
+        "model_id": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
+        "version": "4eab4cf1983c2801c515804005214de56a4b67cc",
+        "filelist": null,
+        "precision": "FP32",
+        "nvcf_model_id": "depth_anything_v2_metric_outdoor_large"
+    },
     "gpt2": {
         "model_id": "openai-community/gpt2",
         "version": "607a30d783dfa663caf39e06633721c8d4cfcd7e",

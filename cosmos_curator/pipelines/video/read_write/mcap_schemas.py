@@ -29,7 +29,8 @@ are base64 strings per the Foxglove convention.
 
 import base64
 import json
-from collections.abc import Buffer
+import math
+from collections.abc import Buffer, Sequence
 from typing import Any
 
 import numpy as np
@@ -43,8 +44,13 @@ TOPIC_AUDIO_RAW = "/camera/audio-raw"
 TOPIC_CAMERA_INFO = "/camera/camera-info"
 TOPIC_TF_STATIC = "/tf-static"
 TOPIC_CLIP_EMBEDDING = "/clip/embedding"
+TOPIC_SCENE_BACKGROUND = "/scene/background"
+TOPIC_SCENE_OBJECTS = "/scene/objects"
 
 SESSION_METADATA_RECORD_NAME = "session-metadata"
+
+# Parent frame of the static transform; the frame 3D geometry is expressed in.
+MAP_FRAME_ID = "map"
 
 JSONSCHEMA_ENCODING = "jsonschema"
 JSON_MESSAGE_ENCODING = "json"
@@ -56,6 +62,29 @@ _TIME_SCHEMA: dict[str, Any] = {
         "sec": {"type": "integer", "minimum": 0},
         "nsec": {"type": "integer", "minimum": 0, "maximum": 999999999},
     },
+}
+
+_VECTOR3_SCHEMA: dict[str, Any] = {
+    "title": "foxglove.Vector3",
+    "type": "object",
+    "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+    },
+    "required": ["x", "y", "z"],
+}
+
+_QUATERNION_SCHEMA: dict[str, Any] = {
+    "title": "foxglove.Quaternion",
+    "type": "object",
+    "properties": {
+        "x": {"type": "number"},
+        "y": {"type": "number"},
+        "z": {"type": "number"},
+        "w": {"type": "number"},
+    },
+    "required": ["x", "y", "z", "w"],
 }
 
 COMPRESSED_VIDEO_SCHEMA_NAME = "foxglove.CompressedVideo"
@@ -143,27 +172,8 @@ FRAME_TRANSFORMS_SCHEMA: dict[str, Any] = {
                     "timestamp": _TIME_SCHEMA,
                     "parent_frame_id": {"type": "string"},
                     "child_frame_id": {"type": "string"},
-                    "translation": {
-                        "title": "foxglove.Vector3",
-                        "type": "object",
-                        "properties": {
-                            "x": {"type": "number"},
-                            "y": {"type": "number"},
-                            "z": {"type": "number"},
-                        },
-                        "required": ["x", "y", "z"],
-                    },
-                    "rotation": {
-                        "title": "foxglove.Quaternion",
-                        "type": "object",
-                        "properties": {
-                            "x": {"type": "number"},
-                            "y": {"type": "number"},
-                            "z": {"type": "number"},
-                            "w": {"type": "number"},
-                        },
-                        "required": ["x", "y", "z", "w"],
-                    },
+                    "translation": _VECTOR3_SCHEMA,
+                    "rotation": _QUATERNION_SCHEMA,
                 },
                 "required": ["timestamp", "parent_frame_id", "child_frame_id", "translation", "rotation"],
             },
@@ -202,6 +212,71 @@ CLIP_EMBEDDING_SCHEMA: dict[str, Any] = {
 }
 
 
+POINT_CLOUD_SCHEMA_NAME = "foxglove.PointCloud"
+POINT_CLOUD_SCHEMA: dict[str, Any] = {
+    "title": POINT_CLOUD_SCHEMA_NAME,
+    "description": "A collection of N-dimensional points in a frame of reference",
+    "type": "object",
+    "properties": {
+        "timestamp": {**_TIME_SCHEMA, "description": "Timestamp of point cloud"},
+        "frame_id": {"type": "string", "description": "Frame of reference the points are in."},
+        "pose": {
+            "type": "object",
+            "title": "foxglove.Pose",
+            "properties": {
+                "position": _VECTOR3_SCHEMA,
+                "orientation": _QUATERNION_SCHEMA,
+            },
+            "description": "Origin of the point cloud relative to the frame of reference.",
+        },
+        "point_stride": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of bytes between points in the data.",
+        },
+        "fields": {
+            "type": "array",
+            "items": {
+                "title": "foxglove.PackedElementField",
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "type": {"type": "integer", "minimum": 0, "description": "Numeric type; 7 = FLOAT32."},
+                },
+                "required": ["name", "offset", "type"],
+            },
+            "description": "Fields in each point, in order.",
+        },
+        "data": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "Point data, interpreted using `fields`.",
+        },
+    },
+    "required": ["timestamp", "frame_id", "pose", "point_stride", "fields", "data"],
+}
+
+SCENE_UPDATE_SCHEMA_NAME = "foxglove.SceneUpdate"
+SCENE_UPDATE_SCHEMA: dict[str, Any] = {
+    "title": SCENE_UPDATE_SCHEMA_NAME,
+    "description": "An update to the entities displayed in a 3D scene",
+    "type": "object",
+    "properties": {
+        "deletions": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Scene entities to delete.",
+        },
+        "entities": {
+            "type": "array",
+            "items": {"type": "object"},
+            "description": "Scene entities to add or replace.",
+        },
+    },
+    "required": ["deletions", "entities"],
+}
+
 # Every topic carries exactly one schema; channel registration is driven by this map.
 TOPIC_SCHEMAS: dict[str, dict[str, Any]] = {
     TOPIC_IMAGE_RAW: COMPRESSED_VIDEO_SCHEMA,
@@ -210,6 +285,8 @@ TOPIC_SCHEMAS: dict[str, dict[str, Any]] = {
     TOPIC_CAMERA_INFO: CAMERA_CALIBRATION_SCHEMA,
     TOPIC_TF_STATIC: FRAME_TRANSFORMS_SCHEMA,
     TOPIC_CLIP_EMBEDDING: CLIP_EMBEDDING_SCHEMA,
+    TOPIC_SCENE_BACKGROUND: POINT_CLOUD_SCHEMA,
+    TOPIC_SCENE_OBJECTS: SCENE_UPDATE_SCHEMA,
 }
 
 
@@ -269,45 +346,216 @@ def clip_embedding_message(ns: int, model_name: str, model_version: str, vector:
     )
 
 
-def camera_calibration_message(ns: int, frame_id: str, width: int, height: int) -> bytes:
-    """Build a ``foxglove.CameraCalibration`` JSON payload.
+# Pose half of a camera model: map and camera coincide. Kept separate because a
+# transform is publishable even for a video whose frame size is unknown.
+IDENTITY_CAMERA_POSE: dict[str, Any] = {
+    "translation": [0.0, 0.0, 0.0],
+    "rotation": [0.0, 0.0, 0.0, 1.0],
+}
 
-    No real calibration source exists in the pipeline; K/R/P are identity-style
-    placeholders with the principal point at the image center so the message is
-    well-formed for Foxglove without claiming a measured focal length.
+
+def placeholder_camera_model(width: int, height: int) -> dict[str, Any]:
+    """Build an identity-style camera model for a video with no measured calibration.
+
+    Expressed as a value in the same shape a real estimate takes, so
+    :func:`camera_calibration_message` has one code path rather than a branch. K/R/P
+    are identity-style with the principal point at the image centre: well-formed for
+    Foxglove without claiming a focal length the pipeline does not know.
     """
     cx = width / 2
     cy = height / 2
-    k = [1.0, 0.0, cx, 0.0, 1.0, cy, 0.0, 0.0, 1.0]
-    r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-    p = [1.0, 0.0, cx, 0.0, 0.0, 1.0, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+    return {
+        "width": width,
+        "height": height,
+        "K": [1.0, 0.0, cx, 0.0, 1.0, cy, 0.0, 0.0, 1.0],
+        "D": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "R": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        "P": [1.0, 0.0, cx, 0.0, 0.0, 1.0, cy, 0.0, 0.0, 0.0, 1.0, 0.0],
+        **IDENTITY_CAMERA_POSE,
+    }
+
+
+def camera_calibration_message(ns: int, frame_id: str, calibration: dict[str, Any]) -> bytes:
+    """Build a ``foxglove.CameraCalibration`` JSON payload from a camera model.
+
+    ``calibration`` is either ``Scene3DStage``'s estimate or
+    :func:`placeholder_camera_model`; both carry the same keys, and its
+    ``width``/``height`` are the single source of truth for the published size.
+    """
     return _encode(
         {
             "timestamp": ns_to_time(ns),
             "frame_id": frame_id,
-            "width": width,
-            "height": height,
+            "width": int(calibration["width"]),
+            "height": int(calibration["height"]),
             "distortion_model": "plumb_bob",
-            "D": [0.0, 0.0, 0.0, 0.0, 0.0],
-            "K": k,
-            "R": r,
-            "P": p,
+            "D": [float(value) for value in calibration["D"]],
+            "K": [float(value) for value in calibration["K"]],
+            "R": [float(value) for value in calibration["R"]],
+            "P": [float(value) for value in calibration["P"]],
         }
     )
 
 
-def frame_transforms_message(ns: int, child_frame_id: str) -> bytes:
-    """Build a ``foxglove.FrameTransforms`` JSON payload with one identity map->camera transform."""
+def frame_transforms_message(ns: int, child_frame_id: str, pose: dict[str, Any]) -> bytes:
+    """Build a ``foxglove.FrameTransforms`` JSON payload for the map->camera transform.
+
+    ``pose`` is any mapping carrying ``translation`` and ``rotation`` — a full camera
+    model, or :data:`IDENTITY_CAMERA_POSE` when nothing is known. A reconstructed
+    video publishes the camera's real height and orientation above the fitted ground
+    plane; everything else publishes the identity.
+    """
+    translation = [float(value) for value in pose["translation"]]
+    rotation = [float(value) for value in pose["rotation"]]
     return _encode(
         {
             "transforms": [
                 {
                     "timestamp": ns_to_time(ns),
-                    "parent_frame_id": "map",
+                    "parent_frame_id": MAP_FRAME_ID,
                     "child_frame_id": child_frame_id,
-                    "translation": {"x": 0.0, "y": 0.0, "z": 0.0},
-                    "rotation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                    "translation": {"x": translation[0], "y": translation[1], "z": translation[2]},
+                    "rotation": {
+                        "x": rotation[0],
+                        "y": rotation[1],
+                        "z": rotation[2],
+                        "w": rotation[3],
+                    },
                 }
             ]
+        }
+    )
+
+
+# foxglove.PackedElementField numeric type for float32.
+_PACKED_FLOAT32 = 7
+# x, y, z, red, green, blue, alpha -- 7 float32 values per point.
+POINT_CLOUD_STRIDE_BYTES = 28
+_POINT_CLOUD_FIELDS: list[dict[str, Any]] = [
+    {"name": "x", "offset": 0, "type": _PACKED_FLOAT32},
+    {"name": "y", "offset": 4, "type": _PACKED_FLOAT32},
+    {"name": "z", "offset": 8, "type": _PACKED_FLOAT32},
+    {"name": "red", "offset": 12, "type": _PACKED_FLOAT32},
+    {"name": "green", "offset": 16, "type": _PACKED_FLOAT32},
+    {"name": "blue", "offset": 20, "type": _PACKED_FLOAT32},
+    {"name": "alpha", "offset": 24, "type": _PACKED_FLOAT32},
+]
+_IDENTITY_POSE: dict[str, Any] = {
+    "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+    "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+}
+
+
+def point_cloud_message(ns: int, frame_id: str, packed: npt.NDArray[np.float32]) -> bytes:
+    """Build a ``foxglove.PointCloud`` JSON payload from a packed ``(N, 7)`` array.
+
+    Colours are separate float32 red/green/blue/alpha channels in ``0..1``, which
+    Foxglove's "RGBA (separate fields)" colour mode reads unambiguously and
+    auto-selects, so the 3D panel needs no manual setup. The array is already in
+    the wire layout (see ``scene3d.lifting.pack_point_cloud``), so this only
+    base64-encodes it.
+    """
+    # `pack_point_cloud` already yields C-contiguous float32, so encode its buffer directly.
+    raw = np.ascontiguousarray(packed, dtype="<f4")
+    return _encode(
+        {
+            "timestamp": ns_to_time(ns),
+            "frame_id": frame_id,
+            "pose": _IDENTITY_POSE,
+            "point_stride": POINT_CLOUD_STRIDE_BYTES,
+            "fields": _POINT_CLOUD_FIELDS,
+            "data": base64.b64encode(raw.data).decode("ascii"),
+        }
+    )
+
+
+def _pose(position: Sequence[float], yaw: float = 0.0) -> dict[str, Any]:
+    """Build a ``foxglove.Pose`` with a rotation about the map z-axis only."""
+    return {
+        "position": {"x": float(position[0]), "y": float(position[1]), "z": float(position[2])},
+        "orientation": {
+            "x": 0.0,
+            "y": 0.0,
+            "z": float(math.sin(yaw / 2.0)),
+            "w": float(math.cos(yaw / 2.0)),
+        },
+    }
+
+
+def _color(rgba: Sequence[float]) -> dict[str, float]:
+    """Build a ``foxglove.Color`` from an ``(r, g, b, a)`` sequence."""
+    return {"r": float(rgba[0]), "g": float(rgba[1]), "b": float(rgba[2]), "a": float(rgba[3])}
+
+
+def _scene_entity(ns: int, frame_id: str, entity: dict[str, Any]) -> dict[str, Any]:
+    """Render one ``scene3d`` cuboid record as a ``foxglove.SceneEntity``.
+
+    Every primitive array is emitted even when empty: some Foxglove builds reject
+    an entity with missing primitive keys.
+    """
+    cube = entity["cube"]
+    cubes = [
+        {
+            "pose": _pose(cube["position"], float(cube["yaw"])),
+            "size": {
+                "x": float(cube["size"][0]),
+                "y": float(cube["size"][1]),
+                "z": float(cube["size"][2]),
+            },
+            "color": _color(cube["color"]),
+        }
+    ]
+    arrows: list[dict[str, Any]] = []
+    arrow = entity.get("arrow")
+    if arrow is not None:
+        length = float(arrow["length"])
+        arrows.append(
+            {
+                "pose": _pose(arrow["position"], float(arrow["yaw"])),
+                "shaft_length": length * 0.7,
+                "shaft_diameter": 0.5,
+                "head_length": length * 0.3,
+                "head_diameter": 1.0,
+                "color": _color(arrow["color"]),
+            }
+        )
+    texts: list[dict[str, Any]] = []
+    text = entity.get("text")
+    if text is not None:
+        texts.append(
+            {
+                "pose": _pose(text["position"]),
+                "billboard": True,
+                "font_size": float(text["font_size"]),
+                "scale_invariant": False,
+                "color": {"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0},
+                "text": str(text["value"]),
+            }
+        )
+    lifetime_ns = int(entity["lifetime_ns"])
+    return {
+        "timestamp": ns_to_time(ns),
+        "frame_id": frame_id,
+        "id": str(entity["id"]),
+        "lifetime": ns_to_time(lifetime_ns),
+        "frame_locked": False,
+        "metadata": [{"key": key, "value": str(value)} for key, value in entity["metadata"].items()],
+        "arrows": arrows,
+        "cubes": cubes,
+        "spheres": [],
+        "cylinders": [],
+        "lines": [],
+        "triangles": [],
+        "texts": texts,
+        "models": [],
+    }
+
+
+def scene_update_message(ns: int, frame_id: str, entities: list[dict[str, Any]]) -> bytes:
+    """Build a ``foxglove.SceneUpdate`` JSON payload from ``scene3d`` cuboid records."""
+    return _encode(
+        {
+            "deletions": [],
+            "entities": [_scene_entity(ns, frame_id, entity) for entity in entities],
         }
     )

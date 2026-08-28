@@ -25,6 +25,7 @@ from cosmos_curator.core.utils.config.args_utils import fill_default_args
 from cosmos_curator.pipelines.common.model_constraints import PreprocessMode
 from cosmos_curator.pipelines.video.captioning.captioning_builders import CaptioningConfig, VllmAsyncCaptionConfig
 from cosmos_curator.pipelines.video.read_write.metadata_writer_stage import ClipWriterStage
+from cosmos_curator.pipelines.video.scene3d.scene3d_stage import Scene3DStage
 from cosmos_curator.pipelines.video.splitting_pipeline import _assemble_stages, _setup_parser
 from cosmos_curator.pipelines.video.utils.data_model import (
     VllmAsyncConfig,
@@ -545,3 +546,110 @@ def test_vllm_video_max_pixels_help_text_names_scope_bounds_and_grid() -> None:
     assert "[100352, 602112]" in help_text
     assert "28 for CPU prep" in help_text
     assert "32 for Qwen3" in help_text
+
+
+def test_scene3d_stage_is_absent_by_default() -> None:
+    """3D reconstruction is opt-in; nothing changes for existing invocations."""
+    stages = _assemble_stages(_caption_args([]))
+
+    assert not any(isinstance(_stage_object(stage), Scene3DStage) for stage in stages)
+
+
+def test_scene3d_flag_appends_the_stage_before_the_writers() -> None:
+    """The stage must run while clip.encoded_data still exists, i.e. before ClipWriterStage."""
+    args = _caption_args(["--scene3d", "--sam3", "--sam3-prompts", "a car"])
+
+    stages = [_stage_object(stage) for stage in _assemble_stages(args)]
+    names = [type(stage).__name__ for stage in stages]
+
+    assert "Scene3DStage" in names
+    assert names.index("Scene3DStage") < names.index("ClipWriterStage")
+    assert names.index("SAM3BBoxStage") < names.index("Scene3DStage")
+
+
+def test_scene3d_options_reach_the_stage() -> None:
+    """Every knob threads from argparse through Scene3DConfig into the stage."""
+    args = _caption_args(
+        [
+            "--scene3d",
+            "--scene3d-depth-variant",
+            "indoor",
+            "--scene3d-hfov-deg",
+            "72",
+            "--scene3d-camera-height-m",
+            "12.5",
+            "--scene3d-max-points",
+            "50000",
+            "--scene3d-max-range-m",
+            "80",
+            "--scene3d-dimension-mode",
+            "depth",
+            "--no-scene3d-snap-to-ground",
+            "--scene3d-background-mode",
+            "ground-plane",
+            "--scene3d-gpus-per-worker",
+            "0.25",
+        ]
+    )
+
+    stage = next(stage for stage in map(_stage_object, _assemble_stages(args)) if isinstance(stage, Scene3DStage))
+
+    assert stage.model.model_id_names == ["depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"]
+    assert stage.resources.gpus == 0.25
+    assert stage._camera_overrides.hfov_deg == 72.0
+    assert stage._camera_overrides.camera_height_m == 12.5
+    assert stage._cloud_params.max_points == 50_000
+    assert stage._cloud_params.max_range_m == 80.0
+    assert stage._object_params.dimension_mode == "depth"
+    assert stage._object_params.snap_to_ground is False
+    assert stage._background_mode == "ground-plane"
+
+
+def test_scene3d_without_sam3_warns_but_still_builds() -> None:
+    """The background cloud is useful on its own, so a missing detector is not fatal."""
+    args = _caption_args(["--scene3d"])
+
+    stages = [type(_stage_object(stage)).__name__ for stage in _assemble_stages(args)]
+
+    assert "Scene3DStage" in stages
+    assert "SAM3BBoxStage" not in stages
+
+
+def test_scene3d_write_json_requires_the_scene3d_flag() -> None:
+    """The sidecar knob is inert unless the reconstruction actually runs."""
+    without = _caption_args(["--scene3d-write-json"])
+    with_flag = _caption_args(["--scene3d", "--scene3d-write-json"])
+
+    assert (without.scene3d and without.scene3d_write_json) is False
+    assert (with_flag.scene3d and with_flag.scene3d_write_json) is True
+
+
+def test_scene3d_help_text_names_the_mcap_topics() -> None:
+    """Users need to know what --scene3d adds to the output file."""
+    help_text = _parser().format_help()
+
+    assert "/scene/background" in help_text
+    assert "/scene/objects" in help_text
+
+
+@pytest.mark.parametrize(
+    "bad_args",
+    [
+        ["--scene3d-max-points", "0"],
+        ["--scene3d-min-track-points", "0"],
+        ["--scene3d-depth-long-side", "-1"],
+        ["--num-scene3d-workers-per-node", "-1"],
+    ],
+)
+def test_scene3d_integer_knobs_reject_degenerate_values(bad_args: list[str]) -> None:
+    """A zero point budget must fail, not silently disable the budget entirely."""
+    with pytest.raises(SystemExit):
+        _caption_args(["--scene3d", *bad_args])
+
+
+def test_scene3d_focal_px_is_documented_in_source_pixels() -> None:
+    """The unit matters: the fit runs on a downscaled plate, so the help must say which."""
+    help_text = _parser().format_help()
+
+    assert "--scene3d-focal-px" in help_text
+    assert "source video" in help_text

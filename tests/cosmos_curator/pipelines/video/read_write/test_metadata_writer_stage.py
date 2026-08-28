@@ -244,6 +244,9 @@ def _assert_payloads_cleared(clip: Clip, window: Window) -> None:
     """Ensure transient buffers are released after processing."""
     assert clip.encoded_data.resolve() is None
     assert clip.intern_video_2_embedding is None
+    assert clip.scene3d_calibration is None
+    assert clip.scene3d_objects is None
+    assert clip.scene3d_background.resolve() is None
     assert window.webp_bytes.resolve() is None
     assert window.model_input == {}
     assert window.caption == {}
@@ -397,6 +400,9 @@ def test_process_data_cleanup_resets_caption_quality_flags(tmp_path: Path) -> No
 def test_retain_clip_data_preserves_mcap_payloads(tmp_path: Path) -> None:
     """With retain_clip_data the writer keeps the MCAP writer's inputs but drops everything else."""
     stage, task, clip, main_window, output_dir = _stage_with_main_clip(tmp_path, retain_clip_data=True)
+    clip.scene3d_calibration = {"translation": [0.0, 0.0, 4.0], "rotation": [0.0, 0.0, 0.0, 1.0]}
+    clip.scene3d_objects = [{"timestamp_s": 0.0, "entities": []}]
+    clip.scene3d_background = np.zeros((3, 7), dtype=np.float32)  # type: ignore[assignment]
     filtered_clip = Clip(
         uuid=uuid.uuid4(),
         source_video=clip.source_video,
@@ -412,6 +418,10 @@ def test_retain_clip_data_preserves_mcap_payloads(tmp_path: Path) -> None:
     # The MCAP writer's annotation inputs survive the extra stage hop.
     assert clip.intern_video_2_embedding is not None
     assert main_window.caption == {"qwen": "main caption"}
+    # ...including the 3D reconstruction, which the MCAP writer serialises next.
+    assert clip.scene3d_calibration is not None
+    assert clip.scene3d_objects is not None
+    assert clip.scene3d_background.resolve() is not None
     # Everything the MCAP writer does not carry in memory is still dropped — including
     # the mp4 bytes, which it reads back from the written clips/ output instead.
     assert clip.encoded_data.resolve() is None
@@ -424,6 +434,32 @@ def test_retain_clip_data_preserves_mcap_payloads(tmp_path: Path) -> None:
     assert filtered_clip.windows[0].caption == {}
     # Outputs are still written as usual.
     assert (output_dir / "clips" / f"{clip.uuid}.mp4").read_bytes() == b"clip-bytes"
+
+
+def test_scene3d_write_json_emits_sidecar(tmp_path: Path) -> None:
+    """With scene3d_write_json the writer emits scene3d/<uuid>.json, cloud excluded."""
+    stage, task, clip, _main_window, output_dir = _stage_with_main_clip(tmp_path, scene3d_write_json=True)
+    clip.scene3d_calibration = {"translation": [0.0, 0.0, 4.0], "rotation": [0.0, 0.0, 0.0, 1.0], "estimated": True}
+    clip.scene3d_objects = [{"timestamp_s": 0.25, "entities": [{"id": "obj_3"}]}]
+    clip.scene3d_background = np.zeros((5, 7), dtype=np.float32)  # type: ignore[assignment]
+
+    assert stage.process_data([task]) == [task]
+
+    sidecar = _read_json(output_dir / "scene3d" / f"{clip.uuid}.json")
+    assert sidecar["calibration"]["estimated"] is True
+    assert sidecar["frames"][0]["entities"][0]["id"] == "obj_3"
+    # The point cloud is far too large for JSON; it stays MCAP-only.
+    assert "background" not in sidecar
+
+
+def test_scene3d_sidecar_not_written_without_the_flag(tmp_path: Path) -> None:
+    """The sidecar is opt-in: a reconstruction alone does not create the directory."""
+    stage, task, clip, _main_window, output_dir = _stage_with_main_clip(tmp_path)
+    clip.scene3d_calibration = {"translation": [0.0, 0.0, 4.0], "rotation": [0.0, 0.0, 0.0, 1.0]}
+
+    assert stage.process_data([task]) == [task]
+
+    assert not (output_dir / "scene3d").exists()
 
 
 def test_process_data_writes_filter_window_errors(tmp_path: Path) -> None:

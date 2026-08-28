@@ -57,6 +57,9 @@ def _get_default_models() -> list[str]:
         if model == "sam3":
             # gated by Meta approval, opt-in only
             continue
+        if model.startswith("depth_anything_v2"):
+            # 3D scene reconstruction (--scene3d) only, opt-in
+            continue
         default_models_to_download.append(model)
     return default_models_to_download
 

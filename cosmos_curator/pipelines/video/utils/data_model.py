@@ -510,6 +510,21 @@ class Clip:
     # style_transfer/<uuid>.json for later debugging/comparison. None when the stage
     # did not run.
     style_transfer_metadata: dict[str, Any] | None = None
+    # --- 3D scene reconstruction (Scene3DStage); all None/empty when it did not run ---
+    # Estimated camera model in the MCAP payload shape: width/height, K/D/R/P, and the
+    # map->camera translation + (x, y, z, w) rotation. Also carries `estimated` and
+    # `ground_inlier_frac` so consumers can tell a real ground fit from the fallback.
+    scene3d_calibration: dict[str, Any] | None = None
+    # Per-sampled-frame 3D cuboids: [{"timestamp_s": float, "entities": [...]}], where each
+    # entity holds a cube/arrow/text plus class + speed metadata. Plain dicts so they
+    # serialize unchanged into both the MCAP SceneUpdate and the JSON sidecar.
+    scene3d_objects: list[dict[str, Any]] | None = None
+    # Background point cloud as (N, 7) float32 -- x, y, z, red, green, blue, alpha --
+    # pre-packed in the foxglove.PointCloud byte layout so the writer only base64-encodes
+    # it. Wrapped in LazyData for zero-copy inter-stage transport via PEP 574. Size is set
+    # by the depth plate and sampling stride, not by --scene3d-max-points: at the default
+    # 700 px plate that is ~17k points (~0.5 MB), well under the 200k budget.
+    scene3d_background: LazyData[npt.NDArray[np.float32]] = attrs.field(factory=LazyData, converter=LazyData.coerce)  # type: ignore[misc]
 
     def get_all_captions(self) -> list[str]:
         """Get all captions from the clip's windows.

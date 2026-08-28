@@ -58,6 +58,8 @@ class OutputConfig:
     caption_quality_flags_enabled: bool = True
     generate_cosmos_predict_dataset: bool = False
     sam3_output_format: Sam3OutputFormat = "native"
+    # Emit the per-clip scene3d/<uuid>.json sidecar alongside the MCAP channels.
+    scene3d_write_json: bool = False
     # Also appends an McapWriterStage after the clip writer, which then retains the
     # clip annotations (captions/embeddings) the MCAP writer consumes; clip mp4s are
     # read back from the written clips/ output rather than retained. Keeping both on
@@ -112,6 +114,7 @@ def build_output_stages(config: OutputConfig) -> list[CuratorStage | CuratorStag
                 caption_quality_flags_enabled=config.caption_quality_flags_enabled,
                 generate_cosmos_predict_dataset=config.generate_cosmos_predict_dataset,
                 sam3_output_format=config.sam3_output_format,
+                scene3d_write_json=config.scene3d_write_json,
                 retain_clip_data=config.generate_mcap,
                 verbose=config.verbose,
                 log_stats=config.perf_profile,
